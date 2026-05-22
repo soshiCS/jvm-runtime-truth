@@ -52,6 +52,71 @@
 #include "runtime/signature.hpp"
 #include "runtime/vframe.inline.hpp"
 #include "utilities/formatBuffer.hpp"
+#include <stdlib.h>
+#include <string.h>
+
+static bool soroush_trace_reflection_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = ::getenv("SOROUSH_TRACE_REFLECTION");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static bool soroush_is_reflection_frame(Method* method) {
+  if (method == nullptr) return false;
+  Symbol* holder = method->method_holder()->name();
+  return holder->equals("java/lang/reflect/Method") ||
+         holder->equals("java/lang/reflect/Constructor") ||
+         holder->equals("jdk/internal/reflect/NativeMethodAccessorImpl") ||
+         holder->equals("jdk/internal/reflect/DelegatingMethodAccessorImpl") ||
+         (vmClasses::reflect_MethodAccessorImpl_klass_is_loaded() &&
+          method->method_holder()->is_subclass_of(vmClasses::reflect_MethodAccessorImpl_klass()));
+}
+
+static const char* soroush_reflection_caller_name(JavaThread* thread) {
+  if (thread == nullptr || !thread->has_last_Java_frame()) {
+    return "<unknown>";
+  }
+
+  for (vframeStream vfst(thread); !vfst.at_end(); vfst.next()) {
+    Method* method = vfst.method();
+    if (!soroush_is_reflection_frame(method)) {
+      return method->method_holder()->name()->as_C_string();
+    }
+  }
+  return "<unknown>";
+}
+
+static void soroush_trace_reflection_invoke(InstanceKlass* declared_klass,
+                                            Klass* target_klass,
+                                            const methodHandle& reflected_method,
+                                            const methodHandle& selected_method,
+                                            bool is_method_invoke,
+                                            TRAPS) {
+  if (!soroush_trace_reflection_enabled() || !is_method_invoke) {
+    return;
+  }
+
+  ResourceMark rm(THREAD);
+  const char* caller = soroush_reflection_caller_name(THREAD);
+  fprintf(stderr, "[JVM REFLECT] caller=%s\n", caller);
+  fprintf(stderr, "[JVM REFLECT] reflected_method=%s.%s%s\n",
+          declared_klass->name()->as_C_string(),
+          reflected_method->name()->as_C_string(),
+          reflected_method->signature()->as_C_string());
+  fprintf(stderr, "[JVM REFLECT] target_class=%s\n",
+          target_klass == nullptr ? "<null>" : target_klass->name()->as_C_string());
+  fprintf(stderr, "[JVM REFLECT] reflect_target=%s.%s%s\n",
+          selected_method->method_holder()->name()->as_C_string(),
+          selected_method->name()->as_C_string(),
+          selected_method->signature()->as_C_string());
+  fprintf(stderr, "[JVM REFLECT] final_resolved_method=%s.%s%s\n",
+          selected_method->method_holder()->name()->as_C_string(),
+          selected_method->name()->as_C_string(),
+          selected_method->signature()->as_C_string());
+}
 
 static void trace_class_resolution(oop mirror) {
   if (mirror == nullptr || java_lang_Class::is_primitive(mirror)) {
@@ -1055,6 +1120,13 @@ static oop invoke(InstanceKlass* klass,
     ss.print("'");
     THROW_MSG_0(vmSymbols::java_lang_NoSuchMethodError(), ss.as_string());
   }
+
+  soroush_trace_reflection_invoke(klass,
+                                  target_klass,
+                                  reflected_method,
+                                  method,
+                                  is_method_invoke,
+                                  THREAD);
 
   assert(ptypes->is_objArray(), "just checking");
   int args_len = args.is_null() ? 0 : args->length();

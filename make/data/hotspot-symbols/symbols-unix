@@ -49,6 +49,7 @@ JVM_ConstantPoolGetUTF8At
 JVM_CurrentCarrierThread
 JVM_CurrentThread
 JVM_SetCurrentThread
+JVM_SoroushTrace
 JVM_CurrentTimeMillis
 JVM_DefineClass
 JVM_DefineClassWithSource

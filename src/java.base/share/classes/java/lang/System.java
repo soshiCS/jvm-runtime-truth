@@ -348,6 +348,13 @@ public final class System {
     private static native void setOut0(PrintStream out);
     private static native void setErr0(PrintStream err);
 
+    /**
+     * Records a custom JVM runtime trace event.
+     *
+     * @param event the trace event text
+     */
+    public static native void soroushTrace(String event);
+
     private static class CallersHolder {
         // Remember callers of setSecurityManager() here so that warning
         // is only printed once for each different caller

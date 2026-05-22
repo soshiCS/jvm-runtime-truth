@@ -61,6 +61,8 @@
 #include "runtime/stubRoutines.hpp"
 #include "sanitizers/leak.hpp"
 #include "utilities/exceptions.hpp"
+#include <stdlib.h>
+#include <string.h>
 
 
 /*
@@ -79,6 +81,28 @@
 
 bool MethodHandles::_enabled = false; // set true after successful native linkage
 MethodHandlesAdapterBlob* MethodHandles::_adapter_code = nullptr;
+
+static bool soroush_trace_reflection_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = ::getenv("SOROUSH_TRACE_REFLECTION");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static void soroush_trace_membername_resolution(const char* source, Method* method, TRAPS) {
+  if (!soroush_trace_reflection_enabled() || method == nullptr) {
+    return;
+  }
+
+  ResourceMark rm(THREAD);
+  fprintf(stderr, "[JVM REFLECT] membername_source=%s\n", source);
+  fprintf(stderr, "[JVM REFLECT] membername_target=%s.%s%s\n",
+          method->method_holder()->name()->as_C_string(),
+          method->name()->as_C_string(),
+          method->signature()->as_C_string());
+}
 
 /**
  * Generates method handle adapters. Returns 'false' if memory allocation
@@ -217,6 +241,7 @@ oop MethodHandles::init_MemberName(Handle mname, Handle target, TRAPS) {
       if (m == nullptr || is_signature_polymorphic(m->intrinsic_id()))
         return nullptr;            // do not resolve unless there is a concrete signature
       CallInfo info(m, k, CHECK_NULL);
+      soroush_trace_membername_resolution("java.lang.reflect.Method", m, THREAD);
       return init_method_MemberName(mname, info);
     }
   } else if (target_klass == vmClasses::reflect_Constructor_klass()) {
@@ -227,6 +252,7 @@ oop MethodHandles::init_MemberName(Handle mname, Handle target, TRAPS) {
       Method* m = InstanceKlass::cast(k)->method_with_idnum(slot);
       if (m == nullptr)  return nullptr;
       CallInfo info(m, k, CHECK_NULL);
+      soroush_trace_membername_resolution("java.lang.reflect.Constructor", m, THREAD);
       return init_method_MemberName(mname, info);
     }
   }
@@ -804,6 +830,7 @@ Handle MethodHandles::resolve_MemberName(Handle mname, Klass* caller, int lookup
         THROW_MSG_(vmSymbols::java_lang_InternalError(), "appendix", empty);
       }
       result.set_resolved_method_name(CHECK_(empty));
+      soroush_trace_membername_resolution("MemberName.resolve", result.resolved_method(), THREAD);
       oop mname2 = init_method_MemberName(mname, result);
       return Handle(THREAD, mname2);
     }
@@ -827,6 +854,7 @@ Handle MethodHandles::resolve_MemberName(Handle mname, Klass* caller, int lookup
       }
       assert(result.is_statically_bound(), "");
       result.set_resolved_method_name(CHECK_(empty));
+      soroush_trace_membername_resolution("MemberName.resolve", result.resolved_method(), THREAD);
       oop mname2 = init_method_MemberName(mname, result);
       return Handle(THREAD, mname2);
     }

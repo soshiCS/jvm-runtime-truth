@@ -115,6 +115,8 @@
 #endif
 
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 
 /*
   NOTE about use of any ctor or function call that can trigger a safepoint/GC:
@@ -303,6 +305,225 @@ JVM_ENTRY(void, JVM_ArrayCopy(JNIEnv *env, jclass ignored, jobject src, jint src
   // Do copy
   s->klass()->copy_array(s, src_pos, d, dst_pos, length, thread);
 JVM_END
+
+struct RuntimeCallEvent {
+  u8 id;
+  u8 parent_id;
+  const char* class_name;
+  const char* method_name;
+  JavaThread* thread;
+  jlong timestamp;
+  bool enter;
+};
+
+static const int SOROUSH_RUNTIME_RING_SIZE = 65536;
+static const int SOROUSH_RUNTIME_STACK_SIZE = 2048;
+static const int SOROUSH_RUNTIME_THREAD_LIMIT = 4096;
+
+static RuntimeCallEvent g_soroush_runtime_events[SOROUSH_RUNTIME_RING_SIZE];
+static char g_soroush_runtime_classes[SOROUSH_RUNTIME_RING_SIZE][256];
+static char g_soroush_runtime_methods[SOROUSH_RUNTIME_RING_SIZE][256];
+static char g_soroush_runtime_thread_names[SOROUSH_RUNTIME_THREAD_LIMIT][128];
+static volatile intptr_t g_soroush_runtime_threads[SOROUSH_RUNTIME_THREAD_LIMIT];
+static volatile u8 g_soroush_runtime_next_id = 0;
+static volatile u8 g_soroush_runtime_total_events = 0;
+static volatile u8 g_soroush_runtime_total_calls = 0;
+static volatile u8 g_soroush_runtime_max_depth = 0;
+static volatile int g_soroush_runtime_thread_count = 0;
+static THREAD_LOCAL u8 g_soroush_runtime_stack[SOROUSH_RUNTIME_STACK_SIZE];
+static THREAD_LOCAL int g_soroush_runtime_depth = 0;
+
+static bool soroush_runtime_graph_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = ::getenv("SOROUSH_RUNTIME_GRAPH");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static void soroush_copy_limited(char* dst, size_t dst_len, const char* src, size_t src_len) {
+  if (dst_len == 0) return;
+  size_t n = src_len;
+  if (n > dst_len - 1) n = dst_len - 1;
+  if (src != nullptr && n > 0) {
+    memcpy(dst, src, n);
+  }
+  dst[n] = '\0';
+}
+
+static const char* soroush_thread_name(JavaThread* thread, char* fallback, size_t fallback_len) {
+  if (thread != nullptr && thread->threadObj() != nullptr) {
+    oop name = java_lang_Thread::name(thread->threadObj());
+    if (name != nullptr) {
+      return java_lang_String::as_utf8_string(name);
+    }
+  }
+  jio_snprintf(fallback, fallback_len, PTR_FORMAT, p2i(thread));
+  return fallback;
+}
+
+static void soroush_note_runtime_thread(JavaThread* thread, const char* thread_name) {
+  intptr_t thread_value = (intptr_t)thread;
+  for (int i = 0; i < SOROUSH_RUNTIME_THREAD_LIMIT; i++) {
+    intptr_t current = Atomic::load(&g_soroush_runtime_threads[i]);
+    if (current == thread_value) {
+      return;
+    }
+    if (current == 0 &&
+        Atomic::cmpxchg(&g_soroush_runtime_threads[i], (intptr_t)0, thread_value) == 0) {
+      soroush_copy_limited(g_soroush_runtime_thread_names[i],
+                           sizeof(g_soroush_runtime_thread_names[i]),
+                           thread_name,
+                           strlen(thread_name));
+      Atomic::inc(&g_soroush_runtime_thread_count);
+      return;
+    }
+  }
+}
+
+static void soroush_parse_runtime_event(const char* message,
+                                        bool* enter,
+                                        const char** class_start,
+                                        size_t* class_len,
+                                        const char** method_start,
+                                        size_t* method_len) {
+  *enter = false;
+  *class_start = "<unknown>";
+  *class_len = strlen(*class_start);
+  *method_start = "<unknown>";
+  *method_len = strlen(*method_start);
+
+  const char* name = nullptr;
+  if (strncmp(message, "ENTER ", 6) == 0) {
+    *enter = true;
+    name = message + 6;
+  } else if (strncmp(message, "EXIT ", 5) == 0) {
+    *enter = false;
+    name = message + 5;
+  } else {
+    return;
+  }
+
+  const char* last_dot = strrchr(name, '.');
+  if (last_dot == nullptr || last_dot == name || last_dot[1] == '\0') {
+    *class_start = name;
+    *class_len = strlen(name);
+    return;
+  }
+
+  *class_start = name;
+  *class_len = (size_t)(last_dot - name);
+  *method_start = last_dot + 1;
+  *method_len = strlen(last_dot + 1);
+}
+
+static void soroush_update_max_depth(u8 depth) {
+  u8 current = Atomic::load(&g_soroush_runtime_max_depth);
+  while (depth > current) {
+    u8 observed = Atomic::cmpxchg(&g_soroush_runtime_max_depth, current, depth);
+    if (observed == current) {
+      return;
+    }
+    current = observed;
+  }
+}
+
+JVM_ENTRY(void, JVM_SoroushTrace(JNIEnv *env, jclass ignored, jstring event))
+  if (event == nullptr) {
+    return;
+  }
+
+  ResourceMark rm(THREAD);
+  oop event_oop = JNIHandles::resolve_non_null(event);
+  const char* message = java_lang_String::as_utf8_string(event_oop);
+  if (message == nullptr) {
+    return;
+  }
+
+  fprintf(stderr, "%s\n", message);
+
+  if (!soroush_runtime_graph_enabled()) {
+    return;
+  }
+
+  bool enter = false;
+  const char* class_start = nullptr;
+  const char* method_start = nullptr;
+  size_t class_len = 0;
+  size_t method_len = 0;
+  soroush_parse_runtime_event(message, &enter, &class_start, &class_len, &method_start, &method_len);
+
+  u8 id = 0;
+  u8 parent_id = 0;
+  if (enter) {
+    id = Atomic::add(&g_soroush_runtime_next_id, (u8)1);
+    parent_id = g_soroush_runtime_depth > 0 ? g_soroush_runtime_stack[g_soroush_runtime_depth - 1] : 0;
+    if (g_soroush_runtime_depth < SOROUSH_RUNTIME_STACK_SIZE) {
+      g_soroush_runtime_stack[g_soroush_runtime_depth++] = id;
+      soroush_update_max_depth((u8)g_soroush_runtime_depth);
+    }
+    Atomic::inc(&g_soroush_runtime_total_calls);
+  } else {
+    if (g_soroush_runtime_depth > 0) {
+      id = g_soroush_runtime_stack[--g_soroush_runtime_depth];
+      parent_id = g_soroush_runtime_depth > 0 ? g_soroush_runtime_stack[g_soroush_runtime_depth - 1] : 0;
+    } else {
+      id = Atomic::add(&g_soroush_runtime_next_id, (u8)1);
+    }
+  }
+
+  u8 event_number = Atomic::add(&g_soroush_runtime_total_events, (u8)1);
+  int slot = (int)((event_number - 1) % SOROUSH_RUNTIME_RING_SIZE);
+
+  soroush_copy_limited(g_soroush_runtime_classes[slot],
+                       sizeof(g_soroush_runtime_classes[slot]),
+                       class_start,
+                       class_len);
+  soroush_copy_limited(g_soroush_runtime_methods[slot],
+                       sizeof(g_soroush_runtime_methods[slot]),
+                       method_start,
+                       method_len);
+
+  RuntimeCallEvent* stored = &g_soroush_runtime_events[slot];
+  stored->id = id;
+  stored->parent_id = parent_id;
+  stored->class_name = g_soroush_runtime_classes[slot];
+  stored->method_name = g_soroush_runtime_methods[slot];
+  stored->thread = THREAD;
+  stored->timestamp = os::javaTimeNanos();
+  stored->enter = enter;
+
+  char fallback_thread_name[32];
+  const char* thread_name = soroush_thread_name(THREAD, fallback_thread_name, sizeof(fallback_thread_name));
+  soroush_note_runtime_thread(THREAD, thread_name);
+
+  fprintf(stderr,
+          "[JVM TRACE] id=" UINT64_FORMAT " parent=" UINT64_FORMAT " thread=%s %s %s.%s\n",
+          (uint64_t)id,
+          (uint64_t)parent_id,
+          thread_name,
+          enter ? "ENTER" : "EXIT",
+          stored->class_name,
+          stored->method_name);
+JVM_END
+
+extern "C" void soroush_runtime_graph_print_summary() {
+  if (!soroush_runtime_graph_enabled()) {
+    return;
+  }
+
+  fprintf(stderr,
+          "[JVM TRACE] summary total_calls=" UINT64_FORMAT
+          " total_events=" UINT64_FORMAT
+          " max_depth=" UINT64_FORMAT
+          " thread_count=%d ring_size=%d\n",
+          (uint64_t)Atomic::load(&g_soroush_runtime_total_calls),
+          (uint64_t)Atomic::load(&g_soroush_runtime_total_events),
+          (uint64_t)Atomic::load(&g_soroush_runtime_max_depth),
+          Atomic::load(&g_soroush_runtime_thread_count),
+          SOROUSH_RUNTIME_RING_SIZE);
+}
 
 
 static void set_property(Handle props, const char* key, const char* value, TRAPS) {

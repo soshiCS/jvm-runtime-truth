@@ -390,6 +390,9 @@ void print_statistics() {
 // Note: before_exit() can be executed only once, if more than one threads
 //       are trying to shutdown the VM at the same time, only one thread
 //       can run before_exit() and all other threads must wait.
+extern "C" void soroush_runtime_graph_print_summary();
+extern "C" void soroush_runtime_recovery_print_summary();
+
 void before_exit(JavaThread* thread, bool halt) {
   #define BEFORE_EXIT_NOT_RUN 0
   #define BEFORE_EXIT_RUNNING 1
@@ -453,6 +456,8 @@ void before_exit(JavaThread* thread, bool halt) {
 
 
   // Actual shutdown logic begins here.
+  soroush_runtime_graph_print_summary();
+  soroush_runtime_recovery_print_summary();
 
 #if INCLUDE_JVMCI
   if (EnableJVMCI) {

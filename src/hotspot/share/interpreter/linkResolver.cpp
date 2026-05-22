@@ -60,9 +60,91 @@
 #include "runtime/signature.hpp"
 #include "runtime/vmThread.hpp"
 #include "utilities/macros.hpp"
+#include <stdlib.h>
+#include <string.h>
 #if INCLUDE_JFR
 #include "jfr/jfr.hpp"
 #endif
+
+static bool soroush_trace_reflection_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = ::getenv("SOROUSH_TRACE_REFLECTION");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static void soroush_print_reflect_member_name(oop mname) {
+  if (mname == nullptr || !java_lang_invoke_MemberName::is_instance(mname)) {
+    fprintf(stderr, "<null-or-non-MemberName>");
+    return;
+  }
+
+  Method* target = java_lang_invoke_MemberName::vmtarget(mname);
+  if (target != nullptr) {
+    fprintf(stderr, "%s.%s%s",
+            target->method_holder()->name()->as_C_string(),
+            target->name()->as_C_string(),
+            target->signature()->as_C_string());
+    return;
+  }
+
+  oop clazz = java_lang_invoke_MemberName::clazz(mname);
+  oop name = java_lang_invoke_MemberName::name(mname);
+  fprintf(stderr, "MemberName[");
+  if (clazz != nullptr && java_lang_Class::is_instance(clazz)) {
+    Klass* k = java_lang_Class::as_Klass(clazz);
+    fprintf(stderr, "class=%s ", k == nullptr ? "<null>" : k->name()->as_C_string());
+  }
+  if (name != nullptr && java_lang_String::is_instance(name)) {
+    fprintf(stderr, "name=%s", java_lang_String::as_utf8_string(name));
+  }
+  fprintf(stderr, "]");
+}
+
+static void soroush_print_reflect_method_handle(oop mh) {
+  if (mh == nullptr || !java_lang_invoke_MethodHandle::is_instance(mh)) {
+    fprintf(stderr, "<null-or-non-MethodHandle>");
+    return;
+  }
+
+  fprintf(stderr, "%s", mh->klass()->external_name());
+
+  if (java_lang_invoke_DirectMethodHandle::is_instance(mh)) {
+    fprintf(stderr, " direct_target=");
+    soroush_print_reflect_member_name(java_lang_invoke_DirectMethodHandle::member(mh));
+  }
+
+  oop form = java_lang_invoke_MethodHandle::form(mh);
+  if (form != nullptr && java_lang_invoke_LambdaForm::is_instance(form)) {
+    fprintf(stderr, " lambda_form_vmentry=");
+    soroush_print_reflect_member_name(java_lang_invoke_LambdaForm::vmentry(form));
+  }
+}
+
+static void soroush_trace_runtime_dispatch(const char* kind,
+                                           Klass* receiver_klass,
+                                           const methodHandle& resolved_method,
+                                           const methodHandle& selected_method,
+                                           TRAPS) {
+  if (!soroush_trace_reflection_enabled() || selected_method.is_null()) {
+    return;
+  }
+
+  ResourceMark rm(THREAD);
+  fprintf(stderr, "[JVM REFLECT] dispatch_kind=%s\n", kind);
+  fprintf(stderr, "[JVM REFLECT] receiver_class=%s\n",
+          receiver_klass == nullptr ? "<null>" : receiver_klass->name()->as_C_string());
+  fprintf(stderr, "[JVM REFLECT] resolved_method=%s.%s%s\n",
+          resolved_method->method_holder()->name()->as_C_string(),
+          resolved_method->name()->as_C_string(),
+          resolved_method->signature()->as_C_string());
+  fprintf(stderr, "[JVM REFLECT] final_resolved_method=%s.%s%s\n",
+          selected_method->method_holder()->name()->as_C_string(),
+          selected_method->name()->as_C_string(),
+          selected_method->signature()->as_C_string());
+}
 
 //------------------------------------------------------------------------------------------------------------------------
 // Implementation of CallInfo
@@ -1418,6 +1500,11 @@ void LinkResolver::runtime_resolve_virtual_method(CallInfo& result,
                             recv_klass, resolved_klass, selected_method(),
                             false, vtable_index);
   }
+  soroush_trace_runtime_dispatch("invokevirtual",
+                                 recv_klass,
+                                 resolved_method,
+                                 selected_method,
+                                 THREAD);
   // setup result
   result.set_virtual(resolved_klass, resolved_method, selected_method, vtable_index, CHECK);
   JFR_ONLY(Jfr::on_resolution(result, CHECK);)
@@ -1511,6 +1598,11 @@ void LinkResolver::runtime_resolve_interface_method(CallInfo& result,
     trace_method_resolution("invokeinterface selected method: receiver-class:",
                             recv_klass, resolved_klass, selected_method(), true);
   }
+  soroush_trace_runtime_dispatch("invokeinterface",
+                                 recv_klass,
+                                 resolved_method,
+                                 selected_method,
+                                 THREAD);
   // setup result
   if (resolved_method->has_vtable_index()) {
     int vtable_index = resolved_method->vtable_index();
@@ -1759,6 +1851,24 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
     }
   }
   result.set_handle(resolved_klass, resolved_method, resolved_appendix, CHECK);
+  if (soroush_trace_reflection_enabled()) {
+    ResourceMark rm(THREAD);
+    Klass* current_klass = link_info.current_klass();
+    fprintf(stderr, "[JVM REFLECT] caller=%s\n",
+            current_klass == nullptr ? "<unknown>" : current_klass->name()->as_C_string());
+    fprintf(stderr, "[JVM REFLECT] methodhandle_dispatch=%s%s\n",
+            link_info.name()->as_C_string(),
+            link_info.signature()->as_C_string());
+    fprintf(stderr, "[JVM REFLECT] final_resolved_method=%s.%s%s\n",
+            resolved_method->method_holder()->name()->as_C_string(),
+            resolved_method->name()->as_C_string(),
+            resolved_method->signature()->as_C_string());
+    if (resolved_appendix.not_null()) {
+      fprintf(stderr, "[JVM REFLECT] mh_target=");
+      soroush_print_reflect_method_handle(resolved_appendix());
+      fprintf(stderr, "\n");
+    }
+  }
   JFR_ONLY(Jfr::on_resolution(result, CHECK);)
 }
 

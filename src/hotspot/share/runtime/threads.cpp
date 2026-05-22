@@ -423,6 +423,7 @@ class ReadReleaseFileTask : public PeriodicTask {
 };
 
 jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
+  fprintf(stderr, "Hello from Soroush's modified JVM\n");
   extern void JDK_Version_init();
 
   // Preinitialize version info.

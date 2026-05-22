@@ -83,7 +83,9 @@
 #include "services/finalizerService.hpp"
 #include "services/threadService.hpp"
 #include "utilities/macros.hpp"
+#include "utilities/ostream.hpp"
 #include "utilities/utf8.hpp"
+#include <stdlib.h>
 #if INCLUDE_CDS
 #include "classfile/systemDictionaryShared.hpp"
 #endif
@@ -119,6 +121,170 @@ using InvokeMethodIntrinsicTable = ResourceHashtable<InvokeMethodKey, Method*, 1
 static InvokeMethodIntrinsicTable* _invoke_method_intrinsic_table;
 using InvokeMethodTypeTable = ResourceHashtable<SymbolHandle, OopHandle, 139, AnyObj::C_HEAP, mtClass, SymbolHandle::compute_hash>;
 static InvokeMethodTypeTable* _invoke_method_type_table;
+
+static volatile int g_soroush_indy_trace_counter = 0;
+static THREAD_LOCAL int g_soroush_current_indy_trace_id = 0;
+
+extern "C" int soroush_current_indy_trace_id() {
+  return g_soroush_current_indy_trace_id;
+}
+
+static bool soroush_trace_indy_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = ::getenv("SOROUSH_TRACE_INDY");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static bool soroush_runtime_recovery_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = ::getenv("SOROUSH_RUNTIME_RECOVERY");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static outputStream* soroush_indy_stream() {
+  return fdStream::stderr_stream();
+}
+
+static int soroush_next_indy_trace_id() {
+  return Atomic::add(&g_soroush_indy_trace_counter, 1);
+}
+
+class SoroushIndyTraceScope : public StackObj {
+  int _previous_id;
+
+ public:
+  SoroushIndyTraceScope(int id) : _previous_id(g_soroush_current_indy_trace_id) {
+    g_soroush_current_indy_trace_id = id;
+  }
+
+  ~SoroushIndyTraceScope() {
+    g_soroush_current_indy_trace_id = _previous_id;
+  }
+};
+
+static void soroush_indy_print_cr(int trace_id, const char* format, ...) ATTRIBUTE_PRINTF(2, 3);
+static void soroush_indy_print_cr(int trace_id, const char* format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  fprintf(stderr, "[JVM INDY #%d] ", trace_id);
+  vfprintf(stderr, format, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+}
+
+static void soroush_print_method_type(outputStream* st, oop mt) {
+  if (mt == nullptr || !java_lang_invoke_MethodType::is_instance(mt)) {
+    st->print("<null-or-non-MethodType>");
+    return;
+  }
+  java_lang_invoke_MethodType::print_signature(mt, st);
+}
+
+static void soroush_print_member_name(outputStream* st, oop mname) {
+  if (mname == nullptr || !java_lang_invoke_MemberName::is_instance(mname)) {
+    st->print("<null-or-non-MemberName>");
+    return;
+  }
+  Method* target = java_lang_invoke_MemberName::vmtarget(mname);
+  if (target != nullptr) {
+    st->print("%s.%s%s",
+              target->method_holder()->name()->as_C_string(),
+              target->name()->as_C_string(),
+              target->signature()->as_C_string());
+    return;
+  }
+
+  oop clazz = java_lang_invoke_MemberName::clazz(mname);
+  oop name = java_lang_invoke_MemberName::name(mname);
+  oop type = java_lang_invoke_MemberName::type(mname);
+  st->print("MemberName[");
+  if (clazz != nullptr && java_lang_Class::is_instance(clazz)) {
+    st->print("class=%s ", java_lang_Class::as_external_name(clazz));
+  }
+  if (name != nullptr && java_lang_String::is_instance(name)) {
+    st->print("name=%s ", java_lang_String::as_utf8_string(name));
+  }
+  if (type != nullptr) {
+    st->print("type_klass=%s", type->klass()->external_name());
+  }
+  st->print("]");
+}
+
+static void soroush_print_method_handle(outputStream* st, oop mh) {
+  if (mh == nullptr || !java_lang_invoke_MethodHandle::is_instance(mh)) {
+    st->print("<null-or-non-MethodHandle>");
+    return;
+  }
+
+  st->print("%s", mh->klass()->external_name());
+  oop type = java_lang_invoke_MethodHandle::type(mh);
+  st->print(" type=");
+  soroush_print_method_type(st, type);
+
+  if (java_lang_invoke_DirectMethodHandle::is_instance(mh)) {
+    st->print(" direct_target=");
+    soroush_print_member_name(st, java_lang_invoke_DirectMethodHandle::member(mh));
+  }
+
+  oop form = java_lang_invoke_MethodHandle::form(mh);
+  if (form != nullptr && java_lang_invoke_LambdaForm::is_instance(form)) {
+    st->print(" lambda_form_vmentry=");
+    soroush_print_member_name(st, java_lang_invoke_LambdaForm::vmentry(form));
+  }
+}
+
+static void soroush_print_indy_object(outputStream* st, int trace_id, const char* label, oop obj) {
+  st->print("[JVM INDY #%d] %s=", trace_id, label);
+  if (obj == nullptr) {
+    st->print_cr("<null>");
+    return;
+  }
+
+  if (java_lang_String::is_instance(obj)) {
+    st->print_cr("\"%s\"", java_lang_String::as_utf8_string(obj));
+  } else if (java_lang_invoke_MethodType::is_instance(obj)) {
+    soroush_print_method_type(st, obj);
+    st->cr();
+  } else if (java_lang_invoke_MethodHandle::is_instance(obj)) {
+    soroush_print_method_handle(st, obj);
+    st->cr();
+  } else if (java_lang_invoke_MemberName::is_instance(obj)) {
+    soroush_print_member_name(st, obj);
+    st->cr();
+  } else if (java_lang_invoke_CallSite::is_instance(obj)) {
+    st->print("%s target=", obj->klass()->external_name());
+    soroush_print_method_handle(st, java_lang_invoke_CallSite::target(obj));
+    st->cr();
+  } else if (obj->is_objArray()) {
+    objArrayOop array = objArrayOop(obj);
+    st->print_cr("%s length=%d", obj->klass()->external_name(), array->length());
+    for (int i = 0; i < array->length(); i++) {
+      stringStream item_label;
+      item_label.print("%s[%d]", label, i);
+      soroush_print_indy_object(st, trace_id, item_label.base(), array->obj_at(i));
+    }
+  } else {
+    st->print_cr("%s", obj->klass()->external_name());
+  }
+}
+
+static bool soroush_is_lambda_metafactory_bsm(oop bsm) {
+  if (bsm == nullptr || !java_lang_invoke_DirectMethodHandle::is_instance(bsm)) {
+    return false;
+  }
+  oop member = java_lang_invoke_DirectMethodHandle::member(bsm);
+  Method* target = member == nullptr ? nullptr : java_lang_invoke_MemberName::vmtarget(member);
+  if (target == nullptr) {
+    return false;
+  }
+  return target->method_holder()->name()->equals("java/lang/invoke/LambdaMetafactory");
+}
 
 OopHandle   SystemDictionary::_java_system_loader;
 OopHandle   SystemDictionary::_java_platform_loader;
@@ -2085,7 +2251,25 @@ Method* SystemDictionary::find_method_handle_invoker(Klass* klass,
                          vmSymbols::linkMethod_signature(),
                          &args, CHECK_NULL);
   Handle mname(THREAD, result.get_oop());
-  return unpack_method_and_appendix(mname, accessing_klass, appendix_box, appendix_result, THREAD);
+  Method* linked = unpack_method_and_appendix(mname, accessing_klass, appendix_box, appendix_result, THREAD);
+  if (soroush_trace_indy_enabled()) {
+    ResourceMark rm(THREAD);
+    int trace_id = soroush_current_indy_trace_id();
+    if (trace_id == 0) {
+      trace_id = soroush_next_indy_trace_id();
+    }
+    soroush_indy_print_cr(trace_id, "linkMethod caller=%s methodhandle=%s%s",
+                          accessing_klass->name()->as_C_string(),
+                          name->as_C_string(),
+                          signature->as_C_string());
+    soroush_indy_print_cr(trace_id, "MethodHandle.invokeBasic/link target=%s.%s%s",
+                          linked->method_holder()->name()->as_C_string(),
+                          linked->name()->as_C_string(),
+                          linked->signature()->as_C_string());
+    soroush_print_indy_object(soroush_indy_stream(), trace_id, "linkMethod.member", mname());
+    soroush_print_indy_object(soroush_indy_stream(), trace_id, "linkMethod.appendix", appendix_box->obj_at(0));
+  }
+  return linked;
 }
 
 // Decide if we can globally cache a lookup of this class, to be returned to any client that asks.
@@ -2332,6 +2516,60 @@ void SystemDictionary::invoke_bootstrap_method(BootstrapInfo& bootstrap_specifie
     assert(appendix_box->obj_at(0) == nullptr, "");
   }
 
+  const bool trace_indy = is_indy && soroush_trace_indy_enabled();
+  const bool collect_indy_provenance =
+      is_indy && (trace_indy || soroush_runtime_recovery_enabled());
+  const int trace_id = collect_indy_provenance ? soroush_next_indy_trace_id() : 0;
+  SoroushIndyTraceScope trace_scope(trace_id);
+  const bool trace_lambda_meta =
+      trace_indy && soroush_is_lambda_metafactory_bsm(bootstrap_specifier.bsm()());
+
+  if (trace_indy) {
+    ResourceMark rm(THREAD);
+    stringStream bsm_target;
+    if (java_lang_invoke_DirectMethodHandle::is_instance(bootstrap_specifier.bsm()())) {
+      soroush_print_member_name(&bsm_target,
+          java_lang_invoke_DirectMethodHandle::member(bootstrap_specifier.bsm()()));
+    } else {
+      bsm_target.print("%s", bootstrap_specifier.bsm()()->klass()->external_name());
+    }
+
+    soroush_indy_print_cr(trace_id, "caller=%s", bootstrap_specifier.caller()->name()->as_C_string());
+    soroush_indy_print_cr(trace_id, "indy=%s%s",
+                          bootstrap_specifier.name()->as_C_string(),
+                          bootstrap_specifier.signature()->as_C_string());
+    soroush_indy_print_cr(trace_id, "bootstrap=%s", bsm_target.base());
+    soroush_indy_print_cr(trace_id, "bootstrap_arg_count=%d", bootstrap_specifier.argc());
+
+    stringStream graph;
+    graph.print("graph invokedynamic %s%s -> bootstrap %s",
+                bootstrap_specifier.name()->as_C_string(),
+                bootstrap_specifier.signature()->as_C_string(),
+                bsm_target.base());
+    soroush_indy_print_cr(trace_id, "%s", graph.base());
+
+    soroush_print_indy_object(soroush_indy_stream(), trace_id, "bsm_handle", bootstrap_specifier.bsm()());
+    soroush_print_indy_object(soroush_indy_stream(), trace_id, "interface_method_type", bootstrap_specifier.type_arg()());
+
+    if (bootstrap_specifier.arg_values().not_null()) {
+      soroush_print_indy_object(soroush_indy_stream(), trace_id, "bootstrap_args", bootstrap_specifier.arg_values()());
+    }
+
+    if (trace_lambda_meta && bootstrap_specifier.arg_values().not_null() &&
+        bootstrap_specifier.arg_values()()->is_objArray()) {
+      objArrayOop args = objArrayOop(bootstrap_specifier.arg_values()());
+      if (args->length() > 0) {
+        soroush_print_indy_object(soroush_indy_stream(), trace_id, "interface_method", args->obj_at(0));
+      }
+      if (args->length() > 1) {
+        soroush_print_indy_object(soroush_indy_stream(), trace_id, "impl", args->obj_at(1));
+      }
+      if (args->length() > 2) {
+        soroush_print_indy_object(soroush_indy_stream(), trace_id, "instantiated_method_type", args->obj_at(2));
+      }
+    }
+  }
+
   // call condy: java.lang.invoke.MethodHandleNatives::linkDynamicConstant(caller, bsm, type, info)
   //       indy: java.lang.invoke.MethodHandleNatives::linkCallSite(caller, bsm, name, mtype, info, &appendix)
   JavaCallArguments args;
@@ -2359,6 +2597,31 @@ void SystemDictionary::invoke_bootstrap_method(BootstrapInfo& bootstrap_specifie
                                                 &appendix, CHECK);
     methodHandle mh(THREAD, method);
     bootstrap_specifier.set_resolved_method(mh, appendix);
+
+    if (trace_indy) {
+      ResourceMark rm(THREAD);
+      soroush_indy_print_cr(trace_id, "link_method=%s.%s%s",
+                            method->method_holder()->name()->as_C_string(),
+                            method->name()->as_C_string(),
+                            method->signature()->as_C_string());
+      soroush_print_indy_object(soroush_indy_stream(), trace_id, "link_member_name", value());
+      soroush_print_indy_object(soroush_indy_stream(), trace_id, "appendix", appendix());
+
+      if (appendix.not_null() && java_lang_invoke_CallSite::is_instance(appendix())) {
+        oop target = java_lang_invoke_CallSite::target(appendix());
+        soroush_print_indy_object(soroush_indy_stream(), trace_id, "callsite_target", target);
+        stringStream target_stream;
+        soroush_print_method_handle(&target_stream, target);
+        soroush_indy_print_cr(trace_id, "graph bootstrap -> CallSite target -> %s",
+                              target_stream.base());
+      } else if (appendix.not_null() && java_lang_invoke_MethodHandle::is_instance(appendix())) {
+        stringStream target_stream;
+        soroush_print_method_handle(&target_stream, appendix());
+        soroush_indy_print_cr(trace_id, "callsite_target=%s", target_stream.base());
+        soroush_indy_print_cr(trace_id, "graph bootstrap -> MethodHandle target -> %s",
+                              target_stream.base());
+      }
+    }
   } else {
     bootstrap_specifier.set_resolved_value(value);
   }
