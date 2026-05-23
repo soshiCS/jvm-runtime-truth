@@ -105,6 +105,66 @@ static bool soroush_rewriter_phase1_failures_only() {
   return enabled == 1;
 }
 
+static bool soroush_rewriter_phase2_entry_nops_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = getenv("SOROUSH_REWRITER_PHASE2_ENTRY_NOPS");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static bool soroush_rewriter_phase2_matches(const char* class_name) {
+  const char* prefix = getenv("SOROUSH_REWRITER_PHASE2_PREFIX");
+  if (class_name == nullptr || prefix == nullptr || prefix[0] == '\0') {
+    return false;
+  }
+  if (strcmp(prefix, "*") == 0) {
+    return true;
+  }
+  return strncmp(class_name, prefix, strlen(prefix)) == 0;
+}
+
+static bool soroush_rewriter_phase3_enter_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = getenv("SOROUSH_REWRITER_PHASE3_ENTER");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static bool soroush_rewriter_phase3_matches(const char* class_name) {
+  const char* prefix = getenv("SOROUSH_REWRITER_PHASE3_PREFIX");
+  if (class_name == nullptr || prefix == nullptr || prefix[0] == '\0') {
+    return false;
+  }
+  if (strcmp(prefix, "*") == 0) {
+    return true;
+  }
+  return strncmp(class_name, prefix, strlen(prefix)) == 0;
+}
+
+static bool soroush_rewriter_phase5_normal_exit_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = getenv("SOROUSH_REWRITER_PHASE5_NORMAL_EXIT");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static bool soroush_rewriter_phase5_matches(const char* class_name) {
+  const char* prefix = getenv("SOROUSH_REWRITER_PHASE5_PREFIX");
+  if (class_name == nullptr || prefix == nullptr || prefix[0] == '\0') {
+    return false;
+  }
+  if (strcmp(prefix, "*") == 0) {
+    return true;
+  }
+  return strncmp(class_name, prefix, strlen(prefix)) == 0;
+}
+
 static bool has_branches_or_throw(const u1* code, u4 code_len) {
   for (u4 i = 0; i < code_len; i++) {
     u1 op = code[i];
@@ -1199,6 +1259,104 @@ SoroushClassfileRewriter::free_roundtrip(&phase1);
 }
 
 if (!cl_info.is_hidden() &&
+    internal_class_name != nullptr &&
+    soroush_rewriter_phase5_normal_exit_enabled() &&
+    soroush_rewriter_phase5_matches(internal_class_name)) {
+SoroushClassfileRewriter::TransformResult phase5 =
+    SoroushClassfileRewriter::insert_entry_exit_trace(stream->buffer(), stream->length(), internal_class_name);
+if (phase5.ok) {
+  rewritten_bytes = phase5.bytes;
+  rewritten_len = phase5.length;
+  phase5.bytes = nullptr;
+  fprintf(stderr,
+          "[JVM REWRITER PHASE5] class=%s normal_exit=ok methods=%d instructions=%d old=%d new=%d code_methods=%d ctor_methods_skipped=%d\n",
+          internal_class_name,
+          phase5.transformed_methods,
+          phase5.decoded_instructions,
+          stream->length(),
+          rewritten_len,
+          phase5.code_methods,
+          phase5.constructor_methods);
+  actual_stream = new ClassFileStream(
+      rewritten_bytes,
+      rewritten_len,
+      stream->source()
+  );
+} else {
+  fprintf(stderr,
+          "[JVM REWRITER PHASE5] class=%s normal_exit=failed error=%s\n",
+          internal_class_name,
+          phase5.error == nullptr ? "<unknown>" : phase5.error);
+}
+SoroushClassfileRewriter::free_transform(&phase5);
+}
+
+if (rewritten_bytes == nullptr &&
+    !cl_info.is_hidden() &&
+    internal_class_name != nullptr &&
+    soroush_rewriter_phase3_enter_enabled() &&
+    soroush_rewriter_phase3_matches(internal_class_name)) {
+SoroushClassfileRewriter::TransformResult phase3 =
+    SoroushClassfileRewriter::insert_entry_trace(stream->buffer(), stream->length(), internal_class_name);
+if (phase3.ok) {
+  rewritten_bytes = phase3.bytes;
+  rewritten_len = phase3.length;
+  phase3.bytes = nullptr;
+  fprintf(stderr,
+          "[JVM REWRITER PHASE3] class=%s enter=ok methods=%d instructions=%d old=%d new=%d\n",
+          internal_class_name,
+          phase3.transformed_methods,
+          phase3.decoded_instructions,
+          stream->length(),
+          rewritten_len);
+  actual_stream = new ClassFileStream(
+      rewritten_bytes,
+      rewritten_len,
+      stream->source()
+  );
+} else {
+  fprintf(stderr,
+          "[JVM REWRITER PHASE3] class=%s enter=failed error=%s\n",
+          internal_class_name,
+          phase3.error == nullptr ? "<unknown>" : phase3.error);
+}
+SoroushClassfileRewriter::free_transform(&phase3);
+}
+
+if (rewritten_bytes == nullptr &&
+    !cl_info.is_hidden() &&
+    internal_class_name != nullptr &&
+    soroush_rewriter_phase2_entry_nops_enabled() &&
+    soroush_rewriter_phase2_matches(internal_class_name)) {
+SoroushClassfileRewriter::TransformResult phase2 =
+    SoroushClassfileRewriter::insert_entry_nops(stream->buffer(), stream->length(), 4);
+if (phase2.ok) {
+  rewritten_bytes = phase2.bytes;
+  rewritten_len = phase2.length;
+  phase2.bytes = nullptr;
+  fprintf(stderr,
+          "[JVM REWRITER PHASE2] class=%s entry_nops=ok methods=%d instructions=%d old=%d new=%d\n",
+          internal_class_name,
+          phase2.transformed_methods,
+          phase2.decoded_instructions,
+          stream->length(),
+          rewritten_len);
+  actual_stream = new ClassFileStream(
+      rewritten_bytes,
+      rewritten_len,
+      stream->source()
+  );
+} else {
+  fprintf(stderr,
+          "[JVM REWRITER PHASE2] class=%s entry_nops=failed error=%s\n",
+          internal_class_name,
+          phase2.error == nullptr ? "<unknown>" : phase2.error);
+}
+SoroushClassfileRewriter::free_transform(&phase2);
+}
+
+if (rewritten_bytes == nullptr &&
+    !cl_info.is_hidden() &&
     internal_class_name != nullptr &&
     should_rewrite_soroush_class(internal_class_name)) {
 size_t class_name_len = strlen(internal_class_name);

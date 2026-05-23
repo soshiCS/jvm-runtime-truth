@@ -24,8 +24,24 @@ class SoroushClassfileRewriter : AllStatic {
     int decoded_instructions;
   };
 
+  struct TransformResult {
+    bool ok;
+    u1* bytes;
+    int length;
+    const char* error;
+    int transformed_methods;
+    int decoded_instructions;
+    int code_methods;          // methods with a Code attribute (considered)
+    int constructor_methods;   // <init>/<clinit> with Code, skipped by design
+  };
+
   static RoundTripResult roundtrip_copy(const u1* bytes, int length);
   static void free_roundtrip(RoundTripResult* result);
+
+  static TransformResult insert_entry_nops(const u1* bytes, int length, int nop_count);
+  static TransformResult insert_entry_trace(const u1* bytes, int length, const char* class_name);
+  static TransformResult insert_entry_exit_trace(const u1* bytes, int length, const char* class_name);
+  static void free_transform(TransformResult* result);
 };
 
 #endif // SHARE_CLASSFILE_SOROUSHCLASSFILEREWRITER_HPP
