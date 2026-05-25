@@ -380,9 +380,17 @@ public abstract class ForkJoinTask<V> implements Future<V>, Serializable {
      *
      * @return status on exit from this method
      */
+    // Soroush unified provenance graph: cross-thread causality gate. Read once;
+    // observational and fail-safe (false unless the graph is enabled).
+    private static final boolean SOROUSH_ASYNC = soroushAsyncInit();
+    private static boolean soroushAsyncInit() {
+        try { return System.soroushAsyncEnabled(); } catch (Throwable t) { return false; }
+    }
+
     final int doExec() {
         int s; boolean completed;
         if ((s = status) >= 0) {
+            if (SOROUSH_ASYNC) System.soroushAsyncHandoff(2, this, null);
             try {
                 completed = exec();
             } catch (Throwable rex) {

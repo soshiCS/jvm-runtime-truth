@@ -392,6 +392,8 @@ void print_statistics() {
 //       can run before_exit() and all other threads must wait.
 extern "C" void soroush_runtime_graph_print_summary();
 extern "C" void soroush_runtime_recovery_print_summary();
+extern "C" void soroush_graph_dump_summary();
+extern "C" void soroush_graph_export_runtime_targets(const char* path);
 
 void before_exit(JavaThread* thread, bool halt) {
   #define BEFORE_EXIT_NOT_RUN 0
@@ -458,6 +460,16 @@ void before_exit(JavaThread* thread, bool halt) {
   // Actual shutdown logic begins here.
   soroush_runtime_graph_print_summary();
   soroush_runtime_recovery_print_summary();
+  soroush_graph_dump_summary();
+  {
+    const char* export_path = ::getenv("SOROUSH_EXPORT_RUNTIME_TARGETS");
+    if (export_path != nullptr && export_path[0] != '\0') {
+      const char* out = (strcmp(export_path, "1") == 0)
+                        ? "/tmp/soroush_jvm_dump/runtime_targets.jsonl"
+                        : export_path;
+      soroush_graph_export_runtime_targets(out);
+    }
+  }
 
 #if INCLUDE_JVMCI
   if (EnableJVMCI) {

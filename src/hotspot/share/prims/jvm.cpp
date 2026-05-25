@@ -30,6 +30,7 @@
 #include "cds/lambdaFormInvokers.hpp"
 #include "classfile/classFileStream.hpp"
 #include "classfile/classLoader.inline.hpp"
+#include "classfile/soroushProvenanceGraph.hpp"
 #include "classfile/classLoaderData.hpp"
 #include "classfile/classLoaderData.inline.hpp"
 #include "classfile/classLoadInfo.hpp"
@@ -117,6 +118,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 /*
   NOTE about use of any ctor or function call that can trigger a safepoint/GC:
@@ -333,6 +335,90 @@ static volatile int g_soroush_runtime_thread_count = 0;
 static THREAD_LOCAL u8 g_soroush_runtime_stack[SOROUSH_RUNTIME_STACK_SIZE];
 static THREAD_LOCAL int g_soroush_runtime_depth = 0;
 
+// --- Async / cross-thread causality (unified provenance graph async extension) ---
+//
+// A worker thread that picks up scheduled work carries a "pending async context"
+// (the cause execution + the owning AsyncTask/Thread node) that is consumed at
+// its next instrumented ENTER, emitting the cross-thread CONTINUES_ON edge.
+// These are thread-local: set on the worker thread (at thread_entry for raw
+// Thread.start, or at the executor RUN bridge) and consumed at the next ENTER in
+// soroush_runtime_record_event (the exact method-token recorder).
+static THREAD_LOCAL uint64_t g_soroush_pending_cause_exec = 0;
+static THREAD_LOCAL uint64_t g_soroush_pending_owner_node = 0;
+static THREAD_LOCAL bool     g_soroush_pending_active = false;
+
+// Thread-start hand-off table: at JVM_StartThread the parent records its context
+// keyed by the newly-created child JavaThread*; the child consumes it in
+// thread_entry. Direct open-addressing, pthread-guarded, fail-safe (drops on
+// full). Only populated when the graph is enabled.
+struct SoroushThreadStartCtx {
+  JavaThread* child;        // key; null = empty slot
+  uint64_t    parent_tid;
+  uint64_t    parent_exec_id;
+  char        parent_name[96];
+};
+static const int SOROUSH_TSTART_SLOTS = 4096; // power of two
+static SoroushThreadStartCtx g_soroush_tstart[SOROUSH_TSTART_SLOTS];
+static pthread_mutex_t g_soroush_tstart_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline unsigned soroush_ptr_hash(JavaThread* p) {
+  uintptr_t v = (uintptr_t)p >> 4;
+  return (unsigned)((v * 2654435761u) & (SOROUSH_TSTART_SLOTS - 1));
+}
+
+// Read the calling thread's current top-of-stack execution id (0 if none).
+static inline uint64_t soroush_current_exec_id() {
+  return g_soroush_runtime_depth > 0
+       ? (uint64_t)g_soroush_runtime_stack[g_soroush_runtime_depth - 1] : 0;
+}
+
+static void soroush_tstart_put(JavaThread* child, uint64_t parent_tid,
+                               uint64_t parent_exec_id, const char* parent_name) {
+  if (child == nullptr) return;
+  pthread_mutex_lock(&g_soroush_tstart_lock);
+  unsigned start = soroush_ptr_hash(child);
+  for (int i = 0; i < SOROUSH_TSTART_SLOTS; i++) {
+    unsigned idx = (start + i) & (SOROUSH_TSTART_SLOTS - 1);
+    SoroushThreadStartCtx* s = &g_soroush_tstart[idx];
+    if (s->child == nullptr || s->child == child) {
+      s->child = child;
+      s->parent_tid = parent_tid;
+      s->parent_exec_id = parent_exec_id;
+      if (parent_name != nullptr) {
+        strncpy(s->parent_name, parent_name, sizeof(s->parent_name) - 1);
+        s->parent_name[sizeof(s->parent_name) - 1] = '\0';
+      } else {
+        s->parent_name[0] = '\0';
+      }
+      pthread_mutex_unlock(&g_soroush_tstart_lock);
+      return;
+    }
+  }
+  pthread_mutex_unlock(&g_soroush_tstart_lock); // table full: drop (fail-safe)
+}
+
+// Returns true and fills *out if a context for child existed; clears the slot.
+static bool soroush_tstart_take(JavaThread* child, SoroushThreadStartCtx* out) {
+  if (child == nullptr) return false;
+  bool found = false;
+  pthread_mutex_lock(&g_soroush_tstart_lock);
+  unsigned start = soroush_ptr_hash(child);
+  for (int i = 0; i < SOROUSH_TSTART_SLOTS; i++) {
+    unsigned idx = (start + i) & (SOROUSH_TSTART_SLOTS - 1);
+    SoroushThreadStartCtx* s = &g_soroush_tstart[idx];
+    if (s->child == child) {
+      *out = *s;
+      s->child = nullptr;
+      s->parent_name[0] = '\0';
+      found = true;
+      break;
+    }
+    if (s->child == nullptr) break; // probe run ended
+  }
+  pthread_mutex_unlock(&g_soroush_tstart_lock);
+  return found;
+}
+
 static bool soroush_runtime_graph_enabled() {
   static int enabled = -1;
   if (enabled == -1) {
@@ -382,42 +468,6 @@ static void soroush_note_runtime_thread(JavaThread* thread, const char* thread_n
   }
 }
 
-static void soroush_parse_runtime_event(const char* message,
-                                        bool* enter,
-                                        const char** class_start,
-                                        size_t* class_len,
-                                        const char** method_start,
-                                        size_t* method_len) {
-  *enter = false;
-  *class_start = "<unknown>";
-  *class_len = strlen(*class_start);
-  *method_start = "<unknown>";
-  *method_len = strlen(*method_start);
-
-  const char* name = nullptr;
-  if (strncmp(message, "ENTER ", 6) == 0) {
-    *enter = true;
-    name = message + 6;
-  } else if (strncmp(message, "EXIT ", 5) == 0) {
-    *enter = false;
-    name = message + 5;
-  } else {
-    return;
-  }
-
-  const char* last_dot = strrchr(name, '.');
-  if (last_dot == nullptr || last_dot == name || last_dot[1] == '\0') {
-    *class_start = name;
-    *class_len = strlen(name);
-    return;
-  }
-
-  *class_start = name;
-  *class_len = (size_t)(last_dot - name);
-  *method_start = last_dot + 1;
-  *method_len = strlen(last_dot + 1);
-}
-
 static void soroush_update_max_depth(u8 depth) {
   u8 current = Atomic::load(&g_soroush_runtime_max_depth);
   while (depth > current) {
@@ -429,31 +479,23 @@ static void soroush_update_max_depth(u8 depth) {
   }
 }
 
-JVM_ENTRY(void, JVM_SoroushTrace(JNIEnv *env, jclass ignored, jstring event))
-  if (event == nullptr) {
-    return;
-  }
-
-  ResourceMark rm(THREAD);
-  oop event_oop = JNIHandles::resolve_non_null(event);
-  const char* message = java_lang_String::as_utf8_string(event_oop);
-  if (message == nullptr) {
-    return;
-  }
-
-  fprintf(stderr, "%s\n", message);
-
-  if (!soroush_runtime_graph_enabled()) {
-    return;
-  }
-
-  bool enter = false;
-  const char* class_start = nullptr;
-  const char* method_start = nullptr;
-  size_t class_len = 0;
-  size_t method_len = 0;
-  soroush_parse_runtime_event(message, &enter, &class_start, &class_len, &method_start, &method_len);
-
+// ENTER/EXIT recorder for the exact method-token trace ABI (the sole execution
+// tracing mechanism). Maintains the thread-local call-id stack, ring buffer,
+// thread registration, the provenance-graph execution node, cross-thread async
+// continuation, the MethodHandle/LambdaForm overlay, and the [JVM TRACE] line.
+//
+// Identity is ALWAYS exact: the Method node is keyed by the token's recorded exact
+// descriptor + loader_id/hidden (via soroush_graph_execution_exact) -- there is no
+// "?" descriptor and no loader_id=0 guessing, and no legacy string/stack-walk
+// path. Only called when the runtime graph is enabled. class_start/method_start are
+// the token's resolved (NUL-terminated) class/method; descriptor is null only when
+// the token itself could not be resolved (registry OOM/overflow), which is recorded
+// as identity-unresolved rather than linked imprecisely.
+static void soroush_runtime_record_event(JavaThread* thread, bool enter,
+                                         const char* class_start, size_t class_len,
+                                         const char* method_start, size_t method_len,
+                                         const char* descriptor, uint64_t loader_id,
+                                         int hidden, uint32_t token) {
   u8 id = 0;
   u8 parent_id = 0;
   if (enter) {
@@ -490,13 +532,72 @@ JVM_ENTRY(void, JVM_SoroushTrace(JNIEnv *env, jclass ignored, jstring event))
   stored->parent_id = parent_id;
   stored->class_name = g_soroush_runtime_classes[slot];
   stored->method_name = g_soroush_runtime_methods[slot];
-  stored->thread = THREAD;
+  stored->thread = thread;
   stored->timestamp = os::javaTimeNanos();
   stored->enter = enter;
 
   char fallback_thread_name[32];
-  const char* thread_name = soroush_thread_name(THREAD, fallback_thread_name, sizeof(fallback_thread_name));
-  soroush_note_runtime_thread(THREAD, thread_name);
+  const char* thread_name = soroush_thread_name(thread, fallback_thread_name, sizeof(fallback_thread_name));
+  soroush_note_runtime_thread(thread, thread_name);
+
+  // Unified provenance graph: record the execution on ENTER (reuses this call's
+  // id/parent from the runtime graph). Observational; fail-safe.
+  if (enter && soroush_graph_enabled()) {
+    // Exact identity (sole path): no "?" descriptor, no loader_id=0 guessing.
+    // Three outcomes:
+    //  - resolved + node created  -> [JVM GRAPH IDENTITY] (once per new method)
+    //  - resolved + node NOT created -> graph capacity/OOM drop (fail-safe, the
+    //    identity IS known; not an identity failure -- not logged per-event)
+    //  - NOT resolved (token 0 / descriptor missing) -> identity-unresolved
+    //    (genuine fail-fast: do NOT create an imprecise Method node)
+    bool resolved = (token != 0 && descriptor != nullptr && descriptor[0] != '\0');
+    uint64_t mnode = 0;
+    bool method_is_new = false;
+    if (resolved) {
+      mnode = soroush_graph_execution_exact(id, parent_id, stored->class_name,
+                                            stored->method_name, descriptor,
+                                            loader_id, hidden, (const void*)thread,
+                                            &method_is_new);
+    }
+    if (resolved && mnode != 0 && method_is_new) {
+      fprintf(stderr, "[JVM GRAPH IDENTITY] token=%u class=%s method=%s desc=%s loader="
+              UINT64_FORMAT " hidden=%d kind=0(ENTER) method_node=" UINT64_FORMAT "\n",
+              (unsigned)token, stored->class_name, stored->method_name, descriptor,
+              (uint64_t)loader_id, hidden ? 1 : 0, (uint64_t)mnode);
+    } else if (!resolved) {
+      fprintf(stderr, "[JVM GRAPH IDENTITY] token=%u class=%s method=%s identity-unresolved"
+              " (no Method node linked)\n", (unsigned)token, stored->class_name,
+              stored->method_name);
+    }
+    // Cross-thread causality: if this thread carries a pending async context
+    // (set when it was started, or when it picked up an executor task), link it
+    // to this first worker frame and clear it (one-shot).
+    if (g_soroush_pending_active) {
+      soroush_graph_async_continue(g_soroush_pending_cause_exec,
+                                   g_soroush_pending_owner_node, (uint64_t)id);
+      g_soroush_pending_active = false;
+      g_soroush_pending_cause_exec = 0;
+      g_soroush_pending_owner_node = 0;
+    }
+    // MethodHandle / LambdaForm execution overlay: when an instrumented
+    // MethodHandle-internal method executes, surface it as a first-class
+    // LambdaFormExec node tied to this Execution, so the adapter chain (the
+    // LambdaForm bytecode running) is queryable as MH nodes, not just generic
+    // executions. (Class name here is dotted, e.g. java.lang.invoke.LambdaForm$DMH.)
+    const char* cn = stored->class_name;
+    if (cn != nullptr && strncmp(cn, "java.lang.invoke.", 17) == 0) {
+      const char* tail = cn + 17;
+      if (strncmp(tail, "LambdaForm", 10) == 0 ||
+          strncmp(tail, "DirectMethodHandle", 18) == 0 ||
+          strncmp(tail, "BoundMethodHandle", 17) == 0 ||
+          strncmp(tail, "DelegatingMethodHandle", 22) == 0 ||
+          strncmp(tail, "Invokers", 8) == 0) {
+        char lf_name[320];
+        jio_snprintf(lf_name, sizeof(lf_name), "%s.%s", cn, stored->method_name);
+        soroush_graph_lambdaform_exec((uint64_t)id, lf_name);
+      }
+    }
+  }
 
   fprintf(stderr,
           "[JVM TRACE] id=" UINT64_FORMAT " parent=" UINT64_FORMAT " thread=%s %s %s.%s\n",
@@ -506,7 +607,53 @@ JVM_ENTRY(void, JVM_SoroushTrace(JNIEnv *env, jclass ignored, jstring event))
           enter ? "ENTER" : "EXIT",
           stored->class_name,
           stored->method_name);
+}
+
+// Exact method-token trace ABI. The rewriter injects
+// System.soroushTraceEnter(int)/soroushTraceExit(int) with a per-method token
+// that resolves (via the method-token registry) to the method's exact identity
+// (class/name/descriptor/loader/hidden). eventKind is encoded by which method is
+// called: Enter == kind 0, Exit == kind 1.
+static void soroush_trace_token(JavaThread* thread, jint token, bool enter) {
+  // soroush_runtime_record_event -> soroush_thread_name -> as_utf8_string
+  // allocates in the resource area; needs a ResourceMark (fastdebug enforces it).
+  ResourceMark rm(thread);
+  const char* dotted = nullptr;
+  const char* method = nullptr;
+  const char* descriptor = nullptr;
+  uint64_t loader_id = 0;
+  int hidden = 0;
+  uint32_t crc = 0;
+  bool found = soroush_method_token_lookup((uint32_t)token, &dotted, &method, &descriptor,
+                                           &loader_id, &hidden, &crc);
+  const char* cls = found && dotted != nullptr ? dotted : "<unresolved>";
+  const char* mth = found && method != nullptr ? method : "<unresolved>";
+  const char* dsc = found && descriptor != nullptr ? descriptor : "";
+  fprintf(stderr, "[JVM TRACE METHOD] %s token=%u %s.%s%s loader=" UINT64_FORMAT " hidden=%d%s\n",
+          enter ? "ENTER" : "EXIT", (unsigned)token, cls, mth, dsc, (uint64_t)loader_id,
+          hidden ? 1 : 0, found ? "" : " identity-unresolved");
+
+  if (!soroush_runtime_graph_enabled()) {
+    return;
+  }
+  soroush_runtime_record_event(thread, enter, cls, strlen(cls), mth, strlen(mth),
+                               found ? descriptor : nullptr, loader_id, hidden,
+                               (uint32_t)token);
+}
+
+JVM_ENTRY(void, JVM_SoroushTraceEnter(JNIEnv *env, jclass ignored, jint token))
+  soroush_trace_token(thread, token, true);
 JVM_END
+
+JVM_ENTRY(void, JVM_SoroushTraceExit(JNIEnv *env, jclass ignored, jint token))
+  soroush_trace_token(thread, token, false);
+JVM_END
+
+// Exposed for the MethodHandle execution tracer (methodHandles/linkResolver):
+// the calling thread's current top-of-stack execution id (0 if none).
+extern "C" uint64_t soroush_runtime_current_exec_id() {
+  return soroush_current_exec_id();
+}
 
 extern "C" void soroush_runtime_graph_print_summary() {
   if (!soroush_runtime_graph_enabled()) {
@@ -524,6 +671,59 @@ extern "C" void soroush_runtime_graph_print_summary() {
           Atomic::load(&g_soroush_runtime_thread_count),
           SOROUSH_RUNTIME_RING_SIZE);
 }
+
+// --- Async / cross-thread causality bridges (called from instrumented JDK
+//     concurrent classes; see java/util/concurrent/{ThreadPoolExecutor,
+//     ForkJoinPool,ForkJoinTask}.java). Observational and fail-safe: a no-op
+//     unless the unified provenance graph is enabled. ---
+
+// Cached gate read once by the JDK concurrent classes' static initializers, so
+// the (object identity hash) work on their hot paths is skipped when disabled.
+JVM_LEAF(jboolean, JVM_SoroushAsyncEnabled(JNIEnv* env, jclass ignored))
+  return soroush_graph_enabled() ? JNI_TRUE : JNI_FALSE;
+JVM_END
+
+// kind: 1 = SUBMIT (task scheduled by the current execution onto executor),
+//       2 = RUN    (current worker thread is about to run task).
+JVM_ENTRY(void, JVM_SoroushAsyncHandoff(JNIEnv* env, jclass ignored, jint kind,
+                                        jobject task, jobject executor))
+  if (!soroush_graph_enabled() || task == nullptr) {
+    return;
+  }
+  ResourceMark rm(THREAD);
+  oop task_oop = JNIHandles::resolve_non_null(task);
+  uint32_t task_hash = (uint32_t)ObjectSynchronizer::FastHashCode(THREAD, task_oop);
+  uint64_t cur_tid = (uint64_t)os::current_thread_id();
+
+  if (kind == 1) { // SUBMIT
+    uint32_t executor_hash = 0;
+    const char* executor_label = "Executor";
+    if (executor != nullptr) {
+      oop ex_oop = JNIHandles::resolve_non_null(executor);
+      executor_hash = (uint32_t)ObjectSynchronizer::FastHashCode(THREAD, ex_oop);
+      executor_label = ex_oop->klass()->external_name();
+    }
+    uint64_t cur_exec = soroush_current_exec_id();
+    soroush_graph_async_submit(task_hash, executor_hash, cur_exec, cur_tid, executor_label);
+    fprintf(stderr, "[JVM GRAPH ASYNC] submit task=%08x executor=%08x submitter_exec="
+            UINT64_FORMAT " tid=" UINT64_FORMAT "\n",
+            task_hash, executor_hash, cur_exec, cur_tid);
+  } else if (kind == 2) { // RUN
+    uint64_t submitter_exec = 0;
+    uint64_t async_node = 0;
+    bool found = soroush_graph_async_run(task_hash, cur_tid, &submitter_exec, &async_node);
+    if (found) {
+      // Stash as this worker thread's pending async context; the next
+      // instrumented ENTER on this thread links the worker frame across threads.
+      g_soroush_pending_cause_exec = submitter_exec;
+      g_soroush_pending_owner_node = async_node;
+      g_soroush_pending_active = true;
+    }
+    fprintf(stderr, "[JVM GRAPH ASYNC] run task=%08x worker_tid=" UINT64_FORMAT
+            " linked=%d submitter_exec=" UINT64_FORMAT "\n",
+            task_hash, cur_tid, found ? 1 : 0, submitter_exec);
+  }
+JVM_END
 
 
 static void set_property(Handle props, const char* key, const char* value, TRAPS) {
@@ -3147,6 +3347,29 @@ void jio_print(const char* s, size_t len) {
 static void thread_entry(JavaThread* thread, TRAPS) {
   HandleMark hm(THREAD);
   Handle obj(THREAD, thread->threadObj());
+
+  // Cross-thread causality: consume the context the parent recorded at
+  // JVM_StartThread and link parent execution -> this worker thread. Sets this
+  // thread's pending async context, consumed at its first instrumented ENTER.
+  if (soroush_graph_enabled()) {
+    SoroushThreadStartCtx ctx;
+    if (soroush_tstart_take(thread, &ctx)) {
+      ResourceMark rm(THREAD);
+      char child_fallback[32];
+      const char* child_name = soroush_thread_name(thread, child_fallback, sizeof(child_fallback));
+      uint64_t child_tid = (uint64_t)os::current_thread_id();
+      uint64_t child_node = soroush_graph_thread_start(ctx.parent_tid, ctx.parent_name,
+                                                       ctx.parent_exec_id, child_tid,
+                                                       child_name, 0);
+      g_soroush_pending_cause_exec = ctx.parent_exec_id;
+      g_soroush_pending_owner_node = child_node;
+      g_soroush_pending_active = true;
+      fprintf(stderr, "[JVM GRAPH THREAD] start parent_tid=" UINT64_FORMAT
+              " parent_exec=" UINT64_FORMAT " child_tid=" UINT64_FORMAT " child=%s\n",
+              ctx.parent_tid, ctx.parent_exec_id, child_tid, child_name);
+    }
+  }
+
   JavaValue result(T_VOID);
   JavaCalls::call_virtual(&result,
                           obj,
@@ -3248,6 +3471,16 @@ JVM_ENTRY(void, JVM_StartThread(JNIEnv* env, jobject jthread))
   }
 
   JFR_ONLY(Jfr::on_java_thread_start(thread, native_thread);)
+
+  // Cross-thread causality: record the starting (parent) thread's context keyed
+  // by the new child JavaThread*, to be consumed by the child in thread_entry.
+  if (soroush_graph_enabled()) {
+    ResourceMark rm(thread);
+    char parent_fallback[32];
+    const char* parent_name = soroush_thread_name(thread, parent_fallback, sizeof(parent_fallback));
+    soroush_tstart_put(native_thread, (uint64_t)os::current_thread_id(),
+                       soroush_current_exec_id(), parent_name);
+  }
 
   Thread::start(native_thread);
 
@@ -3768,10 +4001,118 @@ jclass find_class_from_class_loader(JNIEnv* env, Symbol* name, jboolean init,
 
 // Method ///////////////////////////////////////////////////////////////////////////////////////////
 
+// ---------------------------------------------------------------------------
+// Soroush: exact source callsite capture for reflection / MethodHandle.
+//
+// sg_reflect_frame_info walks the Java vframe stack, skipping internal
+// reflection frames (jdk/internal/reflect/*, java/lang/reflect/*,
+// sun/reflect/*).  On finding the first non-reflection interpreted or
+// compiled frame it fills *out_* and returns true.
+//
+// On success:
+//   *out_opcode_byte = raw Java opcode at src_bci (via Bytecodes::java_code_at)
+//   *out_cp_index    = original CP index from the bytecode's CP-cache entry
+//                      (-1 if conversion fails or the index is out of range)
+// Returns false and leaves all out-params at their defaults on any failure.
+// No fake precision: a compiled user frame with a valid BCI returns true (BCI
+// comes from compiled debug-info and is exact at call-site boundaries).
+// ---------------------------------------------------------------------------
+static bool sg_reflect_frame_info(JavaThread* jt,
+    const char** out_class, uint64_t* out_loader,
+    const char** out_method, const char** out_desc,
+    int* out_bci, int* out_opcode_byte, int* out_cp_index) {
+  *out_class  = nullptr; *out_loader = 0;
+  *out_method = nullptr; *out_desc   = nullptr;
+  *out_bci    = -1; *out_opcode_byte = 0; *out_cp_index = -1;
+
+  if (!jt->has_last_Java_frame()) return false;
+
+  for (vframeStream vfst(jt); !vfst.at_end(); vfst.next()) {
+    Method* m = vfst.method();
+    if (m == nullptr) continue;
+    const char* holder = m->method_holder()->name()->as_C_string();
+    // Skip all JDK reflection-internal frames.
+    if (strncmp(holder, "jdk/internal/reflect/", 21) == 0 ||
+        strncmp(holder, "java/lang/reflect/",   18) == 0 ||
+        strncmp(holder, "sun/reflect/",          12) == 0) {
+      continue;
+    }
+    // First non-reflection frame is the user's callsite.
+    int bci = vfst.bci();
+    if (bci < 0) return false; // invalid; don't guess
+    *out_class  = holder;
+    *out_loader = (uint64_t)(uintptr_t)m->method_holder()->class_loader_data();
+    *out_method = m->name()->as_C_string();
+    *out_desc   = m->signature()->as_C_string();
+    *out_bci    = bci;
+    // Decode opcode and CP index from the bytecode array.
+    if (bci < m->code_size()) {
+      address bcp = m->bcp_from(bci);
+      *out_opcode_byte = (int)(uint8_t)Bytecodes::java_code_at(m, bcp);
+      // Bytes 1-2 after opcode are the CP-cache index (big-endian).
+      if (bci + 2 < m->code_size()) {
+        int cp_cache_idx = (((int)(uint8_t)m->code_base()[bci + 1]) << 8)
+                         |  ((int)(uint8_t)m->code_base()[bci + 2]);
+        ConstantPool* cp = m->constants();
+        if (cp != nullptr && cp->cache() != nullptr
+            && cp_cache_idx >= 0 && cp_cache_idx < cp->cache()->length()) {
+          *out_cp_index = cp->cache()->entry_at(cp_cache_idx)->constant_pool_index();
+        }
+      }
+    }
+    return true;
+  }
+  return false; // user frame not found in vframe chain
+}
+
 JVM_ENTRY(jobject, JVM_InvokeMethod(JNIEnv *env, jobject method, jobject obj, jobjectArray args0))
   Handle method_handle;
   if (thread->stack_overflow_state()->stack_available((address) &method_handle) >= JVMInvokeMethodSlack) {
     method_handle = Handle(THREAD, JNIHandles::resolve(method));
+
+    // Soroush: capture exact callsite identity for reflection Method.invoke.
+    // Runs before Reflection::invoke_method so the Java stack is intact.
+    if (soroush_graph_enabled()) {
+      ResourceMark rm_refl(THREAD);
+      // Extract resolved target from the java.lang.reflect.Method object.
+      oop moop = method_handle();
+      oop clazz = java_lang_reflect_Method::clazz(moop);
+      int slot  = java_lang_reflect_Method::slot(moop);
+      Klass* k  = java_lang_Class::as_Klass(clazz);
+      const char* tgt_class  = nullptr;
+      const char* tgt_method = nullptr;
+      const char* tgt_desc   = nullptr;
+      uint64_t    tgt_loader = 0;
+      bool tgt_ok = false;
+      if (k != nullptr && k->is_instance_klass()) {
+        Method* tm = InstanceKlass::cast(k)->method_with_idnum(slot);
+        if (tm != nullptr) {
+          tgt_class  = tm->method_holder()->name()->as_C_string();
+          tgt_loader = (uint64_t)(uintptr_t)tm->method_holder()->class_loader_data();
+          tgt_method = tm->name()->as_C_string();
+          tgt_desc   = tm->signature()->as_C_string();
+          tgt_ok = true;
+        }
+      }
+      // Walk Java stack past reflection internals to the user's callsite.
+      const char* src_class  = nullptr;
+      const char* src_method = nullptr;
+      const char* src_desc   = nullptr;
+      int  src_bci    = -1;
+      int  src_opcode = 0;
+      int  src_cp     = -1;
+      uint64_t src_loader = 0;
+      bool src_ok = sg_reflect_frame_info(thread,
+          &src_class, &src_loader, &src_method, &src_desc,
+          &src_bci, &src_opcode, &src_cp);
+      const char* reason = src_ok ? nullptr : "source_frame_unavailable_or_compiled";
+      soroush_graph_generic_callsite("reflection_method_invoke",
+          src_class, src_loader, src_method, src_desc,
+          src_bci, src_opcode, src_cp,
+          tgt_class, tgt_loader, tgt_method, tgt_desc,
+          src_ok, tgt_ok, reason);
+    }
+
     Handle receiver(THREAD, JNIHandles::resolve(obj));
     objArrayHandle args(THREAD, objArrayOop(JNIHandles::resolve(args0)));
     oop result = Reflection::invoke_method(method_handle(), receiver, args, CHECK_NULL);
@@ -3794,6 +4135,46 @@ JVM_END
 
 JVM_ENTRY(jobject, JVM_NewInstanceFromConstructor(JNIEnv *env, jobject c, jobjectArray args0))
   oop constructor_mirror = JNIHandles::resolve(c);
+
+  // Soroush: capture exact callsite identity for Constructor.newInstance.
+  if (soroush_graph_enabled()) {
+    ResourceMark rm_ctor(THREAD);
+    oop clazz = java_lang_reflect_Constructor::clazz(constructor_mirror);
+    int slot  = java_lang_reflect_Constructor::slot(constructor_mirror);
+    Klass* k  = java_lang_Class::as_Klass(clazz);
+    const char* tgt_class  = nullptr;
+    const char* tgt_method = nullptr;
+    const char* tgt_desc   = nullptr;
+    uint64_t    tgt_loader = 0;
+    bool tgt_ok = false;
+    if (k != nullptr && k->is_instance_klass()) {
+      Method* tm = InstanceKlass::cast(k)->method_with_idnum(slot);
+      if (tm != nullptr) {
+        tgt_class  = tm->method_holder()->name()->as_C_string();
+        tgt_loader = (uint64_t)(uintptr_t)tm->method_holder()->class_loader_data();
+        tgt_method = tm->name()->as_C_string();
+        tgt_desc   = tm->signature()->as_C_string();
+        tgt_ok = true;
+      }
+    }
+    const char* src_class  = nullptr;
+    const char* src_method = nullptr;
+    const char* src_desc   = nullptr;
+    int  src_bci    = -1;
+    int  src_opcode = 0;
+    int  src_cp     = -1;
+    uint64_t src_loader = 0;
+    bool src_ok = sg_reflect_frame_info(thread,
+        &src_class, &src_loader, &src_method, &src_desc,
+        &src_bci, &src_opcode, &src_cp);
+    const char* reason = src_ok ? nullptr : "source_frame_unavailable_or_compiled";
+    soroush_graph_generic_callsite("reflection_constructor_newInstance",
+        src_class, src_loader, src_method, src_desc,
+        src_bci, src_opcode, src_cp,
+        tgt_class, tgt_loader, tgt_method, tgt_desc,
+        src_ok, tgt_ok, reason);
+  }
+
   objArrayHandle args(THREAD, objArrayOop(JNIHandles::resolve(args0)));
   oop result = Reflection::invoke_constructor(constructor_mirror, args, CHECK_NULL);
   jobject res = JNIHandles::make_local(THREAD, result);

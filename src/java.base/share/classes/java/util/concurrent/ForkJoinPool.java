@@ -2351,6 +2351,13 @@ public class ForkJoinPool extends AbstractExecutorService {
         throw new RejectedExecutionException();
     }
 
+    // Soroush unified provenance graph: cross-thread causality gate. Read once;
+    // observational and fail-safe (false unless the graph is enabled).
+    private static final boolean SOROUSH_ASYNC = soroushAsyncInit();
+    private static boolean soroushAsyncInit() {
+        try { return System.soroushAsyncEnabled(); } catch (Throwable t) { return false; }
+    }
+
     /**
      * Pushes a submission to the pool, using internal queue if called
      * from ForkJoinWorkerThread, else external queue.
@@ -2360,6 +2367,7 @@ public class ForkJoinPool extends AbstractExecutorService {
         WorkQueue q; Thread t; ForkJoinWorkerThread wt;
         U.storeStoreFence();  // ensure safely publishable
         if (task == null) throw new NullPointerException();
+        if (SOROUSH_ASYNC) System.soroushAsyncHandoff(1, task, this);
         if (((t = Thread.currentThread()) instanceof ForkJoinWorkerThread) &&
             (wt = (ForkJoinWorkerThread)t).pool == this)
             q = wt.workQueue;

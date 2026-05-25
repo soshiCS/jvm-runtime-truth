@@ -32,6 +32,7 @@
 #include "classfile/classLoadInfo.hpp"
 #include "classfile/klassFactory.hpp"
 #include "classfile/soroushClassfileRewriter.hpp"
+#include "classfile/soroushProvenanceGraph.hpp"
 #include "memory/resourceArea.hpp"
 #include "prims/jvmtiEnvBase.hpp"
 #include "prims/jvmtiRedefineClasses.hpp"
@@ -154,15 +155,62 @@ static bool soroush_rewriter_phase5_normal_exit_enabled() {
   return enabled == 1;
 }
 
+// Additive toggle: when SOROUSH_TRACE_MH_EXEC=1, also instrument the JDK's
+// MethodHandle/LambdaForm internal classes so the adapter chain is visible
+// *executing* (ENTER/EXIT) at runtime, on top of whatever PHASE5 prefix the
+// user chose for their own code. Observational; still fully verifier-safe and
+// fail-safe (any method we can't prove safe is per-method skipped as usual).
+static bool soroush_mh_exec_instrument_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = getenv("SOROUSH_TRACE_MH_EXEC");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+// Even more aggressive opt-in: allow the rewriter to instrument the JDK's
+// *hidden* MethodHandle-internal classes (the runtime-customized dispatch
+// LambdaForms, e.g. LambdaForm$BMH+0x...). The rewriter otherwise skips ALL
+// hidden classes (conservative). This lets the actual per-invocation dispatch
+// chain be traced, at the cost of touching very sensitive machinery — hence a
+// distinct, explicit flag, off by default. Still fully verifier-safe + per-method
+// fail-safe; if it destabilizes the MH runtime, leave it off (documented).
+static bool soroush_mh_exec_hidden_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = getenv("SOROUSH_TRACE_MH_EXEC_HIDDEN");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static bool soroush_is_mh_internal_class(const char* n) {
+  if (n == nullptr) return false;
+  return strncmp(n, "java/lang/invoke/LambdaForm", 27) == 0 ||
+         strncmp(n, "java/lang/invoke/DirectMethodHandle", 35) == 0 ||
+         strncmp(n, "java/lang/invoke/BoundMethodHandle", 34) == 0 ||
+         strncmp(n, "java/lang/invoke/DelegatingMethodHandle", 39) == 0 ||
+         strncmp(n, "java/lang/invoke/Invokers", 25) == 0;
+}
+
 static bool soroush_rewriter_phase5_matches(const char* class_name) {
-  const char* prefix = getenv("SOROUSH_REWRITER_PHASE5_PREFIX");
-  if (class_name == nullptr || prefix == nullptr || prefix[0] == '\0') {
+  if (class_name == nullptr) {
     return false;
   }
-  if (strcmp(prefix, "*") == 0) {
+  const char* prefix = getenv("SOROUSH_REWRITER_PHASE5_PREFIX");
+  if (prefix != nullptr && prefix[0] != '\0') {
+    if (strcmp(prefix, "*") == 0) {
+      return true;
+    }
+    if (strncmp(class_name, prefix, strlen(prefix)) == 0) {
+      return true;
+    }
+  }
+  if (soroush_mh_exec_instrument_enabled() && soroush_is_mh_internal_class(class_name)) {
     return true;
   }
-  return strncmp(class_name, prefix, strlen(prefix)) == 0;
+  return false;
 }
 
 static bool has_branches_or_throw(const u1* code, u4 code_len) {
@@ -181,62 +229,6 @@ static bool has_branches_or_throw(const u1* code, u4 code_len) {
     }
   }
   return false;
-}
-
-static u2 read_u2(const u1* p) {
-  return ((u2)p[0] << 8) | p[1];
-}
-
-static u4 read_u4(const u1* p) {
-  return ((u4)p[0] << 24) | ((u4)p[1] << 16) | ((u4)p[2] << 8) | p[3];
-}
-
-static void write_u2(u1* p, u2 v) {
-  p[0] = (u1)(v >> 8);
-  p[1] = (u1)v;
-}
-
-static void write_u4(u1* p, u4 v) {
-  p[0] = (u1)(v >> 24);
-  p[1] = (u1)(v >> 16);
-  p[2] = (u1)(v >> 8);
-  p[3] = (u1)v;
-}
-
-static void emit_u1(u1*& p, u1 v) { *p++ = v; }
-static void emit_u2(u1*& p, u2 v) { write_u2(p, v); p += 2; }
-
-static void emit_ldc_w(u1*& p, u2 string_index) {
-  emit_u1(p, 0x13);
-  emit_u2(p, string_index);
-}
-
-static void emit_invokestatic(u1*& p, u2 methodref) {
-  emit_u1(p, 0xb8);
-  emit_u2(p, methodref);
-}
-
-static void emit_soroush_trace(u1*& p, u2 string_index, u2 methodref) {
-  emit_ldc_w(p, string_index);
-  emit_invokestatic(p, methodref);
-}
-
-struct SoroushMethodRewrite {
-  bool rewrite;
-  u2 enter_string_index;
-  u2 exit_string_index;
-  int return_count;
-  char enter_msg[512];
-  char exit_msg[512];
-};
-
-static bool should_rewrite_soroush_class(const char* class_name) {
-  const char* prefix = getenv("SOROUSH_REWRITE_PREFIX");
-  if (prefix == nullptr || prefix[0] == '\0') {
-    prefix = "com/example/springboot/";
-  }
-  if (strcmp(prefix, "*") == 0) return true;
-  return strncmp(class_name, prefix, strlen(prefix)) == 0;
 }
 
 static bool should_dump_soroush_class(bool is_hidden, const char* class_name) {
@@ -602,6 +594,14 @@ static void recover_runtime_generated_class(const char* class_name,
   fprintf(stderr, "[JVM RECOVER] loader=%s\n", loader_name);
   fprintf(stderr, "[JVM RECOVER] dumped=%s\n", dumped ? path : "<failed>");
   fprintf(stderr, "[JVM RECOVER] metadata=%s\n", metadata_path);
+
+  // Unified provenance graph: GeneratedClass node (+ GENERATED_FROM / CREATED_BY).
+  if (soroush_graph_enabled()) {
+    soroush_graph_generated_class(logged_name, hidden ? 1 : 0,
+                                  provenance.generated_by, provenance.source_trigger,
+                                  provenance.provenance_kind, provenance.trace_id,
+                                  crc, (uint64_t)(uintptr_t)loader_data);
+  }
 }
 
 extern "C" void soroush_runtime_recovery_print_summary() {
@@ -617,465 +617,6 @@ extern "C" void soroush_runtime_recovery_print_summary() {
           Atomic::load(&g_recover_transformed_count));
 }
 
-static u1* rewrite_soroush_main(const u1* old_bytes,
-                                int old_len,
-                                const char* dotted_class_name,
-                                int* new_len_out) {
-  if (read_u4(old_bytes) != 0xCAFEBABE) return nullptr;
-
-  u2 old_cp_count = read_u2(old_bytes + 8);
-  const char** cp_utf8 = (const char**)calloc(old_cp_count, sizeof(char*));
-  u2* cp_utf8_len = (u2*)calloc(old_cp_count, sizeof(u2));
-  if (cp_utf8 == nullptr || cp_utf8_len == nullptr) {
-    free(cp_utf8);
-    free(cp_utf8_len);
-    return nullptr;
-  }
-
-  const u1* p = old_bytes + 10;
-  const u1* cp_start = p;
-
-  int code_utf8_index = -1;
-
-  for (u2 i = 1; i < old_cp_count; i++) {
-    u1 tag = *p++;
-
-    switch (tag) {
-      case 1: {
-        u2 len = read_u2(p);
-        const char* s = (const char*)(p + 2);
-
-        cp_utf8[i] = s;
-        cp_utf8_len[i] = len;
-
-        if (len == 4 && memcmp(s, "Code", 4) == 0) code_utf8_index = i;
-
-        p += 2 + len;
-        break;
-      }
-
-      case 3:
-      case 4:
-        p += 4;
-        break;
-
-      case 5:
-      case 6:
-        p += 8;
-        i++;
-        break;
-
-      case 7:
-      case 8:
-      case 16:
-      case 19:
-      case 20:
-        p += 2;
-        break;
-
-      case 9:
-      case 10:
-      case 11:
-      case 12:
-      case 18:
-      case 17:
-        p += 4;
-        break;
-
-      case 15:
-        p += 3;
-        break;
-
-      default:
-        free(cp_utf8);
-        free(cp_utf8_len);
-        return nullptr;
-    }
-  }
-
-  if (code_utf8_index < 0) {
-    free(cp_utf8);
-    free(cp_utf8_len);
-    return nullptr;
-  }
-
-  const u1* cp_end = p;
-  int old_cp_size = (int)(cp_end - cp_start);
-  const u1* body_start = cp_end;
-  const u1* scan = body_start;
-
-  // access_flags, this_class, super_class
-  scan += 6;
-
-  u2 scan_interfaces_count = read_u2(scan);
-  scan += 2 + scan_interfaces_count * 2;
-
-  u2 scan_fields_count = read_u2(scan);
-  scan += 2;
-
-  for (u2 i = 0; i < scan_fields_count; i++) {
-    scan += 6;
-    u2 ac = read_u2(scan);
-    scan += 2;
-    for (u2 j = 0; j < ac; j++) {
-      scan += 2;
-      u4 alen = read_u4(scan);
-      scan += 4 + alen;
-    }
-  }
-
-  u2 scan_methods_count = read_u2(scan);
-  scan += 2;
-
-  SoroushMethodRewrite* method_rewrites =
-      (SoroushMethodRewrite*)calloc(scan_methods_count, sizeof(SoroushMethodRewrite));
-  if (method_rewrites == nullptr) {
-    free(cp_utf8);
-    free(cp_utf8_len);
-    return nullptr;
-  }
-
-  int rewrite_count = 0;
-  int code_extra = 0;
-  int max_rewrite_count = (65535 - old_cp_count - 6) / 4;
-
-  for (u2 mi = 0; mi < scan_methods_count; mi++) {
-    scan += 2;
-    u2 m_name = read_u2(scan); scan += 2;
-    scan += 2;
-    u2 attr_count = read_u2(scan); scan += 2;
-
-    const char* method_name = cp_utf8[m_name];
-    u2 method_name_len = cp_utf8_len[m_name];
-    bool is_constructor =
-        method_name != nullptr &&
-        ((method_name_len == 6 && memcmp(method_name, "<init>", 6) == 0) ||
-         (method_name_len == 8 && memcmp(method_name, "<clinit>", 8) == 0));
-    bool method_has_code = false;
-    bool method_has_branches_or_throw = false;
-    bool method_has_exception_table = false;
-    int return_count = 0;
-
-    for (u2 ai = 0; ai < attr_count; ai++) {
-      u2 attr_name = read_u2(scan); scan += 2;
-      u4 attr_len = read_u4(scan); scan += 4;
-      const u1* attr_body = scan;
-      scan += attr_len;
-
-      if (!is_constructor && attr_name == code_utf8_index) {
-        const u1* c = attr_body;
-        c += 2; // max_stack
-        c += 2; // max_locals
-        u4 code_len = read_u4(c); c += 4;
-        const u1* code = c;
-        method_has_code = true;
-        method_has_branches_or_throw = has_branches_or_throw(code, code_len);
-        c += code_len;
-        u2 exception_table_len = read_u2(c);
-        method_has_exception_table = exception_table_len > 0;
-        for (u4 k = 0; k < code_len; k++) {
-          if (code[k] == 0xb1) {
-            return_count++;
-          }
-        }
-      }
-    }
-
-    if (rewrite_count < max_rewrite_count &&
-        method_name != nullptr &&
-        !is_constructor &&
-        method_has_code &&
-        return_count > 0 &&
-        !method_has_exception_table &&
-        !method_has_branches_or_throw) {
-      SoroushMethodRewrite* rewrite = &method_rewrites[mi];
-      rewrite->rewrite = true;
-      rewrite->return_count = return_count;
-      snprintf(rewrite->enter_msg, sizeof(rewrite->enter_msg),
-               "ENTER %s.%.*s",
-               dotted_class_name, method_name_len, method_name);
-      snprintf(rewrite->exit_msg, sizeof(rewrite->exit_msg),
-               "EXIT %s.%.*s",
-               dotted_class_name, method_name_len, method_name);
-      code_extra += 6 + return_count * 6;
-      rewrite_count++;
-    }
-  }
-
-  if (rewrite_count == 0) {
-    free(method_rewrites);
-    free(cp_utf8);
-    free(cp_utf8_len);
-    return nullptr;
-  }
-
-  u2 idx_utf8_system = old_cp_count;
-  u2 idx_class_system = old_cp_count + 1;
-  u2 idx_utf8_soroush_trace = old_cp_count + 2;
-  u2 idx_utf8_soroush_trace_desc = old_cp_count + 3;
-  u2 idx_nt_soroush_trace = old_cp_count + 4;
-  u2 idx_method_soroush_trace = old_cp_count + 5;
-
-  u2 next_method_cp_index = old_cp_count + 6;
-  for (u2 mi = 0; mi < scan_methods_count; mi++) {
-    if (method_rewrites[mi].rewrite) {
-      method_rewrites[mi].enter_string_index = next_method_cp_index + 1;
-      method_rewrites[mi].exit_string_index = next_method_cp_index + 3;
-      next_method_cp_index += 4;
-    }
-  }
-
-  u2 new_cp_count = old_cp_count + 6 + rewrite_count * 4;
-
-  int cp_extra = 0;
-  cp_extra += 1 + 2 + (int)strlen("java/lang/System");
-  cp_extra += 1 + 2;
-  cp_extra += 1 + 2 + (int)strlen("soroushTrace");
-  cp_extra += 1 + 2 + (int)strlen("(Ljava/lang/String;)V");
-  cp_extra += 1 + 2 + 2;
-  cp_extra += 1 + 2 + 2;
-
-  for (u2 mi = 0; mi < scan_methods_count; mi++) {
-    if (method_rewrites[mi].rewrite) {
-      cp_extra += 1 + 2 + (int)strlen(method_rewrites[mi].enter_msg);
-      cp_extra += 1 + 2;
-      cp_extra += 1 + 2 + (int)strlen(method_rewrites[mi].exit_msg);
-      cp_extra += 1 + 2;
-    }
-  }
-
-  int max_new_size = old_len + cp_extra + code_extra + 1024;
-  u1* out = (u1*)malloc(max_new_size);
-  if (out == nullptr) {
-    free(method_rewrites);
-    free(cp_utf8);
-    free(cp_utf8_len);
-    return nullptr;
-  }
-
-  u1* q = out;
-
-  memcpy(q, old_bytes, 8);
-  q += 8;
-  write_u2(q, new_cp_count);
-  q += 2;
-
-  memcpy(q, cp_start, old_cp_size);
-  q += old_cp_size;
-
-#define ADD_UTF8(str) do { \
-    const char* s = (str); \
-    int len = (int)strlen(s); \
-    emit_u1(q, 1); \
-    emit_u2(q, (u2)len); \
-    memcpy(q, s, len); \
-    q += len; \
-  } while (0)
-
-#define ADD_CLASS(name_index) do { \
-    emit_u1(q, 7); \
-    emit_u2(q, name_index); \
-  } while (0)
-
-#define ADD_STRING(utf8_index) do { \
-    emit_u1(q, 8); \
-    emit_u2(q, utf8_index); \
-  } while (0)
-
-#define ADD_NAME_AND_TYPE(name_index, desc_index) do { \
-    emit_u1(q, 12); \
-    emit_u2(q, name_index); \
-    emit_u2(q, desc_index); \
-  } while (0)
-
-#define ADD_FIELDREF(class_index, nt_index) do { \
-    emit_u1(q, 9); \
-    emit_u2(q, class_index); \
-    emit_u2(q, nt_index); \
-  } while (0)
-
-#define ADD_METHODREF(class_index, nt_index) do { \
-    emit_u1(q, 10); \
-    emit_u2(q, class_index); \
-    emit_u2(q, nt_index); \
-  } while (0)
-
-  ADD_UTF8("java/lang/System");
-  ADD_CLASS(idx_utf8_system);
-  ADD_UTF8("soroushTrace");
-  ADD_UTF8("(Ljava/lang/String;)V");
-  ADD_NAME_AND_TYPE(idx_utf8_soroush_trace, idx_utf8_soroush_trace_desc);
-  ADD_METHODREF(idx_class_system, idx_nt_soroush_trace);
-
-  next_method_cp_index = old_cp_count + 6;
-  for (u2 mi = 0; mi < scan_methods_count; mi++) {
-    if (method_rewrites[mi].rewrite) {
-      ADD_UTF8(method_rewrites[mi].enter_msg);
-      ADD_STRING(next_method_cp_index);
-      ADD_UTF8(method_rewrites[mi].exit_msg);
-      ADD_STRING(next_method_cp_index + 2);
-      next_method_cp_index += 4;
-    }
-  }
-
-#undef ADD_UTF8
-#undef ADD_CLASS
-#undef ADD_STRING
-#undef ADD_NAME_AND_TYPE
-#undef ADD_FIELDREF
-#undef ADD_METHODREF
-
-  const u1* r = body_start;
-
-  // access_flags, this_class, super_class
-  r += 6;
-
-  u2 interfaces_count = read_u2(r);
-  r += 2 + interfaces_count * 2;
-
-  u2 fields_count = read_u2(r);
-  r += 2;
-
-  for (u2 i = 0; i < fields_count; i++) {
-    r += 6;
-    u2 ac = read_u2(r);
-    r += 2;
-    for (u2 j = 0; j < ac; j++) {
-      r += 2;
-      u4 alen = read_u4(r);
-      r += 4 + alen;
-    }
-  }
-
-  const u1* methods_count_pos = r;
-  u2 methods_count = read_u2(r);
-  r += 2;
-
-  memcpy(q, body_start, methods_count_pos + 2 - body_start);
-  q += methods_count_pos + 2 - body_start;
-
-  bool changed = false;
-
-  for (u2 mi = 0; mi < methods_count; mi++) {
-    const u1* method_start = r;
-
-    u2 access = read_u2(r); r += 2;
-    u2 m_name = read_u2(r); r += 2;
-    u2 m_desc = read_u2(r); r += 2;
-    u2 attr_count = read_u2(r); r += 2;
-    (void)access;
-    (void)m_desc;
-    const char* method_name = cp_utf8[m_name];
-    u2 method_name_len = cp_utf8_len[m_name];
-    bool is_constructor =
-        method_name != nullptr &&
-        ((method_name_len == 6 && memcmp(method_name, "<init>", 6) == 0) ||
-         (method_name_len == 8 && memcmp(method_name, "<clinit>", 8) == 0));
-
-    memcpy(q, method_start, 8);
-    q += 8;
-
-    SoroushMethodRewrite* rewrite = &method_rewrites[mi];
-    bool should_rewrite_method = rewrite->rewrite && !is_constructor;
-    for (u2 ai = 0; ai < attr_count; ai++) {
-      const u1* attr_start = r;
-      u2 attr_name = read_u2(r); r += 2;
-      u4 attr_len = read_u4(r); r += 4;
-      const u1* attr_body = r;
-      r += attr_len;
-
-      if (should_rewrite_method && attr_name == code_utf8_index) {
-        const u1* c = attr_body;
-
-        u2 max_stack = read_u2(c); c += 2;
-        u2 max_locals = read_u2(c); c += 2;
-        u4 code_len = read_u4(c); c += 4;
-
-        const u1* code = c;
-        c += code_len;
-
-
-        if (has_branches_or_throw(code, code_len)) {
-          memcpy(q, attr_start, 6 + attr_len);
-          q += 6 + attr_len;
-          continue;
-        }
-
-        u2 exception_table_len = read_u2(c);
-        const u1* exception_table = c;
-        int exception_table_size = 2 + exception_table_len * 8;
-        c += exception_table_size;
-
-        u2 code_attr_count = read_u2(c);
-        (void)code_attr_count;
-
-        int enter_len = 6;
-        int exit_len = 6;
-
-        int return_count = rewrite->return_count;
-
-        u4 new_code_len = code_len + enter_len + return_count * exit_len;
-        u4 new_attr_len =
-        2 + // max_stack
-        2 + // max_locals
-        4 + // code_length
-        new_code_len +
-        exception_table_size +
-        2;  // attributes_count = 0
-
-        write_u2(q, attr_name); q += 2;
-        write_u4(q, new_attr_len); q += 4;
-
-        write_u2(q, max_stack + 1); q += 2;
-        write_u2(q, max_locals); q += 2;
-        write_u4(q, new_code_len); q += 4;
-
-        emit_soroush_trace(q, rewrite->enter_string_index, idx_method_soroush_trace);
-
-        for (u4 k = 0; k < code_len; k++) {
-          if (code[k] == 0xb1) {
-            emit_soroush_trace(q, rewrite->exit_string_index, idx_method_soroush_trace);
-          }
-          emit_u1(q, code[k]);
-        }
-
-        // Copy exception table and code attributes unchanged.
-        // This is okay for your simple Main.main test.
-// Copy exception table unchanged
-
-memcpy(q, exception_table, exception_table_size);
-q += exception_table_size;
-
-// Drop Code sub-attributes:
-// LineNumberTable, LocalVariableTable, StackMapTable, etc.
-write_u2(q, 0);
-q += 2;
-
-        changed = true;
-      } else {
-        memcpy(q, attr_start, 6 + attr_len);
-        q += 6 + attr_len;
-      }
-    }
-  }
-
-  memcpy(q, r, old_bytes + old_len - r);
-  q += old_bytes + old_len - r;
-
-  if (!changed) {
-    free(out);
-    free(method_rewrites);
-    free(cp_utf8);
-    free(cp_utf8_len);
-    return nullptr;
-  }
-
-  *new_len_out = (int)(q - out);
-  free(method_rewrites);
-  free(cp_utf8);
-  free(cp_utf8_len);
-  return out;
-}
 // called during initial loading of a shared class
 InstanceKlass* KlassFactory::check_shared_class_file_load_hook(
                                           InstanceKlass* ik,
@@ -1258,12 +799,15 @@ if (phase1.ok) {
 SoroushClassfileRewriter::free_roundtrip(&phase1);
 }
 
-if (!cl_info.is_hidden() &&
+if ((!cl_info.is_hidden() ||
+     (soroush_mh_exec_hidden_enabled() && soroush_is_mh_internal_class(internal_class_name))) &&
     internal_class_name != nullptr &&
     soroush_rewriter_phase5_normal_exit_enabled() &&
     soroush_rewriter_phase5_matches(internal_class_name)) {
 SoroushClassfileRewriter::TransformResult phase5 =
-    SoroushClassfileRewriter::insert_entry_exit_trace(stream->buffer(), stream->length(), internal_class_name);
+    SoroushClassfileRewriter::insert_entry_exit_trace(stream->buffer(), stream->length(), internal_class_name,
+        (uint64_t)(uintptr_t)loader_data, cl_info.is_hidden() ? 1 : 0,
+        soroush_crc32(stream->buffer(), stream->length()));
 if (phase5.ok) {
   rewritten_bytes = phase5.bytes;
   rewritten_len = phase5.length;
@@ -1297,7 +841,9 @@ if (rewritten_bytes == nullptr &&
     soroush_rewriter_phase3_enter_enabled() &&
     soroush_rewriter_phase3_matches(internal_class_name)) {
 SoroushClassfileRewriter::TransformResult phase3 =
-    SoroushClassfileRewriter::insert_entry_trace(stream->buffer(), stream->length(), internal_class_name);
+    SoroushClassfileRewriter::insert_entry_trace(stream->buffer(), stream->length(), internal_class_name,
+        (uint64_t)(uintptr_t)loader_data, cl_info.is_hidden() ? 1 : 0,
+        soroush_crc32(stream->buffer(), stream->length()));
 if (phase3.ok) {
   rewritten_bytes = phase3.bytes;
   rewritten_len = phase3.length;
@@ -1355,40 +901,6 @@ if (phase2.ok) {
 SoroushClassfileRewriter::free_transform(&phase2);
 }
 
-if (rewritten_bytes == nullptr &&
-    !cl_info.is_hidden() &&
-    internal_class_name != nullptr &&
-    should_rewrite_soroush_class(internal_class_name)) {
-size_t class_name_len = strlen(internal_class_name);
-char* dotted_class_name = (char*)malloc(class_name_len + 1);
-if (dotted_class_name != nullptr) {
-for (size_t i = 0; i < class_name_len; i++) {
-dotted_class_name[i] = internal_class_name[i] == '/' ? '.' : internal_class_name[i];
-}
-dotted_class_name[class_name_len] = '\0';
-
-rewritten_bytes = rewrite_soroush_main(stream->buffer(),
- stream->length(),
- dotted_class_name,
- &rewritten_len);
-free(dotted_class_name);
-}
-
-if (rewritten_bytes != nullptr) {
-fprintf(stderr,
-"[JVM REWRITE] Rewrote %s, old=%d new=%d\n",
-internal_class_name,
-stream->length(),
-rewritten_len);
-
-actual_stream = new ClassFileStream(
-rewritten_bytes,
-rewritten_len,
-stream->source()
-);
-}
-}
-
 HandleMark hm(THREAD);
 
 JvmtiCachedClassFileData* cached_class_file = nullptr;
@@ -1414,6 +926,21 @@ capture_final_class_bytes(internal_class_name,
  transformed,
  cl_info.is_hidden(),
  load_kind);
+
+// Unified provenance graph: BytecodeArtifact node(s) (+ HAS_BYTECODE / REWRITTEN_FROM).
+if (soroush_graph_enabled()) {
+  uint64_t graph_loader_id = (uint64_t)(uintptr_t)loader_data;
+  int graph_hidden = cl_info.is_hidden() ? 1 : 0;
+  if (transformed) {
+    soroush_graph_bytecode(internal_class_name,
+                           soroush_crc32(stream->buffer(), stream->length()),
+                           stream->length(), 0, load_kind, graph_loader_id, graph_hidden);
+  }
+  soroush_graph_bytecode(internal_class_name,
+                         soroush_crc32(actual_stream->buffer(), actual_stream->length()),
+                         actual_stream->length(), transformed ? 1 : 0, load_kind,
+                         graph_loader_id, graph_hidden);
+}
 
 if (should_dump_soroush_class(cl_info.is_hidden(), internal_class_name)) {
 dump_class_bytes(internal_class_name,

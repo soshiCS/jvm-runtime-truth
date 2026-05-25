@@ -1140,6 +1140,7 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
                     wt.interrupt();
                 try {
                     beforeExecute(wt, task);
+                    if (SOROUSH_ASYNC) System.soroushAsyncHandoff(2, task, null);
                     try {
                         task.run();
                         afterExecute(task, null);
@@ -1336,9 +1337,17 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
      *         cannot be accepted for execution
      * @throws NullPointerException if {@code command} is null
      */
+    // Soroush unified provenance graph: cross-thread causality gate. Read once;
+    // observational and fail-safe (false unless the graph is enabled).
+    private static final boolean SOROUSH_ASYNC = soroushAsyncInit();
+    private static boolean soroushAsyncInit() {
+        try { return System.soroushAsyncEnabled(); } catch (Throwable t) { return false; }
+    }
+
     public void execute(Runnable command) {
         if (command == null)
             throw new NullPointerException();
+        if (SOROUSH_ASYNC) System.soroushAsyncHandoff(1, command, this);
         /*
          * Proceed in 3 steps:
          *

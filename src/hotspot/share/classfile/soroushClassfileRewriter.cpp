@@ -1,5 +1,6 @@
 #include "precompiled.hpp"
 #include "classfile/soroushClassfileRewriter.hpp"
+#include "classfile/soroushProvenanceGraph.hpp" // method-token registry (exact trace ABI)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,10 +187,15 @@ struct SoroushInstruction {
 struct SoroushMethodTracePlan {
   bool rewrite;
   bool is_constructor; // <init>: ENTER must go after super()/this() delegation
-  u2 enter_string_index;
-  u2 exit_string_index;
-  char enter_msg[512];
-  char exit_msg[512];
+  // Method-token trace ABI: each instrumented method gets ONE Integer constant
+  // (the token) shared by its ENTER and EXIT calls; ENTER invokes
+  // System.soroushTraceEnter(int) and EXIT invokes soroushTraceExit(int). The
+  // token resolves at runtime to the method's exact identity (class/name/
+  // descriptor/loader/hidden) via the method-token registry.
+  uint32_t token;          // 0 = registration failed -> method left uninstrumented
+  u2 token_cp_index;       // cp index of the Integer constant holding `token`
+  char enter_msg[512];     // "ENTER <dotted-class>.<method>" (human/diagnostic only)
+  char exit_msg[512];      // "EXIT <dotted-class>.<method>"  (human/diagnostic only)
 };
 
 struct SoroushVerificationType {
@@ -417,8 +423,8 @@ static void soroush_append_local_access(SoroushByteWriter* out, u1 op, int local
 static bool soroush_append_exit_prefix(SoroushByteWriter* out,
                                        u1 return_op,
                                        int temp_local,
-                                       u2 exit_string_index,
-                                       u2 trace_methodref,
+                                       u2 token_cp_index,
+                                       u2 exit_methodref,
                                        const char** error) {
   switch (return_op) {
     case 0xac: soroush_append_local_access(out, 0x36, temp_local); break; // istore
@@ -433,10 +439,10 @@ static bool soroush_append_exit_prefix(SoroushByteWriter* out,
       return false;
   }
 
-  out->append_u1(0x13); // ldc_w
-  out->append_u2(exit_string_index);
-  out->append_u1(0xb8); // invokestatic
-  out->append_u2(trace_methodref);
+  out->append_u1(0x13); // ldc_w  (push the Integer method token)
+  out->append_u2(token_cp_index);
+  out->append_u1(0xb8); // invokestatic System.soroushTraceExit(I)V
+  out->append_u2(exit_methodref);
 
   switch (return_op) {
     case 0xac: soroush_append_local_access(out, 0x15, temp_local); break; // iload
@@ -456,14 +462,14 @@ static bool soroush_append_exit_prefix(SoroushByteWriter* out,
 
 static bool soroush_append_exception_exit_handler(SoroushByteWriter* out,
                                                   int temp_local,
-                                                  u2 exit_string_index,
-                                                  u2 trace_methodref,
+                                                  u2 token_cp_index,
+                                                  u2 exit_methodref,
                                                   const char** error) {
   soroush_append_local_access(out, 0x3a, temp_local); // astore
-  out->append_u1(0x13); // ldc_w
-  out->append_u2(exit_string_index);
-  out->append_u1(0xb8); // invokestatic
-  out->append_u2(trace_methodref);
+  out->append_u1(0x13); // ldc_w  (push the Integer method token)
+  out->append_u2(token_cp_index);
+  out->append_u1(0xb8); // invokestatic System.soroushTraceExit(I)V
+  out->append_u2(exit_methodref);
   soroush_append_local_access(out, 0x19, temp_local); // aload
   out->append_u1(0xbf); // athrow
   if (!out->ok()) {
@@ -1064,8 +1070,8 @@ static bool soroush_emit_rewritten_code(SoroushByteWriter* out,
                                         int temp_local,
                                         bool is_constructor,
                                         int enter_after_old_pc,
-                                        u2 exit_string_index,
-                                        u2 trace_methodref,
+                                        u2 token_cp_index,
+                                        u2 exit_methodref,
                                         const u1* code,
                                         int code_len,
                                         const SoroushInstruction* instructions,
@@ -1096,8 +1102,8 @@ static bool soroush_emit_rewritten_code(SoroushByteWriter* out,
     bool wants_exit = insert_exits &&
         (soroush_is_return_opcode(op) || (op == 0xbf && instrument_athrow));
     if (wants_exit) {
-      if (!soroush_append_exit_prefix(out, op, temp_local, exit_string_index,
-                                      trace_methodref, error)) {
+      if (!soroush_append_exit_prefix(out, op, temp_local, token_cp_index,
+                                      exit_methodref, error)) {
         return false;
       }
       instruction_pc += soroush_exit_prefix_len(op, temp_local, instrument_athrow);
@@ -3106,8 +3112,8 @@ static bool soroush_transform_code_attribute_entry_code(SoroushByteWriter* out,
                                                         u2 this_class_index,
                                                         u2 object_class_index,
                                                         bool insert_exits,
-                                                        u2 exit_string_index,
-                                                        u2 trace_methodref,
+                                                        u2 token_cp_index,
+                                                        u2 exit_methodref,
                                                         u2 throwable_class_index,
                                                         u2 stack_map_table_name_index,
                                                         const char* method_id,
@@ -3358,7 +3364,7 @@ static bool soroush_transform_code_attribute_entry_code(SoroushByteWriter* out,
   if (!soroush_emit_rewritten_code(&new_code, entry_code, entry_len,
                                    insert_exits, temp_local,
                                    is_constructor, enter_after_old_pc,
-                                   exit_string_index, trace_methodref,
+                                   token_cp_index, exit_methodref,
                                    code, code_len,
                                    instructions, instruction_count, pc_map, error)) {
     free(instructions);
@@ -3370,8 +3376,8 @@ static bool soroush_transform_code_attribute_entry_code(SoroushByteWriter* out,
   if (catch_all_exits) {
     exception_handler_pc = new_code.length();
     if (!soroush_append_exception_exit_handler(&new_code, temp_local,
-                                               exit_string_index,
-                                               trace_methodref, error)) {
+                                               token_cp_index,
+                                               exit_methodref, error)) {
       free(instructions);
       free(pc_map);
       soroush_free_exception_handlers(exception_handlers, exception_handler_count);
@@ -3381,8 +3387,8 @@ static bool soroush_transform_code_attribute_entry_code(SoroushByteWriter* out,
   for (int i = 0; i < exception_handler_count; i++) {
     exception_handlers[i].handler_pc = new_code.length();
     if (!soroush_append_exception_exit_handler(&new_code, temp_local,
-                                               exit_string_index,
-                                               trace_methodref, error)) {
+                                               token_cp_index,
+                                               exit_methodref, error)) {
       free(instructions);
       free(pc_map);
       soroush_free_exception_handlers(exception_handlers, exception_handler_count);
@@ -3665,9 +3671,9 @@ static void soroush_append_cp_class(SoroushByteWriter* out, u2 name_index) {
   out->append_u2(name_index);
 }
 
-static void soroush_append_cp_string(SoroushByteWriter* out, u2 utf8_index) {
-  out->append_u1(8);
-  out->append_u2(utf8_index);
+static void soroush_append_cp_integer(SoroushByteWriter* out, u4 value) {
+  out->append_u1(3); // CONSTANT_Integer
+  out->append_u4(value);
 }
 
 static void soroush_append_cp_name_and_type(SoroushByteWriter* out, u2 name_index, u2 desc_index) {
@@ -3687,7 +3693,8 @@ static bool soroush_transform_member_entry_trace(SoroushByteWriter* out,
                                                  const SoroushCpInfo* cp,
                                                  u2 cp_count,
                                                  const SoroushMethodTracePlan* plan,
-                                                 u2 trace_methodref,
+                                                 u2 enter_methodref,
+                                                 u2 exit_methodref,
                                                  u2 throwable_class_index,
                                                  u2 stack_map_table_name_index,
                                                  u2 this_class_index,
@@ -3711,10 +3718,10 @@ static bool soroush_transform_member_entry_trace(SoroushByteWriter* out,
   out->append_u2(attr_count);
 
   u1 entry_code[6];
-  entry_code[0] = 0x13; // ldc_w
-  soroush_write_u2(entry_code + 1, plan->enter_string_index);
-  entry_code[3] = 0xb8; // invokestatic
-  soroush_write_u2(entry_code + 4, trace_methodref);
+  entry_code[0] = 0x13; // ldc_w  (push the Integer method token)
+  soroush_write_u2(entry_code + 1, plan->token_cp_index);
+  entry_code[3] = 0xb8; // invokestatic System.soroushTraceEnter(I)V
+  soroush_write_u2(entry_code + 4, enter_methodref);
 
   bool transformed_code = false;
   for (u2 i = 0; i < attr_count; i++) {
@@ -3739,8 +3746,8 @@ static bool soroush_transform_member_entry_trace(SoroushByteWriter* out,
                                                        this_class_index,
                                                        object_class_index,
                                                        insert_exits,
-                                                       plan->exit_string_index,
-                                                       trace_methodref,
+                                                       plan->token_cp_index,
+                                                       exit_methodref,
                                                        throwable_class_index,
                                                        stack_map_table_name_index,
                                                        method_id,
@@ -4112,7 +4119,8 @@ SoroushClassfileRewriter::insert_entry_nops(const u1* bytes, int length, int nop
 }
 
 static SoroushClassfileRewriter::TransformResult
-soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool insert_exits) {
+soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool insert_exits,
+                     uint64_t loader_id, int hidden, uint32_t artifact_crc) {
   SoroushClassfileRewriter::TransformResult result;
   result.ok = false;
   result.bytes = nullptr;
@@ -4253,7 +4261,7 @@ soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool i
   for (u2 mi = 0; mi < methods_count && scan.ok(); mi++) {
     scan.skip(2, "truncated method access_flags");
     u2 name_index = scan.get_u2("truncated method name_index");
-    scan.skip(2, "truncated method descriptor_index");
+    u2 descriptor_index = scan.get_u2("truncated method descriptor_index");
     u2 attr_count = scan.get_u2("truncated method attributes_count");
     bool has_code = false;
     for (u2 ai = 0; ai < attr_count && scan.ok(); ai++) {
@@ -4287,6 +4295,24 @@ soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool i
                  "ENTER %s.%.*s", dotted_class, method_name_len, method_name);
         snprintf(plans[mi].exit_msg, sizeof(plans[mi].exit_msg),
                  "EXIT %s.%.*s", dotted_class, method_name_len, method_name);
+        // Exact-identity trace ABI: register this method's identity and bake the
+        // returned token into its injected ENTER/EXIT calls. method/descriptor cp
+        // utf8s are not NUL-terminated, so copy them out for registration.
+        char mname_buf[256];
+        int mlen = method_name_len < (u2)(sizeof(mname_buf) - 1)
+                       ? method_name_len : (int)(sizeof(mname_buf) - 1);
+        memcpy(mname_buf, method_name, mlen);
+        mname_buf[mlen] = '\0';
+        char desc_buf[512];
+        desc_buf[0] = '\0';
+        if (descriptor_index < old_cp_count && cp[descriptor_index].utf8 != nullptr) {
+          u2 dl = cp[descriptor_index].utf8_len;
+          int dn = dl < (u2)(sizeof(desc_buf) - 1) ? dl : (int)(sizeof(desc_buf) - 1);
+          memcpy(desc_buf, cp[descriptor_index].utf8, dn);
+          desc_buf[dn] = '\0';
+        }
+        plans[mi].token = soroush_method_token_register(dotted_class, mname_buf, desc_buf,
+                                                        loader_id, hidden, artifact_crc);
         rewrite_count++;
       }
     }
@@ -4306,8 +4332,14 @@ soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool i
     result.error = "no rewriteable methods";
     return result;
   }
-  int cp_entries_per_method = insert_exits ? 4 : 2;
-  int global_cp_entries = insert_exits ? 11 : 6;
+  // Method-token trace ABI constant-pool layout:
+  //   per method: ONE CONSTANT_Integer (the token), shared by ENTER and EXIT.
+  //   global: System utf8/class, "soroushTraceEnter" utf8, "(I)V" utf8,
+  //           NameAndType(enter), Methodref(enter) [6]; with exits also
+  //           "soroushTraceExit" utf8, NameAndType(exit), Methodref(exit) [+3],
+  //           and Throwable utf8/class, "StackMapTable" utf8, Object utf8/class [+5].
+  int cp_entries_per_method = 1;
+  int global_cp_entries = insert_exits ? 14 : 6;
   if (old_cp_count + global_cp_entries + rewrite_count * cp_entries_per_method > 65535) {
     free(plans);
     free(cp);
@@ -4317,22 +4349,22 @@ soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool i
 
   u2 idx_utf8_system = old_cp_count;
   u2 idx_class_system = old_cp_count + 1;
-  u2 idx_utf8_soroush_trace = old_cp_count + 2;
-  u2 idx_utf8_soroush_trace_desc = old_cp_count + 3;
-  u2 idx_nt_soroush_trace = old_cp_count + 4;
-  u2 idx_method_soroush_trace = old_cp_count + 5;
-  u2 idx_utf8_throwable = insert_exits ? (u2)(old_cp_count + 6) : 0;
-  u2 idx_class_throwable = insert_exits ? (u2)(old_cp_count + 7) : 0;
-  u2 idx_utf8_stack_map_table = insert_exits ? (u2)(old_cp_count + 8) : 0;
-  u2 idx_utf8_object = insert_exits ? (u2)(old_cp_count + 9) : 0;
-  u2 idx_class_object = insert_exits ? (u2)(old_cp_count + 10) : 0;
+  u2 idx_utf8_enter_name = old_cp_count + 2;   // "soroushTraceEnter"
+  u2 idx_utf8_trace_desc = old_cp_count + 3;   // "(I)V" (shared by enter/exit)
+  u2 idx_nt_enter = old_cp_count + 4;
+  u2 idx_method_enter = old_cp_count + 5;
+  u2 idx_utf8_exit_name = insert_exits ? (u2)(old_cp_count + 6) : 0;   // "soroushTraceExit"
+  u2 idx_nt_exit = insert_exits ? (u2)(old_cp_count + 7) : 0;
+  u2 idx_method_exit = insert_exits ? (u2)(old_cp_count + 8) : 0;
+  u2 idx_utf8_throwable = insert_exits ? (u2)(old_cp_count + 9) : 0;
+  u2 idx_class_throwable = insert_exits ? (u2)(old_cp_count + 10) : 0;
+  u2 idx_utf8_stack_map_table = insert_exits ? (u2)(old_cp_count + 11) : 0;
+  u2 idx_utf8_object = insert_exits ? (u2)(old_cp_count + 12) : 0;
+  u2 idx_class_object = insert_exits ? (u2)(old_cp_count + 13) : 0;
   u2 next_method_cp_index = old_cp_count + global_cp_entries;
   for (u2 mi = 0; mi < methods_count; mi++) {
     if (plans[mi].rewrite) {
-      plans[mi].enter_string_index = next_method_cp_index + 1;
-      if (insert_exits) {
-        plans[mi].exit_string_index = next_method_cp_index + 3;
-      }
+      plans[mi].token_cp_index = next_method_cp_index; // the Integer constant
       next_method_cp_index += cp_entries_per_method;
     }
   }
@@ -4348,11 +4380,14 @@ soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool i
 
   soroush_append_cp_utf8(&out, "java/lang/System");
   soroush_append_cp_class(&out, idx_utf8_system);
-  soroush_append_cp_utf8(&out, "soroushTrace");
-  soroush_append_cp_utf8(&out, "(Ljava/lang/String;)V");
-  soroush_append_cp_name_and_type(&out, idx_utf8_soroush_trace, idx_utf8_soroush_trace_desc);
-  soroush_append_cp_methodref(&out, idx_class_system, idx_nt_soroush_trace);
+  soroush_append_cp_utf8(&out, "soroushTraceEnter");
+  soroush_append_cp_utf8(&out, "(I)V");
+  soroush_append_cp_name_and_type(&out, idx_utf8_enter_name, idx_utf8_trace_desc);
+  soroush_append_cp_methodref(&out, idx_class_system, idx_nt_enter);
   if (insert_exits) {
+    soroush_append_cp_utf8(&out, "soroushTraceExit");
+    soroush_append_cp_name_and_type(&out, idx_utf8_exit_name, idx_utf8_trace_desc);
+    soroush_append_cp_methodref(&out, idx_class_system, idx_nt_exit);
     soroush_append_cp_utf8(&out, "java/lang/Throwable");
     soroush_append_cp_class(&out, idx_utf8_throwable);
     soroush_append_cp_utf8(&out, "StackMapTable");
@@ -4361,12 +4396,7 @@ soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool i
   }
   for (u2 mi = 0; mi < methods_count; mi++) {
     if (plans[mi].rewrite) {
-      soroush_append_cp_utf8(&out, plans[mi].enter_msg);
-      soroush_append_cp_string(&out, plans[mi].enter_string_index - 1);
-      if (insert_exits) {
-        soroush_append_cp_utf8(&out, plans[mi].exit_msg);
-        soroush_append_cp_string(&out, plans[mi].exit_string_index - 1);
-      }
+      soroush_append_cp_integer(&out, (u4)plans[mi].token);
     }
   }
   r.skip((int)(cp_end - cp_start), "truncated constant pool");
@@ -4406,7 +4436,8 @@ soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool i
   for (u2 mi = 0; mi < methods_count; mi++) {
     const char* error = nullptr;
     if (!soroush_transform_member_entry_trace(&out, &r, cp, old_cp_count,
-                                              &plans[mi], idx_method_soroush_trace,
+                                              &plans[mi], idx_method_enter,
+                                              idx_method_exit,
                                               idx_class_throwable,
                                               idx_utf8_stack_map_table,
                                               this_class_index,
@@ -4451,13 +4482,15 @@ soroush_insert_trace(const u1* bytes, int length, const char* class_name, bool i
 }
 
 SoroushClassfileRewriter::TransformResult
-SoroushClassfileRewriter::insert_entry_trace(const u1* bytes, int length, const char* class_name) {
-  return soroush_insert_trace(bytes, length, class_name, false);
+SoroushClassfileRewriter::insert_entry_trace(const u1* bytes, int length, const char* class_name,
+                                             uint64_t loader_id, int hidden, uint32_t artifact_crc) {
+  return soroush_insert_trace(bytes, length, class_name, false, loader_id, hidden, artifact_crc);
 }
 
 SoroushClassfileRewriter::TransformResult
-SoroushClassfileRewriter::insert_entry_exit_trace(const u1* bytes, int length, const char* class_name) {
-  return soroush_insert_trace(bytes, length, class_name, true);
+SoroushClassfileRewriter::insert_entry_exit_trace(const u1* bytes, int length, const char* class_name,
+                                                  uint64_t loader_id, int hidden, uint32_t artifact_crc) {
+  return soroush_insert_trace(bytes, length, class_name, true, loader_id, hidden, artifact_crc);
 }
 
 void SoroushClassfileRewriter::free_transform(TransformResult* result) {

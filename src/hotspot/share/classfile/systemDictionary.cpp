@@ -40,6 +40,7 @@
 #include "classfile/protectionDomainCache.hpp"
 #include "classfile/resolutionErrors.hpp"
 #include "classfile/stringTable.hpp"
+#include "classfile/soroushProvenanceGraph.hpp"
 #include "classfile/symbolTable.hpp"
 #include "classfile/systemDictionary.hpp"
 #include "classfile/vmClasses.hpp"
@@ -71,6 +72,7 @@
 #include "prims/methodHandles.hpp"
 #include "runtime/arguments.hpp"
 #include "runtime/atomic.hpp"
+#include "runtime/frame.inline.hpp"
 #include "runtime/handles.inline.hpp"
 #include "runtime/java.hpp"
 #include "runtime/javaCalls.hpp"
@@ -2517,8 +2519,12 @@ void SystemDictionary::invoke_bootstrap_method(BootstrapInfo& bootstrap_specifie
   }
 
   const bool trace_indy = is_indy && soroush_trace_indy_enabled();
+  // collect_indy_provenance governs trace_id assignment.  Include the graph
+  // path so that SOROUSH_PROVENANCE_GRAPH=1 alone (without SOROUSH_TRACE_INDY)
+  // still triggers callsite capture and IndyCallSite node creation.
   const bool collect_indy_provenance =
-      is_indy && (trace_indy || soroush_runtime_recovery_enabled());
+      is_indy && (trace_indy || soroush_runtime_recovery_enabled()
+                  || soroush_graph_enabled());
   const int trace_id = collect_indy_provenance ? soroush_next_indy_trace_id() : 0;
   SoroushIndyTraceScope trace_scope(trace_id);
   const bool trace_lambda_meta =
@@ -2540,6 +2546,16 @@ void SystemDictionary::invoke_bootstrap_method(BootstrapInfo& bootstrap_specifie
                           bootstrap_specifier.signature()->as_C_string());
     soroush_indy_print_cr(trace_id, "bootstrap=%s", bsm_target.base());
     soroush_indy_print_cr(trace_id, "bootstrap_arg_count=%d", bootstrap_specifier.argc());
+
+    // Unified provenance graph: enrich the IndyCallSite (keyed by trace_id) +
+    // BootstrapMethod node. The generated lambda class links here via trace_id.
+    if (soroush_graph_enabled()) {
+      stringStream indy_desc;
+      indy_desc.print("%s%s", bootstrap_specifier.name()->as_C_string(),
+                      bootstrap_specifier.signature()->as_C_string());
+      soroush_graph_indy(trace_id, bootstrap_specifier.caller()->name()->as_C_string(),
+                         indy_desc.base(), bsm_target.base());
+    }
 
     stringStream graph;
     graph.print("graph invokedynamic %s%s -> bootstrap %s",
@@ -2568,6 +2584,124 @@ void SystemDictionary::invoke_bootstrap_method(BootstrapInfo& bootstrap_specifie
         soroush_print_indy_object(soroush_indy_stream(), trace_id, "instantiated_method_type", args->obj_at(2));
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Exact callsite identity capture for JSONL export (SOROUSH_PROVENANCE_GRAPH=1).
+  //
+  // Runs independently of SOROUSH_TRACE_INDY.  Creates the IndyCallSite graph
+  // node when not already done by the trace_indy block (idempotent; uses
+  // find-or-create).  Then captures source callsite identity from the
+  // interpreter frame and LambdaMetafactory impl method from bootstrap args.
+  //
+  // Frame timing: at this point resolve_bsm() has returned but
+  // JavaCalls::call_static (the actual bootstrap) has NOT yet been called.
+  // The JavaCallWrapper in resolve_bsm restored _last_Java_sp, so
+  // THREAD->last_frame() is back to the interpreter frame executing the
+  // invokedynamic instruction.  Compiled frames are detected and yield
+  // bci=-1 + source_capture="compiled_frame_bci_unavailable" in the export.
+  //
+  // All ResourceMark-scoped strings are duplicated by soroush_graph_indy_callsite
+  // before rm_cs is destroyed.  No fake precision: null/empty fields are left
+  // null; the export emits explicit unresolved status rather than guessing.
+  // ---------------------------------------------------------------------------
+  if (is_indy && soroush_graph_enabled() && trace_id > 0) {
+    ResourceMark rm_cs(THREAD);
+
+    // Step 1: Ensure the IndyCallSite graph node exists.
+    // soroush_graph_indy() uses find-or-create so calling it twice (when
+    // trace_indy already called it) is safe and a no-op on the second call.
+    if (!trace_indy) {
+      stringStream cs_indy_str;
+      cs_indy_str.print("%s%s",
+          bootstrap_specifier.name()->as_C_string(),
+          bootstrap_specifier.signature()->as_C_string());
+      stringStream cs_bsm_str;
+      if (java_lang_invoke_DirectMethodHandle::is_instance(bootstrap_specifier.bsm()())) {
+        soroush_print_member_name(&cs_bsm_str,
+            java_lang_invoke_DirectMethodHandle::member(bootstrap_specifier.bsm()()));
+      } else {
+        cs_bsm_str.print("%s", bootstrap_specifier.bsm()()->klass()->external_name());
+      }
+      soroush_graph_indy(trace_id,
+                         bootstrap_specifier.caller()->name()->as_C_string(),
+                         cs_indy_str.base(), cs_bsm_str.base());
+    }
+
+    // Step 2: Capture source callsite from the interpreter frame.
+    // THREAD->last_frame() is the invokedynamic instruction's frame here.
+    const char* src_method_name = nullptr;
+    const char* src_method_desc = nullptr;
+    int  src_bci      = -1;
+    bool frame_ok     = false;
+    uint64_t src_loader_id = 0;
+    {
+      ClassLoaderData* cld = bootstrap_specifier.caller()->class_loader_data();
+      if (cld != nullptr) src_loader_id = (uint64_t)(uintptr_t)cld;
+    }
+    if (THREAD->has_last_Java_frame()) {
+      frame top_frame = THREAD->last_frame();
+      if (top_frame.is_interpreted_frame()) {
+        Method* caller_m = top_frame.interpreter_frame_method();
+        if (caller_m != nullptr) {
+          src_method_name = caller_m->name()->as_C_string();
+          src_method_desc = caller_m->signature()->as_C_string();
+          src_bci         = top_frame.interpreter_frame_bci();
+          frame_ok        = true;
+        }
+      }
+    }
+
+    // Step 3: LambdaMetafactory impl method from bootstrap args[1].
+    // The arg at index 1 is the implementation MethodHandle for LMF.
+    const char* lmf_impl_cls = nullptr;
+    const char* lmf_impl_mth = nullptr;
+    const char* lmf_impl_dsc = nullptr;
+    if (soroush_is_lambda_metafactory_bsm(bootstrap_specifier.bsm()()) &&
+        bootstrap_specifier.arg_values().not_null() &&
+        bootstrap_specifier.arg_values()()->is_objArray()) {
+      objArrayOop lmf_args = objArrayOop(bootstrap_specifier.arg_values()());
+      if (lmf_args->length() > 1) {
+        oop impl_mh = lmf_args->obj_at(1);
+        if (impl_mh != nullptr &&
+            java_lang_invoke_DirectMethodHandle::is_instance(impl_mh)) {
+          oop impl_mn = java_lang_invoke_DirectMethodHandle::member(impl_mh);
+          if (impl_mn != nullptr &&
+              java_lang_invoke_MemberName::is_instance(impl_mn)) {
+            Method* impl_m = java_lang_invoke_MemberName::vmtarget(impl_mn);
+            if (impl_m != nullptr) {
+              lmf_impl_cls = impl_m->method_holder()->name()->as_C_string();
+              lmf_impl_mth = impl_m->name()->as_C_string();
+              lmf_impl_dsc = impl_m->signature()->as_C_string();
+            }
+          }
+        }
+      }
+    }
+
+    // Build indy name+sig and bootstrap label for the callsite record.
+    stringStream cs_desc2;
+    cs_desc2.print("%s%s",
+        bootstrap_specifier.name()->as_C_string(),
+        bootstrap_specifier.signature()->as_C_string());
+    stringStream cs_bsm2;
+    if (java_lang_invoke_DirectMethodHandle::is_instance(bootstrap_specifier.bsm()())) {
+      soroush_print_member_name(&cs_bsm2,
+          java_lang_invoke_DirectMethodHandle::member(bootstrap_specifier.bsm()()));
+    } else {
+      cs_bsm2.print("%s", bootstrap_specifier.bsm()()->klass()->external_name());
+    }
+
+    soroush_graph_indy_callsite(trace_id,
+        bootstrap_specifier.caller()->name()->as_C_string(),
+        src_loader_id,
+        src_method_name, src_method_desc, src_bci,
+        bootstrap_specifier.bss_index(),
+        bootstrap_specifier.name()->as_C_string(),
+        bootstrap_specifier.signature()->as_C_string(),
+        cs_bsm2.base(),
+        lmf_impl_cls, lmf_impl_mth, lmf_impl_dsc,
+        frame_ok);
   }
 
   // call condy: java.lang.invoke.MethodHandleNatives::linkDynamicConstant(caller, bsm, type, info)

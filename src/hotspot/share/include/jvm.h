@@ -101,7 +101,17 @@ JVM_ArrayCopy(JNIEnv *env, jclass ignored, jobject src, jint src_pos,
               jobject dst, jint dst_pos, jint length);
 
 JNIEXPORT void JNICALL
-JVM_SoroushTrace(JNIEnv *env, jclass ignored, jstring event);
+JVM_SoroushTraceEnter(JNIEnv *env, jclass ignored, jint token);
+
+JNIEXPORT void JNICALL
+JVM_SoroushTraceExit(JNIEnv *env, jclass ignored, jint token);
+
+JNIEXPORT jboolean JNICALL
+JVM_SoroushAsyncEnabled(JNIEnv *env, jclass ignored);
+
+JNIEXPORT void JNICALL
+JVM_SoroushAsyncHandoff(JNIEnv *env, jclass ignored, jint kind,
+                        jobject task, jobject executor);
 
 /*
  * Return an array of all properties as alternating name and value pairs.

@@ -2091,6 +2091,528 @@ static int sg_find_receiver_local_slot(Method* m, int invoke_bci, int arg_slots)
 }
 
 // ---------------------------------------------------------------------------
+// sg_analyze_mh_receiver — compiler-grade symbolic bytecode stack simulator
+//
+// Replaces sg_find_receiver_local_slot.  Forward-scans method bytecodes from
+// BCI 0 to invoke_bci maintaining a typed symbolic operand stack, then returns
+// which local variable holds the MH receiver — or a precise diagnostic reason
+// when the origin cannot be proven.
+//
+// Rationale: the old backward scanner returned -1 whenever any argument before
+// the invoke was produced by a complex bytecode (invokestatic Integer.valueOf,
+// getfield, etc.) because sg_slots_pushed returned 0.  The forward simulator
+// correctly accounts for those instructions by reading their CP-cache descriptor
+// and adjusting the depth, so the receiver slot identity is preserved.
+//
+// Reliability rules obeyed:
+//   • Never guesses — returns DIAGNOSTIC instead of a wrong local index.
+//   • Bails on backward branches, switches, multi-op fast forms, and unknown
+//     bytecodes; each emits a distinct reason string.
+//   • CP-cache lookup for descriptors: after class loading every invoke/field
+//     bytecode operand is a CP-cache index (not a raw CP index).
+// ---------------------------------------------------------------------------
+
+// Count parameter slots from a C-string JVM descriptor.
+// is_static=true: don't add 1 for an implicit receiver.
+// Returns -1 on malformed input.
+static int sg_cstr_param_slots(const char* desc, bool is_static) {
+  if (!desc || desc[0] != '(') return -1;
+  const char* p = desc + 1;
+  int slots = is_static ? 0 : 1; // +1 for implicit receiver if not static
+  while (*p && *p != ')') {
+    switch (*p++) {
+    case 'J': case 'D': slots += 2; break;
+    case 'L':
+      slots++;
+      while (*p && *p != ';') p++;
+      if (*p == ';') p++;
+      break;
+    case '[':
+      slots++;
+      while (*p == '[') p++;
+      if (*p == 'L') { p++; while (*p && *p != ';') p++; if (*p == ';') p++; }
+      else if (*p && *p != ')') p++;
+      break;
+    default:
+      slots++;
+      break;
+    }
+  }
+  return slots;
+}
+
+// Return slot count for the return type of a C-string descriptor.
+static int sg_cstr_return_slots(const char* desc) {
+  if (!desc) return 1;
+  const char* p = strchr(desc, ')');
+  if (!p) return 1;
+  p++;
+  switch (*p) {
+  case 'V': return 0;
+  case 'J': case 'D': return 2;
+  default: return 1;
+  }
+}
+
+// Read the 2-byte CP-cache index operand from bcp+1.
+// The Rewriter stores it in NATIVE byte order (Bytes::put_native_u2), so we
+// must read it the same way.  Big-endian manual reads were giving garbage on
+// aarch64 (little-endian), causing bounds-check failures in sg_invoke_desc_at.
+static inline int sg_u2at(address bcp) {
+  return (int)Bytes::get_native_u2(bcp + 1);
+}
+
+// Get method descriptor for an invoke bytecode via the CP-cache.
+// After class loading the 2-byte operand of every invoke instruction is a
+// CP-cache index; returns nullptr on any lookup failure.
+static const char* sg_invoke_desc_at(ConstantPool* cp, address bcp) {
+  if (!cp) return nullptr;
+  ConstantPoolCache* cache = cp->cache();
+  if (!cache) return nullptr;
+  int cc_idx = sg_u2at(bcp);
+  if (cc_idx < 0 || cc_idx >= cache->length()) return nullptr;
+  int raw = cache->entry_at(cc_idx)->constant_pool_index();
+  if (raw < 1 || raw >= cp->length()) return nullptr;
+  Symbol* sig = cp->uncached_signature_ref_at(raw);
+  return sig ? sig->as_C_string() : nullptr;
+}
+
+// Get field category (1 or 2 slots) for a getfield/getstatic/putfield/putstatic.
+// For fast forms the type is encoded in the raw opcode; otherwise falls back to
+// the CP-cache descriptor.
+static int sg_field_cat_at(ConstantPool* cp, address bcp) {
+  Bytecodes::Code raw_bc = (Bytecodes::Code)(uint8_t)bcp[0];
+  if (raw_bc == Bytecodes::_fast_lgetfield || raw_bc == Bytecodes::_fast_dgetfield ||
+      raw_bc == Bytecodes::_fast_lputfield || raw_bc == Bytecodes::_fast_dputfield)
+    return 2;
+  // Not a known cat-2 fast form — try CP-cache descriptor
+  if (cp) {
+    ConstantPoolCache* cache = cp->cache();
+    if (cache) {
+      int cc_idx = sg_u2at(bcp);
+      if (cc_idx >= 0 && cc_idx < cache->length()) {
+        int raw = cache->entry_at(cc_idx)->constant_pool_index();
+        if (raw >= 1 && raw < cp->length()) {
+          Symbol* sig = cp->uncached_signature_ref_at(raw);
+          if (sig) {
+            const char* s = sig->as_C_string();
+            if (s && (s[0] == 'J' || s[0] == 'D')) return 2;
+          }
+        }
+      }
+    }
+  }
+  return 1;
+}
+
+#define SG_SIM_MAX_DEPTH 256
+
+enum SgSvKind : uint8_t {
+  SG_SV_UNKNOWN = 0,  // untracked / cannot be classified
+  SG_SV_LOCAL,        // value from aload_N — local variable index known
+  SG_SV_RESULT,       // result of invoke*/getfield/getstatic/new/constant
+};
+
+struct SgSlot { SgSvKind kind; int32_t local_n; };
+static inline SgSlot sg_sl(SgSvKind k, int n = -1) {
+  SgSlot s; s.kind = k; s.local_n = n; return s;
+}
+
+enum  SgRecvMode { SG_RECV_LOCAL, SG_RECV_DIAGNOSTIC };
+struct SgRecvResult {
+  SgRecvMode mode;
+  int32_t    local_n;    // valid when mode == SG_RECV_LOCAL
+  char       diag[192];  // valid when mode == SG_RECV_DIAGNOSTIC
+};
+
+static SgRecvResult sg_analyze_mh_receiver(Method* m, int invoke_bci, int arg_slots) {
+  SgRecvResult bad; bad.mode = SG_RECV_DIAGNOSTIC; bad.local_n = -1; bad.diag[0] = '\0';
+
+  if (!m || invoke_bci <= 0 || arg_slots < 0 || invoke_bci > 65535) {
+    snprintf(bad.diag, sizeof(bad.diag), "invalid_args_to_analyzer"); return bad;
+  }
+  address code      = m->code_base();
+  int     code_size = m->code_size();
+  if (invoke_bci >= code_size) {
+    snprintf(bad.diag, sizeof(bad.diag), "invoke_bci_out_of_range"); return bad;
+  }
+  ConstantPool* cp = m->constants();
+  SgSlot stk[SG_SIM_MAX_DEPTH];
+  int    sp = 0;
+
+  for (int bci = 0; bci < invoke_bci; ) {
+    address bcp = code + bci;
+
+    // Detect multi-op fast forms whose java_code() is misleading
+    // (_fast_iaccess_0 maps to _aload_0 but actually does aload_0+getfield).
+    Bytecodes::Code raw_bc = (Bytecodes::Code)(uint8_t)bcp[0];
+    if (raw_bc == Bytecodes::_fast_iaccess_0 ||
+        raw_bc == Bytecodes::_fast_aaccess_0 ||
+        raw_bc == Bytecodes::_fast_faccess_0 ||
+        raw_bc == Bytecodes::_fast_iload2    ||
+        raw_bc == Bytecodes::_fast_icaload) {
+      snprintf(bad.diag, sizeof(bad.diag),
+               "unsupported_fast_multiop_0x%02x_at_%d", (int)raw_bc, bci);
+      return bad;
+    }
+
+    Bytecodes::Code bc     = Bytecodes::java_code_at(m, bcp);
+    int             bc_len = Bytecodes::length_at(m, bcp);
+    if (bc_len <= 0) {
+      snprintf(bad.diag, sizeof(bad.diag), "zero_length_bc_at_%d", bci); return bad;
+    }
+    if (sp > SG_SIM_MAX_DEPTH - 4) {
+      snprintf(bad.diag, sizeof(bad.diag), "stack_sim_overflow_at_%d", bci); return bad;
+    }
+
+    switch (bc) {
+    // ---- constants: push 1 slot ----
+    case Bytecodes::_aconst_null:
+      stk[sp++] = sg_sl(SG_SV_RESULT); break; // null ref, not a useful MH
+    case Bytecodes::_iconst_m1: case Bytecodes::_iconst_0: case Bytecodes::_iconst_1:
+    case Bytecodes::_iconst_2:  case Bytecodes::_iconst_3: case Bytecodes::_iconst_4:
+    case Bytecodes::_iconst_5:
+    case Bytecodes::_fconst_0:  case Bytecodes::_fconst_1: case Bytecodes::_fconst_2:
+    case Bytecodes::_bipush: case Bytecodes::_sipush:
+    case Bytecodes::_ldc:    case Bytecodes::_ldc_w:
+      stk[sp++] = sg_sl(SG_SV_RESULT); break; // treat ldc MH constant as opaque
+    // ---- constants: push 2 slots ----
+    case Bytecodes::_lconst_0: case Bytecodes::_lconst_1:
+    case Bytecodes::_dconst_0: case Bytecodes::_dconst_1:
+    case Bytecodes::_ldc2_w:
+      stk[sp++] = sg_sl(SG_SV_RESULT); stk[sp++] = sg_sl(SG_SV_RESULT); break;
+    // ---- aload: track local index ----
+    case Bytecodes::_aload_0: stk[sp++] = sg_sl(SG_SV_LOCAL, 0); break;
+    case Bytecodes::_aload_1: stk[sp++] = sg_sl(SG_SV_LOCAL, 1); break;
+    case Bytecodes::_aload_2: stk[sp++] = sg_sl(SG_SV_LOCAL, 2); break;
+    case Bytecodes::_aload_3: stk[sp++] = sg_sl(SG_SV_LOCAL, 3); break;
+    case Bytecodes::_aload: {
+      int n = (bc_len == 2) ? (int)(uint8_t)bcp[1] : (int)(uint8_t)bcp[2]; // wide
+      stk[sp++] = sg_sl(SG_SV_LOCAL, n); break;
+    }
+    // ---- iload/fload: 1-slot non-ref ----
+    case Bytecodes::_iload_0: case Bytecodes::_iload_1:
+    case Bytecodes::_iload_2: case Bytecodes::_iload_3:
+    case Bytecodes::_fload_0: case Bytecodes::_fload_1:
+    case Bytecodes::_fload_2: case Bytecodes::_fload_3:
+    case Bytecodes::_iload:   case Bytecodes::_fload:
+      stk[sp++] = sg_sl(SG_SV_RESULT); break;
+    // ---- lload/dload: 2-slot ----
+    case Bytecodes::_lload_0: case Bytecodes::_lload_1:
+    case Bytecodes::_lload_2: case Bytecodes::_lload_3:
+    case Bytecodes::_dload_0: case Bytecodes::_dload_1:
+    case Bytecodes::_dload_2: case Bytecodes::_dload_3:
+    case Bytecodes::_lload:   case Bytecodes::_dload:
+      stk[sp++] = sg_sl(SG_SV_RESULT); stk[sp++] = sg_sl(SG_SV_RESULT); break;
+    // ---- stores: pop ----
+    case Bytecodes::_astore_0: case Bytecodes::_astore_1:
+    case Bytecodes::_astore_2: case Bytecodes::_astore_3:
+    case Bytecodes::_astore:
+    case Bytecodes::_istore_0: case Bytecodes::_istore_1:
+    case Bytecodes::_istore_2: case Bytecodes::_istore_3:
+    case Bytecodes::_istore:
+    case Bytecodes::_fstore_0: case Bytecodes::_fstore_1:
+    case Bytecodes::_fstore_2: case Bytecodes::_fstore_3:
+    case Bytecodes::_fstore:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_store_%d",bci); return bad; }
+      sp--; break;
+    case Bytecodes::_lstore_0: case Bytecodes::_lstore_1:
+    case Bytecodes::_lstore_2: case Bytecodes::_lstore_3:
+    case Bytecodes::_lstore:
+    case Bytecodes::_dstore_0: case Bytecodes::_dstore_1:
+    case Bytecodes::_dstore_2: case Bytecodes::_dstore_3:
+    case Bytecodes::_dstore:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_lstore_%d",bci); return bad; }
+      sp -= 2; break;
+    // ---- stack manipulation ----
+    case Bytecodes::_pop:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_pop_%d",bci); return bad; }
+      sp--; break;
+    case Bytecodes::_pop2:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_pop2_%d",bci); return bad; }
+      sp -= 2; break;
+    case Bytecodes::_dup:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_dup_%d",bci); return bad; }
+      stk[sp] = stk[sp-1]; sp++; break;
+    case Bytecodes::_dup_x1:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_dup_x1_%d",bci); return bad; }
+      { SgSlot t = stk[sp-1];
+        stk[sp] = stk[sp-1]; stk[sp-1] = stk[sp-2]; stk[sp-2] = t; sp++; } break;
+    case Bytecodes::_dup_x2:
+      if (sp < 3) { snprintf(bad.diag,sizeof(bad.diag),"underflow_dup_x2_%d",bci); return bad; }
+      { SgSlot t = stk[sp-1];
+        stk[sp] = t; stk[sp-1] = stk[sp-2]; stk[sp-2] = stk[sp-3]; stk[sp-3] = t; sp++; } break;
+    case Bytecodes::_dup2:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_dup2_%d",bci); return bad; }
+      stk[sp] = stk[sp-2]; stk[sp+1] = stk[sp-1]; sp += 2; break;
+    case Bytecodes::_dup2_x1: case Bytecodes::_dup2_x2:
+      snprintf(bad.diag,sizeof(bad.diag),"unsupported_dup2x_at_%d",bci); return bad;
+    case Bytecodes::_swap:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_swap_%d",bci); return bad; }
+      { SgSlot t = stk[sp-1]; stk[sp-1] = stk[sp-2]; stk[sp-2] = t; } break;
+    // ---- checkcast: type change only, preserve symbolic value ----
+    case Bytecodes::_checkcast: break;
+    // ---- instanceof: pop ref, push int ----
+    case Bytecodes::_instanceof:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_instanceof_%d",bci); return bad; }
+      stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- allocation ----
+    case Bytecodes::_new:
+      stk[sp++] = sg_sl(SG_SV_RESULT); break;
+    case Bytecodes::_newarray: case Bytecodes::_anewarray:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_newarray_%d",bci); return bad; }
+      stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    case Bytecodes::_multianewarray: {
+      int dims = (int)(uint8_t)bcp[3];
+      if (sp < dims) { snprintf(bad.diag,sizeof(bad.diag),"underflow_multianewarray_%d",bci); return bad; }
+      sp -= dims; stk[sp++] = sg_sl(SG_SV_RESULT); break;
+    }
+    case Bytecodes::_arraylength:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_arraylength_%d",bci); return bad; }
+      stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- array loads ----
+    case Bytecodes::_aaload: case Bytecodes::_iaload: case Bytecodes::_faload:
+    case Bytecodes::_baload: case Bytecodes::_caload: case Bytecodes::_saload:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_xaload_%d",bci); return bad; }
+      sp--; stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    case Bytecodes::_laload: case Bytecodes::_daload:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_laload_%d",bci); return bad; }
+      stk[sp-2] = sg_sl(SG_SV_RESULT); stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- array stores ----
+    case Bytecodes::_aastore: case Bytecodes::_iastore: case Bytecodes::_fastore:
+    case Bytecodes::_bastore: case Bytecodes::_castore: case Bytecodes::_sastore:
+      if (sp < 3) { snprintf(bad.diag,sizeof(bad.diag),"underflow_xastore_%d",bci); return bad; }
+      sp -= 3; break;
+    case Bytecodes::_lastore: case Bytecodes::_dastore:
+      if (sp < 4) { snprintf(bad.diag,sizeof(bad.diag),"underflow_lastore_%d",bci); return bad; }
+      sp -= 4; break;
+    // ---- int/float binary arithmetic ----
+    case Bytecodes::_iadd: case Bytecodes::_isub: case Bytecodes::_imul: case Bytecodes::_idiv:
+    case Bytecodes::_irem: case Bytecodes::_iand: case Bytecodes::_ior:  case Bytecodes::_ixor:
+    case Bytecodes::_ishl: case Bytecodes::_ishr: case Bytecodes::_iushr:
+    case Bytecodes::_fadd: case Bytecodes::_fsub: case Bytecodes::_fmul:
+    case Bytecodes::_fdiv: case Bytecodes::_frem:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_ibinop_%d",bci); return bad; }
+      sp--; stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- long/double binary arithmetic ----
+    case Bytecodes::_ladd: case Bytecodes::_lsub: case Bytecodes::_lmul: case Bytecodes::_ldiv:
+    case Bytecodes::_lrem: case Bytecodes::_land: case Bytecodes::_lor:  case Bytecodes::_lxor:
+    case Bytecodes::_dadd: case Bytecodes::_dsub: case Bytecodes::_dmul:
+    case Bytecodes::_ddiv: case Bytecodes::_drem:
+      if (sp < 4) { snprintf(bad.diag,sizeof(bad.diag),"underflow_lbinop_%d",bci); return bad; }
+      sp -= 2; stk[sp-2] = sg_sl(SG_SV_RESULT); stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- lshl/lshr/lushr: long(2) + int(1) → long(2), net -1 ----
+    case Bytecodes::_lshl: case Bytecodes::_lshr: case Bytecodes::_lushr:
+      if (sp < 3) { snprintf(bad.diag,sizeof(bad.diag),"underflow_lshift_%d",bci); return bad; }
+      sp--; stk[sp-2] = sg_sl(SG_SV_RESULT); stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- unary arithmetic ----
+    case Bytecodes::_ineg: case Bytecodes::_fneg:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_ineg_%d",bci); return bad; }
+      stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    case Bytecodes::_lneg: case Bytecodes::_dneg:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_lneg_%d",bci); return bad; }
+      stk[sp-2] = sg_sl(SG_SV_RESULT); stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    case Bytecodes::_iinc: break; // local-local, no stack change
+    // ---- conversions (1→1) ----
+    case Bytecodes::_i2b: case Bytecodes::_i2c: case Bytecodes::_i2s:
+    case Bytecodes::_i2f: case Bytecodes::_f2i:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_conv1_%d",bci); return bad; }
+      stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- conversions (1→2): widen ----
+    case Bytecodes::_i2l: case Bytecodes::_i2d: case Bytecodes::_f2l: case Bytecodes::_f2d:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_widen_%d",bci); return bad; }
+      stk[sp-1] = sg_sl(SG_SV_RESULT); stk[sp++] = sg_sl(SG_SV_RESULT); break;
+    // ---- conversions (2→1): narrow ----
+    case Bytecodes::_l2i: case Bytecodes::_l2f: case Bytecodes::_d2i: case Bytecodes::_d2f:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_narrow_%d",bci); return bad; }
+      sp--; stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- conversions (2→2) ----
+    case Bytecodes::_l2d: case Bytecodes::_d2l:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_l2d_%d",bci); return bad; }
+      stk[sp-2] = sg_sl(SG_SV_RESULT); stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- comparisons ----
+    case Bytecodes::_lcmp:
+      if (sp < 4) { snprintf(bad.diag,sizeof(bad.diag),"underflow_lcmp_%d",bci); return bad; }
+      sp -= 3; stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    case Bytecodes::_fcmpl: case Bytecodes::_fcmpg:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_fcmp_%d",bci); return bad; }
+      sp--; stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    case Bytecodes::_dcmpl: case Bytecodes::_dcmpg:
+      if (sp < 4) { snprintf(bad.diag,sizeof(bad.diag),"underflow_dcmp_%d",bci); return bad; }
+      sp -= 3; stk[sp-1] = sg_sl(SG_SV_RESULT); break;
+    // ---- conditional branches: pop condition, continue linear scan ----
+    case Bytecodes::_ifeq: case Bytecodes::_ifne: case Bytecodes::_iflt:
+    case Bytecodes::_ifge: case Bytecodes::_ifgt: case Bytecodes::_ifle:
+    case Bytecodes::_ifnull: case Bytecodes::_ifnonnull:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_if_%d",bci); return bad; }
+      sp--; break;
+    case Bytecodes::_if_icmpeq: case Bytecodes::_if_icmpne: case Bytecodes::_if_icmplt:
+    case Bytecodes::_if_icmpge: case Bytecodes::_if_icmpgt: case Bytecodes::_if_icmple:
+    case Bytecodes::_if_acmpeq: case Bytecodes::_if_acmpne:
+      if (sp < 2) { snprintf(bad.diag,sizeof(bad.diag),"underflow_ifcmp_%d",bci); return bad; }
+      sp -= 2; break;
+    // ---- goto: follow forward jumps; bail on backward (loop) ----
+    case Bytecodes::_goto: {
+      int off = (int)(int16_t)(((uint16_t)(uint8_t)bcp[1] << 8) | (uint8_t)bcp[2]);
+      int tgt = bci + off;
+      if (tgt <= bci) {
+        snprintf(bad.diag,sizeof(bad.diag),"backward_goto_at_%d_target_%d",bci,tgt);
+        return bad;
+      }
+      bci = tgt; continue;
+    }
+    case Bytecodes::_goto_w: {
+      int off = (int)((uint32_t)(uint8_t)bcp[1]<<24 | (uint32_t)(uint8_t)bcp[2]<<16
+                    | (uint32_t)(uint8_t)bcp[3]<<8  | (uint8_t)bcp[4]);
+      int tgt = bci + off;
+      if (tgt <= bci) {
+        snprintf(bad.diag,sizeof(bad.diag),"backward_goto_w_at_%d_target_%d",bci,tgt);
+        return bad;
+      }
+      bci = tgt; continue;
+    }
+    // ---- switch: complex control flow ----
+    case Bytecodes::_tableswitch:  case Bytecodes::_lookupswitch:
+    case Bytecodes::_fast_linearswitch: case Bytecodes::_fast_binaryswitch:
+      snprintf(bad.diag,sizeof(bad.diag),"switch_at_%d",bci); return bad;
+    // ---- nop ----
+    case Bytecodes::_nop: break;
+    // ---- athrow ----
+    case Bytecodes::_athrow:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_athrow_%d",bci); return bad; }
+      sp--; break;
+    // ---- monitor ----
+    case Bytecodes::_monitorenter: case Bytecodes::_monitorexit:
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_monitor_%d",bci); return bad; }
+      sp--; break;
+    // ---- getstatic: push field slots ----
+    case Bytecodes::_getstatic: {
+      int cat = sg_field_cat_at(cp, bcp);
+      stk[sp++] = sg_sl(SG_SV_RESULT);
+      if (cat == 2) stk[sp++] = sg_sl(SG_SV_RESULT);
+      break;
+    }
+    // ---- getfield: pop ref, push field slots ----
+    case Bytecodes::_getfield: {
+      if (sp < 1) { snprintf(bad.diag,sizeof(bad.diag),"underflow_getfield_%d",bci); return bad; }
+      int cat = sg_field_cat_at(cp, bcp);
+      sp--;
+      stk[sp++] = sg_sl(SG_SV_RESULT);
+      if (cat == 2) stk[sp++] = sg_sl(SG_SV_RESULT);
+      break;
+    }
+    // ---- putstatic: pop field slots ----
+    case Bytecodes::_putstatic: {
+      int cat = sg_field_cat_at(cp, bcp);
+      if (sp < cat) { snprintf(bad.diag,sizeof(bad.diag),"underflow_putstatic_%d",bci); return bad; }
+      sp -= cat; break;
+    }
+    // ---- putfield: pop ref + field slots ----
+    case Bytecodes::_putfield: {
+      int cat = sg_field_cat_at(cp, bcp);
+      int n = 1 + cat;
+      if (sp < n) { snprintf(bad.diag,sizeof(bad.diag),"underflow_putfield_%d",bci); return bad; }
+      sp -= n; break;
+    }
+    // ---- invokestatic: descriptor via CP-cache; no implicit receiver ----
+    case Bytecodes::_invokestatic: {
+      const char* desc = sg_invoke_desc_at(cp, bcp);
+      if (!desc) { snprintf(bad.diag,sizeof(bad.diag),"no_desc_invokestatic_%d",bci); return bad; }
+      int ps = sg_cstr_param_slots(desc, true);
+      int rs = sg_cstr_return_slots(desc);
+      if (ps < 0) { snprintf(bad.diag,sizeof(bad.diag),"bad_desc_invokestatic_%d",bci); return bad; }
+      if (sp < ps) { snprintf(bad.diag,sizeof(bad.diag),"underflow_invokestatic_%d",bci); return bad; }
+      sp -= ps;
+      for (int i=0; i<rs; i++) stk[sp++] = sg_sl(SG_SV_RESULT);
+      break;
+    }
+    // ---- instance invokes (virtual/interface/special/handle): include receiver ----
+    case Bytecodes::_invokevirtual:
+    case Bytecodes::_invokeinterface:
+    case Bytecodes::_invokespecial:
+    case Bytecodes::_invokehandle: {
+      const char* desc = sg_invoke_desc_at(cp, bcp);
+      if (!desc) { snprintf(bad.diag,sizeof(bad.diag),"no_desc_invoke_%d",bci); return bad; }
+      int ps = sg_cstr_param_slots(desc, false); // false = include receiver slot
+      int rs = sg_cstr_return_slots(desc);
+      if (ps < 0) { snprintf(bad.diag,sizeof(bad.diag),"bad_desc_invoke_%d",bci); return bad; }
+      if (sp < ps) { snprintf(bad.diag,sizeof(bad.diag),"underflow_invoke_%d",bci); return bad; }
+      sp -= ps;
+      for (int i=0; i<rs; i++) stk[sp++] = sg_sl(SG_SV_RESULT);
+      break;
+    }
+    // ---- invokedynamic: 4-byte native-endian operand encodes indy index ----
+    // The Rewriter stores ~indy_index (negative) via put_native_u4.
+    // Use resolved_indy_entry_at to retrieve the CP index and descriptor.
+    case Bytecodes::_invokedynamic: {
+      if (!cp || !cp->cache()) {
+        snprintf(bad.diag,sizeof(bad.diag),"no_cp_for_indy_%d",bci); return bad;
+      }
+      int raw_u4 = (int)Bytes::get_native_u4(bcp + 1);
+      if (!ConstantPool::is_invokedynamic_index(raw_u4)) {
+        snprintf(bad.diag,sizeof(bad.diag),"invalid_indy_index_%d",bci); return bad;
+      }
+      int indy_idx = ConstantPool::decode_invokedynamic_index(raw_u4);
+      if (indy_idx < 0 || indy_idx >= cp->cache()->resolved_indy_entries_length()) {
+        snprintf(bad.diag,sizeof(bad.diag),"indy_idx_oob_%d",bci); return bad;
+      }
+      ResolvedIndyEntry* indy_entry = cp->cache()->resolved_indy_entry_at(indy_idx);
+      int raw_cp = (int)indy_entry->constant_pool_index();
+      if (raw_cp < 1 || raw_cp >= cp->length()) {
+        snprintf(bad.diag,sizeof(bad.diag),"indy_cp_oob_%d",bci); return bad;
+      }
+      Symbol* sig = cp->uncached_signature_ref_at(raw_cp);
+      if (!sig) { snprintf(bad.diag,sizeof(bad.diag),"no_sig_indy_%d",bci); return bad; }
+      const char* desc = sig->as_C_string();
+      int ps = sg_cstr_param_slots(desc, true); // no receiver for invokedynamic
+      int rs = sg_cstr_return_slots(desc);
+      if (ps < 0) { snprintf(bad.diag,sizeof(bad.diag),"bad_desc_indy_%d",bci); return bad; }
+      if (sp < ps) { snprintf(bad.diag,sizeof(bad.diag),"underflow_indy_%d",bci); return bad; }
+      sp -= ps;
+      for (int i=0; i<rs; i++) stk[sp++] = sg_sl(SG_SV_RESULT);
+      break;
+    }
+    // ---- return (should not appear before invoke_bci in valid code) ----
+    case Bytecodes::_return:  case Bytecodes::_ireturn: case Bytecodes::_lreturn:
+    case Bytecodes::_freturn: case Bytecodes::_dreturn: case Bytecodes::_areturn:
+      snprintf(bad.diag,sizeof(bad.diag),"return_before_invoke_%d",bci); return bad;
+    // ---- jsr/ret: obsolete ----
+    case Bytecodes::_jsr: case Bytecodes::_jsr_w: case Bytecodes::_ret:
+      snprintf(bad.diag,sizeof(bad.diag),"jsr_unsupported_%d",bci); return bad;
+    default:
+      snprintf(bad.diag,sizeof(bad.diag),
+               "unknown_bc_0x%02x_at_%d", (int)(uint8_t)bcp[0], bci);
+      return bad;
+    }
+    bci += bc_len;
+  }
+
+  // At invoke_bci the operand stack layout is:
+  //   [receiver] [arg_0] [arg_1] ... [arg_{n-1}]   (arg_slots total for args)
+  // Receiver is at slot index (sp - 1 - arg_slots).
+  int recv_idx = sp - 1 - arg_slots;
+  if (recv_idx < 0 || recv_idx >= sp) {
+    snprintf(bad.diag,sizeof(bad.diag),
+             "recv_slot_oob sp=%d arg_slots=%d", sp, arg_slots);
+    return bad;
+  }
+  SgSlot recv = stk[recv_idx];
+  if (recv.kind == SG_SV_LOCAL && recv.local_n >= 0) {
+    SgRecvResult ok;
+    ok.mode    = SG_RECV_LOCAL;
+    ok.local_n = recv.local_n;
+    ok.diag[0] = '\0';
+    return ok;
+  }
+  if (recv.kind == SG_SV_RESULT) {
+    snprintf(bad.diag,sizeof(bad.diag),"recv_from_method_result_or_field");
+    return bad;
+  }
+  snprintf(bad.diag,sizeof(bad.diag),"recv_unknown_kind_%d", (int)recv.kind);
+  return bad;
+}
+
+// ---------------------------------------------------------------------------
 // MethodHandle adapter-structure walking (runtime receiver inspection v2).
 //
 // Taxonomy (JDK 21 field layout, audited from source):
@@ -2567,9 +3089,12 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
       if (src_ok && tcm != nullptr) {
         int arg_slots = sg_count_param_slots(link_info.signature());
         if (arg_slots >= 0) {
-          int recv_local = sg_find_receiver_local_slot(tcm, src_bci, arg_slots);
-          if (recv_local >= 0) {
-            intptr_t* local_ptr = top.interpreter_frame_local_at(recv_local);
+          // Use the symbolic stack simulator (replaces sg_find_receiver_local_slot).
+          // It handles complex argument expressions like invokestatic Integer.valueOf()
+          // that the old backward-scan heuristic could not cross.
+          SgRecvResult recv_r = sg_analyze_mh_receiver(tcm, src_bci, arg_slots);
+          if (recv_r.mode == SG_RECV_LOCAL) {
+            intptr_t* local_ptr = top.interpreter_frame_local_at(recv_r.local_n);
             if (local_ptr != nullptr) {
               oop mh_recv = *(oop*)local_ptr;
               if (mh_recv != nullptr && oopDesc::is_oop_or_null(mh_recv)) {
@@ -2602,8 +3127,7 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                       entries, walk.n_targets);
                   multi_target_emitted = true;
                 } else {
-                  // Adapter with non-exact targets or unknown shape: supply a
-                  // descriptive reason string for the diagnostic record below.
+                  // Adapter with non-exact targets or unknown shape.
                   const char* ac = walk.adapter_class ? walk.adapter_class : "unknown";
                   if (walk.lf_kind != nullptr) {
                     snprintf(adapter_diag, sizeof(adapter_diag),
@@ -2616,6 +3140,10 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 }
               }
             }
+          } else {
+            // Simulator could not prove receiver origin — record diagnostic reason.
+            snprintf(adapter_diag, sizeof(adapter_diag),
+                     "recv_analyzer_%s", recv_r.diag);
           }
         }
       }

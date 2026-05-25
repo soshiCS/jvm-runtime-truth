@@ -49,7 +49,10 @@ JVM_ConstantPoolGetUTF8At
 JVM_CurrentCarrierThread
 JVM_CurrentThread
 JVM_SetCurrentThread
-JVM_SoroushTrace
+JVM_SoroushTraceEnter
+JVM_SoroushTraceExit
+JVM_SoroushAsyncEnabled
+JVM_SoroushAsyncHandoff
 JVM_CurrentTimeMillis
 JVM_DefineClass
 JVM_DefineClassWithSource

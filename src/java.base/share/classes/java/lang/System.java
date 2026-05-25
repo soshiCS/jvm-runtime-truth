@@ -349,11 +349,44 @@ public final class System {
     private static native void setErr0(PrintStream err);
 
     /**
-     * Records a custom JVM runtime trace event.
+     * Records a method-ENTER trace event for the exact method-token ABI. The
+     * verifier-safe rewriter injects this call at instrumented method entry with
+     * a stable token that resolves (in the VM) to the method's exact identity
+     * (class, name, descriptor, defining loader, hidden flag). Observational.
      *
-     * @param event the trace event text
+     * @param token the stable method-identity token assigned at rewrite time
      */
-    public static native void soroushTrace(String event);
+    public static native void soroushTraceEnter(int token);
+
+    /**
+     * Records a method-EXIT trace event for the exact method-token ABI. Injected
+     * by the rewriter before each return (and in synthetic exception-exit
+     * handlers) with the same token as the matching ENTER. Observational.
+     *
+     * @param token the stable method-identity token assigned at rewrite time
+     */
+    public static native void soroushTraceExit(int token);
+
+    /**
+     * Returns true if the unified provenance graph's async/cross-thread
+     * causality recording is enabled. Read once by instrumented JDK concurrent
+     * classes so their hot paths skip all work when disabled. Observational.
+     *
+     * @return whether async provenance recording is enabled
+     */
+    public static native boolean soroushAsyncEnabled();
+
+    /**
+     * Records an async work hand-off for the unified provenance graph.
+     * Observational and fail-safe; a no-op unless the graph is enabled.
+     *
+     * @param kind     1 for submission (task scheduled onto {@code executor} by
+     *                 the current execution), 2 for execution (the current
+     *                 worker thread is about to run {@code task})
+     * @param task     the unit of async work being submitted or run
+     * @param executor the executor the task is submitted to (may be null)
+     */
+    public static native void soroushAsyncHandoff(int kind, Object task, Object executor);
 
     private static class CallersHolder {
         // Remember callers of setSecurityManager() here so that warning

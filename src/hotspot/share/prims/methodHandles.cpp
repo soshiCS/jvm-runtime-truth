@@ -24,6 +24,7 @@
 
 #include "precompiled.hpp"
 #include "classfile/javaClasses.inline.hpp"
+#include "classfile/soroushProvenanceGraph.hpp"
 #include "classfile/stringTable.hpp"
 #include "classfile/symbolTable.hpp"
 #include "classfile/systemDictionary.hpp"
@@ -92,16 +93,31 @@ static bool soroush_trace_reflection_enabled() {
 }
 
 static void soroush_trace_membername_resolution(const char* source, Method* method, TRAPS) {
-  if (!soroush_trace_reflection_enabled() || method == nullptr) {
+  if (method == nullptr) {
+    return;
+  }
+  bool trace = soroush_trace_reflection_enabled();
+  bool graph = soroush_graph_enabled();
+  if (!trace && !graph) {
     return;
   }
 
   ResourceMark rm(THREAD);
-  fprintf(stderr, "[JVM REFLECT] membername_source=%s\n", source);
-  fprintf(stderr, "[JVM REFLECT] membername_target=%s.%s%s\n",
-          method->method_holder()->name()->as_C_string(),
-          method->name()->as_C_string(),
-          method->signature()->as_C_string());
+  const char* holder = method->method_holder()->name()->as_C_string();
+  const char* mname = method->name()->as_C_string();
+  const char* sig = method->signature()->as_C_string();
+  if (trace) {
+    fprintf(stderr, "[JVM REFLECT] membername_source=%s\n", source);
+    fprintf(stderr, "[JVM REFLECT] membername_target=%s.%s%s\n", holder, mname, sig);
+  }
+  if (graph) {
+    // reflect.Method/Constructor -> ReflectionInvoke; MemberName.resolve -> MH linkage.
+    int node_type = (source != nullptr && strncmp(source, "java.lang.reflect", 17) == 0)
+        ? SG_NODE_REFLECTION_INVOKE : SG_NODE_METHODHANDLE_LINKAGE;
+    // Loader-precise target class identity: use the target method holder's CLD.
+    uint64_t loader_id = (uint64_t)(uintptr_t)method->method_holder()->class_loader_data();
+    soroush_graph_linkage(node_type, source, holder, mname, sig, loader_id);
+  }
 }
 
 /**

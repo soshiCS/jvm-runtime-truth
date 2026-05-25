@@ -39,8 +39,15 @@ class SoroushClassfileRewriter : AllStatic {
   static void free_roundtrip(RoundTripResult* result);
 
   static TransformResult insert_entry_nops(const u1* bytes, int length, int nop_count);
-  static TransformResult insert_entry_trace(const u1* bytes, int length, const char* class_name);
-  static TransformResult insert_entry_exit_trace(const u1* bytes, int length, const char* class_name);
+  // The trace inserters use the exact method-token ABI: each instrumented method
+  // is assigned a stable token (registered with its class/name/descriptor and the
+  // given loader_id/hidden/artifact_crc) that is baked into the injected
+  // System.soroushTraceEnter/Exit(int) calls. loader_id is the defining
+  // ClassLoaderData pointer (0 if unknown), artifact_crc the original-bytes crc.
+  static TransformResult insert_entry_trace(const u1* bytes, int length, const char* class_name,
+                                            uint64_t loader_id, int hidden, uint32_t artifact_crc);
+  static TransformResult insert_entry_exit_trace(const u1* bytes, int length, const char* class_name,
+                                                 uint64_t loader_id, int hidden, uint32_t artifact_crc);
   static void free_transform(TransformResult* result);
 };
 
