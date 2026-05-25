@@ -192,6 +192,50 @@ static struct SgTsCallsite* g_ts_buckets[SG_TS_BUCKETS];
 static pthread_mutex_t      g_ts_lock   = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t             g_ts_count  = 0;
 
+// ---- Adapter graph callsite side table ----
+// Populated by soroush_graph_adapter_graph_callsite() from linkResolver.cpp.
+// Each entry is a GENERIC or named-kind BMH callsite whose bound MH components
+// were extracted (asType, filterArguments, foldArguments, tryFinally, etc.).
+
+#define SG_AG_BUCKETS  256u
+#define SG_AG_MAX_NODES  8
+
+struct SgAgNode {
+  int      id;
+  char*    role;
+  char*    from_desc;
+  char*    to_desc;
+  char*    klass;
+  uint64_t loader_id;
+  char*    method;
+  char*    descriptor;
+  bool     exact;
+};
+
+struct SgAgCallsite {
+  char*    category;
+  char*    adapter_class;
+  char*    adapter_kind;
+  char*    lf_kind;
+  char*    outer_desc;
+  char*    src_class;
+  uint64_t src_loader_id;
+  char*    src_method;
+  char*    src_desc;
+  int      src_bci;
+  int      opcode_byte;
+  int      cp_index;
+  int      n_nodes;
+  SgAgNode nodes[SG_AG_MAX_NODES];
+  bool     all_exact;
+  uint32_t hash;
+  struct SgAgCallsite* next;
+};
+
+static struct SgAgCallsite* g_ag_buckets[SG_AG_BUCKETS];
+static pthread_mutex_t      g_ag_lock  = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t             g_ag_count = 0;
+
 uint32_t soroush_method_token_register(const char* dotted_class, const char* method,
                                        const char* descriptor, uint64_t loader_id,
                                        int hidden, uint32_t artifact_crc) {
@@ -530,6 +574,92 @@ bool soroush_graph_target_set_callsite(
           src_method     ? src_method     : "?",
           src_desc       ? src_desc       : "",
           src_bci, n_targets);
+  return true;
+}
+
+bool soroush_graph_adapter_graph_callsite(
+    const char* category,
+    const char* adapter_class, const char* adapter_kind, const char* lf_kind,
+    const char* outer_desc,
+    const char* src_class, uint64_t src_loader_id,
+    const char* src_method, const char* src_desc,
+    int src_bci, int opcode_byte, int cp_index,
+    const SgAdapterNodeEntry* nodes, int n_nodes,
+    bool all_exact) {
+  if (!soroush_graph_enabled()) return false;
+  if (nodes == nullptr || n_nodes <= 0 || n_nodes > SG_AG_MAX_NODES) return false;
+
+  uint32_t h = sg_hash_str(category) ^ sg_hash_str(src_class)
+             ^ sg_hash_str(src_method) ^ sg_hash_str(src_desc)
+             ^ (uint32_t)(unsigned)src_bci;
+  uint32_t bucket = h & (SG_AG_BUCKETS - 1u);
+
+  pthread_mutex_lock(&g_ag_lock);
+
+  for (SgAgCallsite* c = g_ag_buckets[bucket]; c != nullptr; c = c->next) {
+    if (c->hash == h
+        && src_bci == c->src_bci
+        && (category == c->category ||
+            (category && c->category && strcmp(category, c->category) == 0))
+        && (src_class == c->src_class ||
+            (src_class && c->src_class && strcmp(src_class, c->src_class) == 0))
+        && (src_method == c->src_method ||
+            (src_method && c->src_method && strcmp(src_method, c->src_method) == 0))
+        && (src_desc == c->src_desc ||
+            (src_desc && c->src_desc && strcmp(src_desc, c->src_desc) == 0))) {
+      pthread_mutex_unlock(&g_ag_lock);
+      return true; // first-in-wins
+    }
+  }
+
+  SgAgCallsite* n = (SgAgCallsite*)malloc(sizeof(SgAgCallsite));
+  if (n == nullptr) { pthread_mutex_unlock(&g_ag_lock); return false; }
+  memset(n, 0, sizeof(*n));
+
+  n->category      = sg_strdup(category);
+  n->adapter_class = sg_strdup(adapter_class);
+  n->adapter_kind  = sg_strdup(adapter_kind);
+  n->lf_kind       = sg_strdup(lf_kind);
+  n->outer_desc    = sg_strdup(outer_desc);
+  n->src_class     = sg_strdup(src_class);
+  n->src_loader_id = src_loader_id;
+  n->src_method    = sg_strdup(src_method);
+  n->src_desc      = sg_strdup(src_desc);
+  n->src_bci       = src_bci;
+  n->opcode_byte   = opcode_byte;
+  n->cp_index      = cp_index;
+  n->all_exact     = all_exact;
+  n->n_nodes       = (n_nodes <= SG_AG_MAX_NODES) ? n_nodes : SG_AG_MAX_NODES;
+
+  for (int i = 0; i < n->n_nodes; i++) {
+    n->nodes[i].id         = nodes[i].id;
+    n->nodes[i].role       = sg_strdup(nodes[i].role);
+    n->nodes[i].from_desc  = sg_strdup(nodes[i].from_desc);
+    n->nodes[i].to_desc    = sg_strdup(nodes[i].to_desc);
+    n->nodes[i].klass      = sg_strdup(nodes[i].klass);
+    n->nodes[i].loader_id  = nodes[i].loader_id;
+    n->nodes[i].method     = sg_strdup(nodes[i].method);
+    n->nodes[i].descriptor = sg_strdup(nodes[i].descriptor);
+    n->nodes[i].exact      = nodes[i].exact;
+  }
+
+  n->hash = h;
+  n->next = g_ag_buckets[bucket];
+  g_ag_buckets[bucket] = n;
+  g_ag_count++;
+  pthread_mutex_unlock(&g_ag_lock);
+
+  fprintf(stderr,
+          "[JVM AG CALLSITE] cat=%s adapter=%s kind=%s lf=%s"
+          " src=%s.%s bci=%d n_nodes=%d all_exact=%s\n",
+          category      ? category      : "?",
+          adapter_class ? adapter_class : "?",
+          adapter_kind  ? adapter_kind  : "?",
+          lf_kind       ? lf_kind       : "?",
+          src_class     ? src_class     : "?",
+          src_method    ? src_method    : "?",
+          src_bci, n_nodes,
+          all_exact ? "true" : "false");
   return true;
 }
 
@@ -1695,6 +1825,98 @@ void soroush_graph_export_runtime_targets(const char* path) {
             if (t->descriptor) {
               fprintf(f, ",\"descriptor\":");
               sg_json_str(f, t->descriptor);
+            }
+            fprintf(f, "}");
+          }
+          fprintf(f, "]}\n");
+          ct_count++;
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 3.6: callsite_adapter_graph records from the GENERIC/named BMH
+  // adapter graph side table (g_ag_buckets).  Each record describes the
+  // full adapter structure with per-node exact targets where provable.
+  // Active when SOROUSH_PROVENANCE_GRAPH=1 (no graph required).
+  // -------------------------------------------------------------------------
+  {
+    pthread_mutex_lock(&g_ag_lock);
+    uint32_t ag_snap = g_ag_count;
+    pthread_mutex_unlock(&g_ag_lock);
+
+    if (ag_snap > 0) {
+      for (uint32_t b = 0; b < SG_AG_BUCKETS; b++) {
+        for (SgAgCallsite* c = g_ag_buckets[b]; c != nullptr; c = c->next) {
+          const char* op_name = "invokevirtual";
+          switch (c->opcode_byte) {
+            case 0xb6: op_name = "invokevirtual";   break;
+            case 0xb7: op_name = "invokespecial";   break;
+            case 0xb8: op_name = "invokestatic";    break;
+            case 0xb9: op_name = "invokeinterface"; break;
+            case 0xba: op_name = "invokedynamic";   break;
+          }
+          fprintf(f, "{\"record\":\"callsite_adapter_graph\",\"category\":");
+          sg_json_str(f, c->category);
+          if (c->adapter_class) {
+            fprintf(f, ",\"adapter_class\":");
+            sg_json_str(f, c->adapter_class);
+          }
+          if (c->adapter_kind) {
+            fprintf(f, ",\"adapter_kind\":");
+            sg_json_str(f, c->adapter_kind);
+          }
+          if (c->lf_kind) {
+            fprintf(f, ",\"lf_kind\":");
+            sg_json_str(f, c->lf_kind);
+          }
+          if (c->outer_desc) {
+            fprintf(f, ",\"outer_descriptor\":");
+            sg_json_str(f, c->outer_desc);
+          }
+          fprintf(f, ",\"evidence\":\"OBSERVED_ONLY\",\"all_exact\":%s",
+                  c->all_exact ? "true" : "false");
+          fprintf(f, ",\"source_class\":");
+          sg_json_str(f, c->src_class);
+          fprintf(f, ",\"source_loader_id\":\"0x%016llx\","
+                  "\"source_capture\":\"exact\",\"source_method\":",
+                  (unsigned long long)c->src_loader_id);
+          sg_json_str(f, c->src_method);
+          fprintf(f, ",\"source_descriptor\":");
+          sg_json_str(f, c->src_desc);
+          fprintf(f, ",\"source_bci\":%d,\"source_opcode\":", c->src_bci);
+          sg_json_str(f, op_name);
+          if (c->cp_index >= 0)
+            fprintf(f, ",\"source_cp_index\":%d", c->cp_index);
+          fprintf(f, ",\"nodes\":[");
+          for (int i = 0; i < c->n_nodes; i++) {
+            SgAgNode* n = &c->nodes[i];
+            if (i > 0) fprintf(f, ",");
+            fprintf(f, "{\"id\":%d,\"role\":", n->id);
+            sg_json_str(f, n->role);
+            if (n->from_desc) {
+              fprintf(f, ",\"from_descriptor\":");
+              sg_json_str(f, n->from_desc);
+            }
+            if (n->to_desc) {
+              fprintf(f, ",\"to_descriptor\":");
+              sg_json_str(f, n->to_desc);
+            }
+            fprintf(f, ",\"exact\":%s", n->exact ? "true" : "false");
+            if (n->exact && n->klass) {
+              fprintf(f, ",\"class\":");
+              sg_json_str(f, n->klass);
+              fprintf(f, ",\"loader_id\":\"0x%016llx\"",
+                      (unsigned long long)n->loader_id);
+              if (n->method) {
+                fprintf(f, ",\"method\":");
+                sg_json_str(f, n->method);
+              }
+              if (n->descriptor) {
+                fprintf(f, ",\"descriptor\":");
+                sg_json_str(f, n->descriptor);
+              }
             }
             fprintf(f, "}");
           }

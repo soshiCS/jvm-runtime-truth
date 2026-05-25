@@ -2648,13 +2648,24 @@ struct SgMhTarget {
   bool        valid;
 };
 
+// SgAdapterNode: one node in an extracted GENERIC-BMH adapter graph.
+struct SgAdapterNode {
+  int         id;
+  const char* role;       // "adapted_target", "primary_target", "secondary_component", …
+  const char* from_desc;  // outer adapter type descriptor (type_conversion nodes only)
+  const char* to_desc;    // inner component's own type descriptor
+  SgMhTarget  target;     // valid when has_target == true
+  bool        has_target;
+};
+
 struct SgMhWalkResult {
   enum Shape {
-    DIRECT,       // DirectMethodHandle  → single exact target
-    GWT,          // guardWithTest       → test / true_target / false_target
-    GWC,          // catchException      → try_target / handler
-    BMH_UNKNOWN,  // BMH with unrecognised LambdaForm kind (asType, filter, fold …)
-    MH_UNKNOWN    // not a known MH class
+    DIRECT,         // DirectMethodHandle  → single exact target
+    GWT,            // guardWithTest       → test / true_target / false_target
+    GWC,            // catchException      → try_target / handler
+    ADAPTER_GRAPH,  // GENERIC/named BMH   → adapter graph extracted
+    BMH_UNKNOWN,    // BMH with unextractable form
+    MH_UNKNOWN      // not a known MH class
   };
 
   Shape       shape;
@@ -2662,10 +2673,19 @@ struct SgMhWalkResult {
   const char* lf_kind;       // LambdaForm.Kind.name() (ResourceMark-allocated)
   const char* aux_info;      // GWC: exception class name
 
-  int        n_targets;
+  // DIRECT / GWT / GWC fields:
+  int         n_targets;
   const char* roles[4];
   SgMhTarget  targets[4];
   bool        all_exact;
+
+  // ADAPTER_GRAPH fields:
+  int           n_graph_nodes;
+  SgAdapterNode graph_nodes[8];
+  const char*   graph_kind;      // "type_conversion", "dual_target", "multi_target", …
+  const char*   outer_desc;      // MH type descriptor as presented to the caller
+  bool          graph_all_exact;
+  char          graph_diag[192]; // non-empty when extraction partially or fully failed
 };
 
 static bool sg_oop_valid(oop o) {
@@ -2770,6 +2790,151 @@ static oop sg_unwrap_delegating(oop mh_oop, int depth) {
   return mh_oop;
 }
 
+// Read MethodHandle.type() → MethodType.methodDescriptor cached String.
+// Returns ResourceMark-allocated C string, or nullptr if the descriptor
+// has not yet been cached in the MethodType object.
+static const char* sg_mh_descriptor(oop mh_oop) {
+  if (!sg_oop_valid(mh_oop)) return nullptr;
+  if (!java_lang_invoke_MethodHandle::is_instance(mh_oop)) return nullptr;
+  oop mt = java_lang_invoke_MethodHandle::type(mh_oop);
+  if (!sg_oop_valid(mt)) return nullptr;
+  oop desc_str = sg_find_field_oop(mt, "methodDescriptor", "Ljava/lang/String;");
+  if (!sg_oop_valid(desc_str) || !java_lang_String::is_instance(desc_str)) return nullptr;
+  return java_lang_String::as_utf8_string(desc_str);
+}
+
+// Count L-type (reference) bound fields in a BMH species from its class name.
+// "...BoundMethodHandle$Species_LLL" → 3.  Returns 0 if not a BMH species.
+static int sg_bmh_species_l_count(oop mh_oop) {
+  if (!sg_oop_valid(mh_oop)) return 0;
+  const char* kn = mh_oop->klass()->name()->as_C_string();
+  const char* sp = strstr(kn, "$Species_");
+  if (!sp) return 0;
+  int count = 0;
+  for (const char* p = sp + 9; *p; p++) {
+    if (*p == 'L') count++;
+  }
+  return count;
+}
+
+// Walk a BoundMethodHandle (any LambdaForm kind) and extract its adapter graph.
+//
+// Strategy: enumerate argL{0..N-1} fields (the bound reference components of
+// the BMH species), attempt exact DMH extraction for each, and return
+// ADAPTER_GRAPH when at least one component was found.  Falls back to
+// BMH_UNKNOWN when the species has no L fields.
+//
+// Role labels by lf_kind:
+//   TRY_FINALLY → "target" (L0) / "cleanup" (L1)
+//   COLLECTOR   → "collection_target" (L0)
+//   LOOP        → "loop_component_N"
+//   TABLE_SWITCH→ "switch_default" (L0) / "switch_case" (L1+)
+//   GENERIC     → n_l==1: "adapted_target"; L0: "primary_target"; L1: "secondary_component";
+//                 L2+: "component_N"
+//
+// graph_kind:
+//   1 MH-component   → "type_conversion"   (asType-like)
+//   2 MH-components  → "dual_target"       (filter/fold/filterRV — same structure)
+//   3+ MH-components → "multi_target"      (filterArguments with multiple filters)
+//   0 MH-components  → "bound_data"        (bindTo/insertArguments with non-MH values)
+//   Named kinds      → override with kind name ("try_finally", "collector", …)
+static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
+  SgMhWalkResult r;
+  memset(&r, 0, sizeof(r));
+  r.shape = SgMhWalkResult::BMH_UNKNOWN;
+
+  if (!sg_oop_valid(mh_oop) || depth <= 0) {
+    snprintf(r.graph_diag, sizeof(r.graph_diag), "depth_exhausted");
+    return r;
+  }
+
+  r.adapter_class = mh_oop->klass()->name()->as_C_string();
+  r.lf_kind       = sg_lf_kind_name(mh_oop);
+  r.outer_desc    = sg_mh_descriptor(mh_oop);
+
+  const char* lf = r.lf_kind ? r.lf_kind : "";
+
+  int n_l = sg_bmh_species_l_count(mh_oop);
+  if (n_l == 0) {
+    snprintf(r.graph_diag, sizeof(r.graph_diag), "no_l_fields_in_species");
+    return r;
+  }
+  if (n_l > 8) n_l = 8;
+
+  int mh_count = 0;
+  bool all_exact = true;
+
+  for (int i = 0; i < n_l; i++) {
+    oop f = sg_bmh_arg_at(mh_oop, i);
+    SgAdapterNode& node = r.graph_nodes[r.n_graph_nodes++];
+    memset(&node, 0, sizeof(node));
+    node.id = i;
+
+    // Role assignment.
+    if (strcmp(lf, "TRY_FINALLY") == 0) {
+      node.role = (i == 0) ? "target" : "cleanup";
+    } else if (strcmp(lf, "COLLECTOR") == 0) {
+      node.role = "collection_target";
+    } else if (strcmp(lf, "LOOP") == 0) {
+      static const char* lroles[] = {
+        "loop_component_0","loop_component_1","loop_component_2","loop_component_3",
+        "loop_component_4","loop_component_5","loop_component_6","loop_component_7"
+      };
+      node.role = lroles[i];
+    } else if (strcmp(lf, "TABLE_SWITCH") == 0) {
+      node.role = (i == 0) ? "switch_default" : "switch_case";
+    } else {
+      // GENERIC or other
+      if (n_l == 1) {
+        node.role = "adapted_target";
+      } else if (i == 0) {
+        node.role = "primary_target";
+      } else if (i == 1) {
+        node.role = "secondary_component";
+      } else {
+        static const char* xroles[] = {
+          "component_2","component_3","component_4",
+          "component_5","component_6","component_7"
+        };
+        node.role = xroles[(i-2) < 6 ? (i-2) : 5];
+      }
+    }
+
+    if (!sg_oop_valid(f)) {
+      node.has_target = false;
+      all_exact = false;
+      continue;
+    }
+
+    if (java_lang_invoke_MethodHandle::is_instance(f)) {
+      mh_count++;
+      oop unwrapped = sg_unwrap_delegating(f, 4);
+      node.has_target = sg_extract_dmh_target(unwrapped, &node.target);
+      if (!node.has_target) all_exact = false;
+      node.to_desc = sg_mh_descriptor(f);
+      if (n_l == 1) node.from_desc = r.outer_desc; // outer→inner for single-target adapters
+    } else {
+      // Non-MH bound value (bindTo / insertArguments with concrete values).
+      node.has_target = false;
+      all_exact = false;
+    }
+  }
+
+  // Determine graph_kind.
+  if      (strcmp(lf, "TRY_FINALLY")  == 0) r.graph_kind = "try_finally";
+  else if (strcmp(lf, "COLLECTOR")    == 0) r.graph_kind = "collector";
+  else if (strcmp(lf, "LOOP")         == 0) r.graph_kind = "loop";
+  else if (strcmp(lf, "TABLE_SWITCH") == 0) r.graph_kind = "table_switch";
+  else if (mh_count == 0)                   r.graph_kind = "bound_data";
+  else if (mh_count == 1)                   r.graph_kind = "type_conversion";
+  else if (mh_count == 2)                   r.graph_kind = "dual_target";
+  else                                      r.graph_kind = "multi_target";
+
+  r.graph_all_exact = all_exact;
+  r.shape = SgMhWalkResult::ADAPTER_GRAPH;
+  return r;
+}
+
 // Walk a MethodHandle oop and classify its adapter structure.
 // Depth-limited; returns shape=MH_UNKNOWN on any error or depth exhaustion.
 static SgMhWalkResult sg_walk_mh(oop mh_oop, int depth) {
@@ -2861,7 +3026,12 @@ static SgMhWalkResult sg_walk_mh(oop mh_oop, int depth) {
     return r;
   }
 
-  // ---- Case 3c: all other BMH shapes (asType/filter/fold/permute/…) ----
+  // ---- Case 3c: GENERIC and other named BMH forms — try adapter graph extraction ----
+  {
+    SgMhWalkResult gr = sg_walk_generic_bmh(mh_oop, depth - 1);
+    if (gr.shape == SgMhWalkResult::ADAPTER_GRAPH) return gr;
+    // Extraction failed (no L fields or depth exhausted); fall through.
+  }
   r.shape = SgMhWalkResult::BMH_UNKNOWN;
   return r;
 }
@@ -3126,8 +3296,33 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                       src_bci, src_opcode, src_cp,
                       entries, walk.n_targets);
                   multi_target_emitted = true;
+                } else if (walk.shape == SgMhWalkResult::ADAPTER_GRAPH) {
+                  // GENERIC/named BMH: adapter graph extracted.
+                  SgAdapterNodeEntry entries[8];
+                  memset(entries, 0, sizeof(entries));
+                  int ne = (walk.n_graph_nodes < 8) ? walk.n_graph_nodes : 8;
+                  for (int i = 0; i < ne; i++) {
+                    entries[i].id        = walk.graph_nodes[i].id;
+                    entries[i].role      = walk.graph_nodes[i].role;
+                    entries[i].from_desc = walk.graph_nodes[i].from_desc;
+                    entries[i].to_desc   = walk.graph_nodes[i].to_desc;
+                    if (walk.graph_nodes[i].has_target) {
+                      entries[i].klass      = walk.graph_nodes[i].target.klass;
+                      entries[i].loader_id  = walk.graph_nodes[i].target.loader_id;
+                      entries[i].method     = walk.graph_nodes[i].target.method;
+                      entries[i].descriptor = walk.graph_nodes[i].target.descriptor;
+                      entries[i].exact      = true;
+                    }
+                  }
+                  soroush_graph_adapter_graph_callsite(
+                    cat,
+                    walk.adapter_class, walk.graph_kind, walk.lf_kind, walk.outer_desc,
+                    src_class, src_loader, src_method, src_desc,
+                    src_bci, src_opcode, src_cp,
+                    entries, ne, walk.graph_all_exact);
+                  multi_target_emitted = true;
                 } else {
-                  // Adapter with non-exact targets or unknown shape.
+                  // BMH_UNKNOWN / MH_UNKNOWN: shape not recognised or extraction failed.
                   const char* ac = walk.adapter_class ? walk.adapter_class : "unknown";
                   if (walk.lf_kind != nullptr) {
                     snprintf(adapter_diag, sizeof(adapter_diag),
