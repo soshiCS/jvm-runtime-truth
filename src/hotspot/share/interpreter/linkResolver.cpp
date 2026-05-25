@@ -26,6 +26,7 @@
 #include "cds/archiveUtils.hpp"
 #include "classfile/defaultMethods.hpp"
 #include "classfile/javaClasses.hpp"
+#include "classfile/soroushProvenanceGraph.hpp"
 #include "classfile/systemDictionary.hpp"
 #include "classfile/vmClasses.hpp"
 #include "classfile/vmSymbols.hpp"
@@ -60,6 +61,8 @@
 #include "runtime/signature.hpp"
 #include "runtime/vmThread.hpp"
 #include "utilities/macros.hpp"
+#include "oops/fieldStreams.inline.hpp"
+#include "runtime/vframe.inline.hpp"
 #include <stdlib.h>
 #include <string.h>
 #if INCLUDE_JFR
@@ -120,6 +123,152 @@ static void soroush_print_reflect_method_handle(oop mh) {
   if (form != nullptr && java_lang_invoke_LambdaForm::is_instance(form)) {
     fprintf(stderr, " lambda_form_vmentry=");
     soroush_print_reflect_member_name(java_lang_invoke_LambdaForm::vmentry(form));
+  }
+}
+
+static bool soroush_trace_mh_exec_enabled() {
+  static int enabled = -1;
+  if (enabled == -1) {
+    const char* value = ::getenv("SOROUSH_TRACE_MH_EXEC");
+    enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+// Compact MethodType descriptor "(<nparams> args)-><rtype>" for a MethodHandle.
+// Read-only; bounded; fail-safe (leaves "?" on any unexpected shape).
+static void soroush_mh_type_desc(oop mh, char* buf, size_t len) {
+  if (len == 0) return;
+  buf[0] = '\0';
+  oop mt = java_lang_invoke_MethodHandle::type(mh);
+  if (mt == nullptr || !java_lang_invoke_MethodType::is_instance(mt)) {
+    snprintf(buf, len, "?");
+    return;
+  }
+  int nargs = java_lang_invoke_MethodType::ptype_count(mt);
+  const char* rname = "?";
+  oop rt = java_lang_invoke_MethodType::rtype(mt);
+  if (rt != nullptr && java_lang_Class::is_instance(rt)) {
+    if (java_lang_Class::is_primitive(rt)) {
+      rname = type2name(java_lang_Class::primitive_type(rt));
+    } else {
+      Klass* rk = java_lang_Class::as_Klass(rt);
+      if (rk != nullptr) rname = rk->external_name();
+    }
+  }
+  snprintf(buf, len, "(%d args)->%s", nargs, rname != nullptr ? rname : "?");
+}
+
+// LambdaForm name for a MethodHandle: its form's vmentry MemberName as
+// "<class>.<method>" (e.g. "java.lang.invoke.LambdaForm$DMH.invokeStatic").
+static void soroush_mh_lf_name(oop mh, char* buf, size_t len) {
+  if (len == 0) return;
+  buf[0] = '\0';
+  oop form = java_lang_invoke_MethodHandle::form(mh);
+  if (form == nullptr || !java_lang_invoke_LambdaForm::is_instance(form)) return;
+  oop vmentry = java_lang_invoke_LambdaForm::vmentry(form);
+  if (vmentry == nullptr || !java_lang_invoke_MemberName::is_instance(vmentry)) return;
+
+  Method* target = java_lang_invoke_MemberName::vmtarget(vmentry);
+  if (target != nullptr) {
+    snprintf(buf, len, "%s.%s", target->method_holder()->name()->as_C_string(),
+             target->name()->as_C_string());
+    return;
+  }
+  oop clazz = java_lang_invoke_MemberName::clazz(vmentry);
+  oop name = java_lang_invoke_MemberName::name(vmentry);
+  const char* cn = "?";
+  if (clazz != nullptr && java_lang_Class::is_instance(clazz)) {
+    Klass* k = java_lang_Class::as_Klass(clazz);
+    if (k != nullptr) cn = k->name()->as_C_string();
+  }
+  if (name != nullptr && java_lang_String::is_instance(name)) {
+    snprintf(buf, len, "%s.%s", cn, java_lang_String::as_utf8_string(name));
+  } else {
+    snprintf(buf, len, "%s.?", cn);
+  }
+}
+
+// Observational MethodHandle / LambdaForm execution-structure tracer. Runs at an
+// invocation linkage site (resolve_handle_call) with the appendix MethodHandle.
+// Read-only walk of the MH object graph (no behavior change); emits [JVM MH EXEC]
+// diagnostics and provenance-graph MHAdapter/LambdaFormExec nodes + edges.
+// NOTE: per-invocation invokeBasic/linkTo* execution runs in generated assembly
+// stubs (no safe C++ hook); the deep adapter-chain *execution* is instead made
+// visible by instrumenting the LambdaForm bytecode (SOROUSH_TRACE_MH_EXEC + the
+// PHASE5 rewriter). This hook captures the structural shape at link time.
+static void soroush_trace_mh_execution(oop mh, const char* site, Klass* caller, TRAPS) {
+  bool log = soroush_trace_mh_exec_enabled();
+  bool graph = soroush_graph_enabled();
+  if (!log && !graph) return;
+  if (mh == nullptr) return;
+  ResourceMark rm(THREAD);
+
+  // Common case at invokeExact/invoke linkage: the appendix is the *invoker*
+  // MemberName, not the user's MethodHandle (that is a runtime receiver value).
+  // Record the invoke site -> invoker LambdaForm so it connects (by name) to the
+  // LambdaForm executions captured via bytecode instrumentation.
+  if (!java_lang_invoke_MethodHandle::is_instance(mh)) {
+    if (!java_lang_invoke_MemberName::is_instance(mh)) return;
+    Method* inv = java_lang_invoke_MemberName::vmtarget(mh);
+    if (inv == nullptr) return;
+    char inv_name[640];
+    snprintf(inv_name, sizeof(inv_name), "%s.%s",
+             inv->method_holder()->name()->as_C_string(), inv->name()->as_C_string());
+    if (log) {
+      fprintf(stderr, "[JVM MH EXEC] site=%s caller=%s invoker=%s\n", site,
+              caller == nullptr ? "<unknown>" : caller->name()->as_C_string(), inv_name);
+    }
+    if (graph) {
+      soroush_graph_mh_chain(soroush_runtime_current_exec_id(), "InvokerSite",
+                             nullptr, inv_name, nullptr, nullptr, nullptr, 0, 0);
+    }
+    return;
+  }
+
+  const char* kind = mh->klass()->external_name();
+  int is_bound = (kind != nullptr && strstr(kind, "BoundMethodHandle") != nullptr) ? 1 : 0;
+
+  char type_desc[256];
+  soroush_mh_type_desc(mh, type_desc, sizeof(type_desc));
+  char lf_name[512];
+  soroush_mh_lf_name(mh, lf_name, sizeof(lf_name));
+
+  const char* final_class = nullptr;
+  const char* final_method = nullptr;
+  const char* final_desc = nullptr;
+  uint64_t final_loader_id = 0;
+  if (java_lang_invoke_DirectMethodHandle::is_instance(mh)) {
+    oop member = java_lang_invoke_DirectMethodHandle::member(mh);
+    if (member != nullptr && java_lang_invoke_MemberName::is_instance(member)) {
+      Method* t = java_lang_invoke_MemberName::vmtarget(member);
+      if (t != nullptr) {
+        final_class = t->method_holder()->name()->as_C_string();
+        final_method = t->name()->as_C_string();
+        final_desc = t->signature()->as_C_string();
+        final_loader_id = (uint64_t)(uintptr_t)t->method_holder()->class_loader_data();
+      }
+    }
+  }
+
+  if (log) {
+    fprintf(stderr, "[JVM MH EXEC] site=%s caller=%s kind=%s type=%s bound=%d\n",
+            site, caller == nullptr ? "<unknown>" : caller->name()->as_C_string(),
+            kind, type_desc, is_bound);
+    if (lf_name[0] != '\0') {
+      fprintf(stderr, "[JVM LAMBDAFORM EXEC] lf=%s\n", lf_name);
+    }
+    if (final_class != nullptr) {
+      fprintf(stderr, "[JVM MH ADAPTER] resolves_to=%s.%s%s\n",
+              final_class, final_method, final_desc ? final_desc : "");
+    }
+  }
+  if (graph) {
+    uint64_t caller_exec = soroush_runtime_current_exec_id();
+    soroush_graph_mh_chain(caller_exec, kind, type_desc,
+                           lf_name[0] != '\0' ? lf_name : nullptr,
+                           final_class, final_method, final_desc, is_bound,
+                           final_loader_id);
   }
 }
 
@@ -1817,6 +1966,130 @@ void LinkResolver::resolve_invokehandle(CallInfo& result, const constantPoolHand
   resolve_handle_call(result, link_info, CHECK);
 }
 
+// ---------------------------------------------------------------------------
+// Soroush: file-local helpers for MethodHandle runtime callsite capture.
+// ---------------------------------------------------------------------------
+
+// Count parameter slots from a JVM descriptor "(T1T2...)R".
+// Excludes the receiver.  Returns -1 on malformed input.
+// J/D = 2 slots; all other types = 1 slot.
+static int sg_count_param_slots(Symbol* sig) {
+  if (sig == nullptr) return -1;
+  const char* s = sig->as_C_string();
+  if (s == nullptr || s[0] != '(') return -1;
+  s++; // skip '('
+  int slots = 0;
+  while (*s != ')' && *s != '\0') {
+    switch (*s) {
+    case 'J': case 'D':
+      slots += 2; s++; break;
+    case 'L':
+      slots++;
+      s++; // skip 'L'
+      while (*s != ';' && *s != '\0') s++;
+      if (*s == ';') s++;
+      break;
+    case '[':
+      slots++; // any array = 1 slot regardless of dimensions
+      while (*s == '[') s++;
+      if (*s == 'L') {
+        s++;
+        while (*s != ';' && *s != '\0') s++;
+        if (*s == ';') s++;
+      } else if (*s != '\0' && *s != ')') {
+        s++; // skip primitive component char
+      }
+      break;
+    default:
+      slots++; s++; break;
+    }
+  }
+  return slots;
+}
+
+// Maps simple single-instruction push bytecodes to the number of stack slots
+// they produce.  Returns 0 for anything that isn't a plain local-load or
+// constant-push — signals a complex argument expression (invokestatic, getfield,
+// etc.) that the backward-walk heuristic cannot handle.
+static int sg_slots_pushed(Bytecodes::Code bc) {
+  switch (bc) {
+  // 1-slot pushes
+  case Bytecodes::_aconst_null:
+  case Bytecodes::_aload:   case Bytecodes::_aload_0: case Bytecodes::_aload_1:
+  case Bytecodes::_aload_2: case Bytecodes::_aload_3:
+  case Bytecodes::_iload:   case Bytecodes::_iload_0: case Bytecodes::_iload_1:
+  case Bytecodes::_iload_2: case Bytecodes::_iload_3:
+  case Bytecodes::_fload:   case Bytecodes::_fload_0: case Bytecodes::_fload_1:
+  case Bytecodes::_fload_2: case Bytecodes::_fload_3:
+  case Bytecodes::_iconst_m1: case Bytecodes::_iconst_0: case Bytecodes::_iconst_1:
+  case Bytecodes::_iconst_2:  case Bytecodes::_iconst_3: case Bytecodes::_iconst_4:
+  case Bytecodes::_iconst_5:
+  case Bytecodes::_fconst_0: case Bytecodes::_fconst_1: case Bytecodes::_fconst_2:
+  case Bytecodes::_bipush: case Bytecodes::_sipush:
+  case Bytecodes::_ldc:    case Bytecodes::_ldc_w:
+    return 1;
+  // 2-slot pushes
+  case Bytecodes::_lload:   case Bytecodes::_lload_0: case Bytecodes::_lload_1:
+  case Bytecodes::_lload_2: case Bytecodes::_lload_3:
+  case Bytecodes::_dload:   case Bytecodes::_dload_0: case Bytecodes::_dload_1:
+  case Bytecodes::_dload_2: case Bytecodes::_dload_3:
+  case Bytecodes::_lconst_0: case Bytecodes::_lconst_1:
+  case Bytecodes::_dconst_0: case Bytecodes::_dconst_1:
+  case Bytecodes::_ldc2_w:
+    return 2;
+  default:
+    return 0; // complex: invokestatic, getfield, checkcast, etc.
+  }
+}
+
+// Forward-scan method bytecodes to find which local variable holds the MH
+// receiver for the invokehandle at invoke_bci.
+// Strategy: collect all BCIs up to invoke_bci into a linear array, then walk
+// backwards consuming arg_slots worth of simple single-instruction pushes.
+// The instruction at pos after that walk is the MH-receiver push; we return
+// its local-variable index, or -1 if the pattern is not a simple aload.
+// Conservative by design: returns -1 rather than guessing.
+static int sg_find_receiver_local_slot(Method* m, int invoke_bci, int arg_slots) {
+  if (m == nullptr || invoke_bci <= 0 || arg_slots < 0 || invoke_bci > 1024)
+    return -1;
+  address code      = m->code_base();
+  int     code_size = m->code_size();
+  if (invoke_bci >= code_size) return -1;
+
+  int bci_arr[1025];
+  int count = 0;
+  for (int bci = 0; bci < invoke_bci; ) {
+    if (count >= 1025) return -1;
+    bci_arr[count++] = bci;
+    int bc_len = Bytecodes::length_at(m, code + bci);
+    if (bc_len <= 0) return -1;
+    bci += bc_len;
+  }
+  if (count == 0) return -1;
+
+  int remaining = arg_slots;
+  int pos       = count - 1;
+  while (remaining > 0 && pos >= 0) {
+    Bytecodes::Code bc = Bytecodes::java_code_at(m, code + bci_arr[pos]);
+    int pushed = sg_slots_pushed(bc);
+    if (pushed == 0) return -1; // non-simple arg expression
+    remaining -= pushed;
+    pos--;
+  }
+  if (remaining != 0 || pos < 0) return -1;
+
+  // pos now indexes the instruction that pushed the MH receiver
+  address recv_bcp = code + bci_arr[pos];
+  switch (Bytecodes::java_code_at(m, recv_bcp)) {
+  case Bytecodes::_aload_0: return 0;
+  case Bytecodes::_aload_1: return 1;
+  case Bytecodes::_aload_2: return 2;
+  case Bytecodes::_aload_3: return 3;
+  case Bytecodes::_aload:   return (int)(uint8_t)recv_bcp[1];
+  default:                  return -1; // getfield, ldc of MH constant, etc.
+  }
+}
+
 void LinkResolver::resolve_handle_call(CallInfo& result,
                                        const LinkInfo& link_info,
                                        TRAPS) {
@@ -1869,6 +2142,257 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
       fprintf(stderr, "\n");
     }
   }
+  // MethodHandle / LambdaForm execution-structure tracing (observational).
+  if (resolved_appendix.not_null()) {
+    soroush_trace_mh_execution(resolved_appendix(), "invokeBasic-link",
+                               link_info.current_klass(), THREAD);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Soroush: source + runtime-receiver callsite capture for MethodHandle and
+  // JDK 21 reflection.
+  //
+  // Fires on first linkage (resolve_handle_call called once per callsite).
+  // At this point all Java arguments are still on the expression stack of the
+  // calling interpreter frame, so we can read the actual MH receiver object
+  // and inspect it directly — no appendix-guessing needed.
+  //
+  // Case A — normal user MH call (e.g. mh.invokeExact(a, b)):
+  //   top frame = user's interpreter frame executing invokehandle.
+  //   Source: read BCI + class/method/desc from that frame.
+  //   Target: read MH receiver from expression stack at offset arg_slots;
+  //           exact iff receiver is a DirectMethodHandle with vmtarget.
+  //
+  // Case B — JDK 21 reflection via DirectMethodHandleAccessor.invokeImpl or
+  //   DirectConstructorHandleAccessor.invokeImpl (JEP 416):
+  //   top frame = accessor frame; user frame is deeper in the stack.
+  //   Source: walk vframeStream past reflection internals to user frame.
+  //   Target: MH receiver on accessor's expression stack is the accessor's
+  //           `target` field — exact iff it is a DirectMethodHandle.
+  //   Category: changed to reflection_method_invoke /
+  //             reflection_constructor_newInstance.
+  //
+  // Deferred (not handled here, see SOROUSH_JVM_SPEC.md):
+  //   - Adapter MH chains (boxing/unboxing) — receiver is not a DMH.
+  //   - Compiled-frame BCI recovery.
+  //   - Virtual/interface dispatch callsite probes.
+  //   - Redefine/retransform lineage.
+  //   - Full adapter unwrapping.
+  //
+  // Hard rules: if source or target is not exactly determinable,
+  // emit a diagnostic record — never emit a callsite_target with guessed data.
+  // ---------------------------------------------------------------------------
+  if (soroush_graph_enabled()) {
+    ResourceMark rm_mh(THREAD);
+
+    Symbol* mh_name = link_info.name();
+    const char* cat = "methodhandle_invoke";
+    if (mh_name == vmSymbols::invokeExact_name()) {
+      cat = "methodhandle_invokeExact";
+    }
+
+    const char* src_class  = nullptr;
+    const char* src_method = nullptr;
+    const char* src_desc   = nullptr;
+    int  src_bci     = -1;
+    int  src_opcode  = 0;
+    int  src_cp      = -1;
+    uint64_t src_loader  = 0;
+    bool src_ok = false;
+
+    const char* tgt_class  = nullptr;
+    const char* tgt_method = nullptr;
+    const char* tgt_desc   = nullptr;
+    uint64_t    tgt_loader = 0;
+    bool tgt_ok = false;
+
+    bool is_reflection_accessor = false;
+    bool top_frame_valid = false;
+    frame top;
+
+    if (THREAD->has_last_Java_frame()) {
+      top = THREAD->last_frame();
+      if (top.is_interpreted_frame()) {
+        top_frame_valid = true;
+        Method* cm = top.interpreter_frame_method();
+        if (cm != nullptr) {
+          const char* holder = cm->method_holder()->name()->as_C_string();
+          bool is_dmha = (strncmp(holder,
+              "jdk/internal/reflect/DirectMethodHandleAccessor",   47) == 0);
+          bool is_dcha = (strncmp(holder,
+              "jdk/internal/reflect/DirectConstructorHandleAccessor", 51) == 0);
+
+          if (is_dmha || is_dcha) {
+            // ---- Case B: JDK 21 reflection accessor ----
+            is_reflection_accessor = true;
+            cat = is_dmha ? "reflection_method_invoke"
+                          : "reflection_constructor_newInstance";
+
+            // Walk vframeStream past reflection internals to user's frame.
+            for (vframeStream vfst(THREAD); !vfst.at_end(); vfst.next()) {
+              Method* m = vfst.method();
+              if (m == nullptr) continue;
+              const char* h = m->method_holder()->name()->as_C_string();
+              if (strncmp(h, "jdk/internal/reflect/", 21) == 0 ||
+                  strncmp(h, "java/lang/reflect/",    18) == 0 ||
+                  strncmp(h, "sun/reflect/",          12) == 0) {
+                continue;
+              }
+              int bci = vfst.bci();
+              if (bci < 0) break;
+              src_class  = h;
+              src_loader = (uint64_t)(uintptr_t)m->method_holder()->class_loader_data();
+              src_method = m->name()->as_C_string();
+              src_desc   = m->signature()->as_C_string();
+              src_bci    = bci;
+              if (bci < m->code_size()) {
+                address bcp = m->bcp_from(bci);
+                src_opcode = (int)(uint8_t)Bytecodes::java_code_at(m, bcp);
+                if (bci + 2 < m->code_size()) {
+                  int cc_idx = (((int)(uint8_t)m->code_base()[bci + 1]) << 8)
+                             |  ((int)(uint8_t)m->code_base()[bci + 2]);
+                  ConstantPool* cpool = m->constants();
+                  if (cpool != nullptr && cpool->cache() != nullptr
+                      && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+                    src_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+                  }
+                }
+              }
+              src_ok = true;
+              break;
+            }
+
+          } else {
+            // ---- Case A: normal user MH callsite ----
+            src_bci = top.interpreter_frame_bci();
+            if (src_bci >= 0) {
+              src_class  = holder;
+              src_loader = (uint64_t)(uintptr_t)cm->method_holder()->class_loader_data();
+              src_method = cm->name()->as_C_string();
+              src_desc   = cm->signature()->as_C_string();
+              if (src_bci < cm->code_size()) {
+                address bcp = cm->bcp_from(src_bci);
+                src_opcode = (int)(uint8_t)Bytecodes::java_code_at(cm, bcp);
+                if (src_bci + 2 < cm->code_size()) {
+                  int cc_idx = (((int)(uint8_t)cm->code_base()[src_bci + 1]) << 8)
+                             |  ((int)(uint8_t)cm->code_base()[src_bci + 2]);
+                  ConstantPool* cpool = cm->constants();
+                  if (cpool != nullptr && cpool->cache() != nullptr
+                      && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+                    src_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+                  }
+                }
+              }
+              src_ok = true;
+            }
+          }
+        }
+      }
+    }
+
+    // ---- Runtime receiver inspection ----
+    //
+    // Case A (normal user MH callsite): the MH is stored in a local variable.
+    //   Use bytecode forward-scan + backward-walk to find which local slot holds
+    //   the receiver, then read it via interpreter_frame_local_at(N).
+    //   interpreter_frame_local_at uses rfp-relative addressing and is safe
+    //   during call_VM regardless of last_sp state.
+    //   interpreter_frame_expression_stack_at MUST NOT be used here because
+    //   last_sp is asserted NULL at call_VM entry on aarch64, making the
+    //   expression-stack address fall back to sp() (C stack pointer).
+    //
+    // Case B (JDK 21 reflection accessor): read accessor `this` from local 0,
+    //   then find the `target` MethodHandle field via JavaFieldStream.
+    if (top_frame_valid && !is_reflection_accessor) {
+      // Case A
+      Method* tcm = top.interpreter_frame_method();
+      if (src_ok && tcm != nullptr) {
+        int arg_slots = sg_count_param_slots(link_info.signature());
+        if (arg_slots >= 0) {
+          int recv_local = sg_find_receiver_local_slot(tcm, src_bci, arg_slots);
+          if (recv_local >= 0) {
+            intptr_t* local = top.interpreter_frame_local_at(recv_local);
+            if (local != nullptr) {
+              oop mh_recv = *(oop*)local;
+              if (mh_recv != nullptr && oopDesc::is_oop_or_null(mh_recv) &&
+                  java_lang_invoke_DirectMethodHandle::is_instance(mh_recv)) {
+                oop mn = java_lang_invoke_DirectMethodHandle::member(mh_recv);
+                if (mn != nullptr && java_lang_invoke_MemberName::is_instance(mn)) {
+                  Method* tm = (Method*)java_lang_invoke_MemberName::vmtarget(mn);
+                  if (tm != nullptr) {
+                    tgt_class  = tm->method_holder()->name()->as_C_string();
+                    tgt_loader = (uint64_t)(uintptr_t)tm->method_holder()->class_loader_data();
+                    tgt_method = tm->name()->as_C_string();
+                    tgt_desc   = tm->signature()->as_C_string();
+                    tgt_ok = true;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } else if (top_frame_valid && is_reflection_accessor) {
+      // Case B: accessor `this` is local 0; find its `target` field.
+      intptr_t* local0 = top.interpreter_frame_local_at(0);
+      if (local0 != nullptr) {
+        oop accessor_obj = *(oop*)local0;
+        if (accessor_obj != nullptr && oopDesc::is_oop_or_null(accessor_obj)) {
+          Klass* ak = accessor_obj->klass();
+          if (ak != nullptr && ak->is_instance_klass()) {
+            InstanceKlass* ik = InstanceKlass::cast(ak);
+            for (JavaFieldStream jfs(ik); !jfs.done(); jfs.next()) {
+              Symbol* fn = jfs.name();
+              Symbol* fs = jfs.signature();
+              if (fn == nullptr || fs == nullptr) continue;
+              if (strcmp(fn->as_C_string(), "target") == 0 &&
+                  strncmp(fs->as_C_string(), "Ljava/lang/invoke/MethodHandle;", 31) == 0) {
+                fieldDescriptor& fd = jfs.field_descriptor();
+                oop mh_recv = accessor_obj->obj_field(fd.offset());
+                if (mh_recv != nullptr && oopDesc::is_oop_or_null(mh_recv) &&
+                    java_lang_invoke_DirectMethodHandle::is_instance(mh_recv)) {
+                  oop mn = java_lang_invoke_DirectMethodHandle::member(mh_recv);
+                  if (mn != nullptr && java_lang_invoke_MemberName::is_instance(mn)) {
+                    Method* tm = (Method*)java_lang_invoke_MemberName::vmtarget(mn);
+                    if (tm != nullptr) {
+                      tgt_class  = tm->method_holder()->name()->as_C_string();
+                      tgt_loader = (uint64_t)(uintptr_t)tm->method_holder()->class_loader_data();
+                      tgt_method = tm->name()->as_C_string();
+                      tgt_desc   = tm->signature()->as_C_string();
+                      tgt_ok = true;
+                    }
+                  }
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    char reason[256] = "";
+    bool exact = src_ok && tgt_ok;
+    if (!exact) {
+      if (!src_ok && !tgt_ok)
+        snprintf(reason, sizeof(reason),
+            "source_compiled_frame_unavailable,target_not_resolved");
+      else if (!src_ok)
+        snprintf(reason, sizeof(reason), is_reflection_accessor
+            ? "reflection_user_frame_not_found_in_stack"
+            : "source_compiled_frame_bci_unavailable");
+      else
+        snprintf(reason, sizeof(reason), is_reflection_accessor
+            ? "reflection_target_adapter_mh_deferred"
+            : "runtime_receiver_not_direct_mh_deferred");
+    }
+    soroush_graph_generic_callsite(cat,
+        src_class, src_loader, src_method, src_desc,
+        src_bci, src_opcode, src_cp,
+        tgt_class, tgt_loader, tgt_method, tgt_desc,
+        src_ok, tgt_ok, exact ? nullptr : reason);
+  }
+
   JFR_ONLY(Jfr::on_resolution(result, CHECK);)
 }
 
