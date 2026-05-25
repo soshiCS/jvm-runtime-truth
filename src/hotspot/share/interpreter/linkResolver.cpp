@@ -2090,6 +2090,260 @@ static int sg_find_receiver_local_slot(Method* m, int invoke_bci, int arg_slots)
   }
 }
 
+// ---------------------------------------------------------------------------
+// MethodHandle adapter-structure walking (runtime receiver inspection v2).
+//
+// Taxonomy (JDK 21 field layout, audited from source):
+//
+//   DirectMethodHandle (+ Special/Interface/Constructor/Accessor subclasses)
+//     → member (MemberName) → single exact target
+//
+//   DelegatingMethodHandle subclasses with `target: MethodHandle` field:
+//     CountingWrapper, IntrinsicMethodHandle, WrappedMember, AsVarargsCollector
+//     → transparent wrappers, recurse through `target`
+//
+//   BoundMethodHandle$Species_LLL  + LambdaForm.kind == "GUARD"
+//     → guardWithTest: argL0=test, argL1=target(maybe wrapped), argL2=fallback
+//     → callsite_target_set with roles test / true_target / false_target
+//
+//   BoundMethodHandle$Species_LLLLL + LambdaForm.kind == "GUARD_WITH_CATCH"
+//     → catchException: argL0=try_target, argL1=exception Class, argL2=handler
+//     → callsite_target_set with roles try_target / handler (aux_info=exception_class)
+//
+//   All other BoundMethodHandle shapes (asType/filter/fold/permute/etc.)
+//     → LambdaForm.kind == "GENERIC" (cannot distinguish roles)
+//     → diagnostic unsupported_adapter_shape
+//
+// NOTE: Kind.CONVERT is defined in the Java source but never assigned in
+// JDK 21 — asType and all pairwise-convert adapters use Kind.GENERIC.
+// ---------------------------------------------------------------------------
+
+struct SgMhTarget {
+  const char* klass;
+  uint64_t    loader_id;
+  const char* method;
+  const char* descriptor;
+  bool        valid;
+};
+
+struct SgMhWalkResult {
+  enum Shape {
+    DIRECT,       // DirectMethodHandle  → single exact target
+    GWT,          // guardWithTest       → test / true_target / false_target
+    GWC,          // catchException      → try_target / handler
+    BMH_UNKNOWN,  // BMH with unrecognised LambdaForm kind (asType, filter, fold …)
+    MH_UNKNOWN    // not a known MH class
+  };
+
+  Shape       shape;
+  const char* adapter_class; // outermost MH class name
+  const char* lf_kind;       // LambdaForm.Kind.name() (ResourceMark-allocated)
+  const char* aux_info;      // GWC: exception class name
+
+  int        n_targets;
+  const char* roles[4];
+  SgMhTarget  targets[4];
+  bool        all_exact;
+};
+
+static bool sg_oop_valid(oop o) {
+  return o != nullptr && oopDesc::is_oop_or_null(o);
+}
+
+// Scan the class hierarchy of `obj` for an instance field named `fname` with
+// descriptor `fsig` and return its value.  Returns nullptr if not found.
+static oop sg_find_field_oop(oop obj, const char* fname, const char* fsig) {
+  if (!sg_oop_valid(obj)) return nullptr;
+  Klass* k = obj->klass();
+  while (k != nullptr && k->is_instance_klass()) {
+    InstanceKlass* ik = InstanceKlass::cast(k);
+    for (JavaFieldStream jfs(ik); !jfs.done(); jfs.next()) {
+      Symbol* fn = jfs.name();
+      Symbol* fs = jfs.signature();
+      if (fn == nullptr || fs == nullptr) continue;
+      if (strcmp(fn->as_C_string(), fname) == 0 &&
+          strcmp(fs->as_C_string(), fsig)  == 0) {
+        return obj->obj_field(jfs.field_descriptor().offset());
+      }
+    }
+    k = k->super();
+  }
+  return nullptr;
+}
+
+// Read LambdaForm.kind.name() for a MethodHandle.
+// Returns a ResourceMark-allocated C string, or nullptr on failure.
+static const char* sg_lf_kind_name(oop mh_oop) {
+  if (!sg_oop_valid(mh_oop) || !java_lang_invoke_MethodHandle::is_instance(mh_oop))
+    return nullptr;
+  oop lf = java_lang_invoke_MethodHandle::form(mh_oop);
+  if (!sg_oop_valid(lf)) return nullptr;
+
+  oop kind_oop = sg_find_field_oop(lf, "kind", "Ljava/lang/invoke/LambdaForm$Kind;");
+  if (!sg_oop_valid(kind_oop)) return nullptr;
+
+  // Read java.lang.Enum.name (String field in the enum supertype)
+  Klass* k = kind_oop->klass();
+  while (k != nullptr && k->is_instance_klass()) {
+    InstanceKlass* ik = InstanceKlass::cast(k);
+    for (JavaFieldStream jfs(ik); !jfs.done(); jfs.next()) {
+      Symbol* fn = jfs.name();
+      Symbol* fs = jfs.signature();
+      if (fn == nullptr || fs == nullptr) continue;
+      if (strcmp(fn->as_C_string(), "name") == 0 &&
+          strcmp(fs->as_C_string(), "Ljava/lang/String;") == 0) {
+        oop str = kind_oop->obj_field(jfs.field_descriptor().offset());
+        if (str != nullptr && java_lang_String::is_instance(str))
+          return java_lang_String::as_utf8_string(str);
+        return nullptr;
+      }
+    }
+    k = k->super();
+  }
+  return nullptr;
+}
+
+// Read argL{index} from a BoundMethodHandle species oop.
+static oop sg_bmh_arg_at(oop mh_oop, int index) {
+  if (!sg_oop_valid(mh_oop) || index < 0 || index > 7) return nullptr;
+  char fname[12];
+  snprintf(fname, sizeof(fname), "argL%d", index);
+  Klass* k = mh_oop->klass();
+  while (k != nullptr && k->is_instance_klass()) {
+    InstanceKlass* ik = InstanceKlass::cast(k);
+    for (JavaFieldStream jfs(ik); !jfs.done(); jfs.next()) {
+      Symbol* fn = jfs.name();
+      if (fn != nullptr && strcmp(fn->as_C_string(), fname) == 0)
+        return mh_oop->obj_field(jfs.field_descriptor().offset());
+    }
+    k = k->super();
+  }
+  return nullptr;
+}
+
+// Fill an SgMhTarget from a DirectMethodHandle.  Returns true on success.
+static bool sg_extract_dmh_target(oop mh_oop, SgMhTarget* out) {
+  if (!sg_oop_valid(mh_oop) || out == nullptr) return false;
+  if (!java_lang_invoke_DirectMethodHandle::is_instance(mh_oop)) return false;
+  oop mn = java_lang_invoke_DirectMethodHandle::member(mh_oop);
+  if (!sg_oop_valid(mn) || !java_lang_invoke_MemberName::is_instance(mn)) return false;
+  Method* tm = (Method*)java_lang_invoke_MemberName::vmtarget(mn);
+  if (tm == nullptr) return false;
+  out->klass      = tm->method_holder()->name()->as_C_string();
+  out->loader_id  = (uint64_t)(uintptr_t)tm->method_holder()->class_loader_data();
+  out->method     = tm->name()->as_C_string();
+  out->descriptor = tm->signature()->as_C_string();
+  out->valid      = true;
+  return true;
+}
+
+// Unwrap transparent DelegatingMethodHandle wrappers (CountingWrapper,
+// IntrinsicMethodHandle, WrappedMember, AsVarargsCollector …) to reach the
+// payload.  Returns the original oop if it is a DMH or has no `target` field.
+static oop sg_unwrap_delegating(oop mh_oop, int depth) {
+  if (!sg_oop_valid(mh_oop) || depth <= 0) return mh_oop;
+  if (java_lang_invoke_DirectMethodHandle::is_instance(mh_oop)) return mh_oop;
+  oop inner = sg_find_field_oop(mh_oop, "target", "Ljava/lang/invoke/MethodHandle;");
+  if (sg_oop_valid(inner)) return sg_unwrap_delegating(inner, depth - 1);
+  return mh_oop;
+}
+
+// Walk a MethodHandle oop and classify its adapter structure.
+// Depth-limited; returns shape=MH_UNKNOWN on any error or depth exhaustion.
+static SgMhWalkResult sg_walk_mh(oop mh_oop, int depth) {
+  SgMhWalkResult r;
+  memset(&r, 0, sizeof(r));
+  r.shape = SgMhWalkResult::MH_UNKNOWN;
+
+  if (!sg_oop_valid(mh_oop) || depth <= 0) return r;
+
+  Klass* k = mh_oop->klass();
+  if (k == nullptr) return r;
+  r.adapter_class = k->name()->as_C_string();
+
+  // ---- Case 1: DirectMethodHandle (includes Special/Interface/Constructor) ----
+  if (java_lang_invoke_DirectMethodHandle::is_instance(mh_oop)) {
+    r.shape     = SgMhWalkResult::DIRECT;
+    r.n_targets = 1;
+    r.roles[0]  = "direct_target";
+    r.all_exact = sg_extract_dmh_target(mh_oop, &r.targets[0]);
+    return r;
+  }
+
+  // ---- Case 2: DelegatingMethodHandle subclass — transparent wrapper ----
+  oop delegate = sg_find_field_oop(mh_oop, "target", "Ljava/lang/invoke/MethodHandle;");
+  if (sg_oop_valid(delegate)) {
+    SgMhWalkResult inner = sg_walk_mh(delegate, depth - 1);
+    inner.adapter_class = r.adapter_class; // report outermost wrapper class
+    return inner;
+  }
+
+  // ---- Case 3: BoundMethodHandle species ----
+  const char* kn = r.adapter_class;
+  bool is_bmh = (strncmp(kn, "java/lang/invoke/BoundMethodHandle", 34) == 0);
+  if (!is_bmh) return r; // shape stays MH_UNKNOWN
+
+  r.lf_kind = sg_lf_kind_name(mh_oop);
+  if (r.lf_kind == nullptr) { r.shape = SgMhWalkResult::BMH_UNKNOWN; return r; }
+
+  // ---- Case 3a: guardWithTest ----
+  if (strcmp(r.lf_kind, "GUARD") == 0) {
+    r.shape     = SgMhWalkResult::GWT;
+    r.n_targets = 3;
+    r.roles[0]  = "test";
+    r.roles[1]  = "true_target";
+    r.roles[2]  = "false_target";
+    r.all_exact = true;
+
+    oop t[3];
+    t[0] = sg_unwrap_delegating(sg_bmh_arg_at(mh_oop, 0), 4);
+    t[1] = sg_unwrap_delegating(sg_bmh_arg_at(mh_oop, 1), 4);
+    t[2] = sg_unwrap_delegating(sg_bmh_arg_at(mh_oop, 2), 4);
+
+    for (int i = 0; i < 3; i++) {
+      if (!sg_extract_dmh_target(t[i], &r.targets[i])) {
+        r.targets[i].klass = (sg_oop_valid(t[i]))
+            ? t[i]->klass()->name()->as_C_string() : "null";
+        r.all_exact = false;
+      }
+    }
+    return r;
+  }
+
+  // ---- Case 3b: catchException ----
+  if (strcmp(r.lf_kind, "GUARD_WITH_CATCH") == 0) {
+    r.shape     = SgMhWalkResult::GWC;
+    r.n_targets = 2;
+    r.roles[0]  = "try_target";
+    r.roles[1]  = "handler";
+    r.all_exact = true;
+
+    oop t0 = sg_unwrap_delegating(sg_bmh_arg_at(mh_oop, 0), 4);
+    oop t2 = sg_unwrap_delegating(sg_bmh_arg_at(mh_oop, 2), 4);
+
+    // argL1 is the exception Class object (not a MethodHandle)
+    oop ex_oop = sg_bmh_arg_at(mh_oop, 1);
+    if (sg_oop_valid(ex_oop)) {
+      Klass* ex_k = java_lang_Class::as_Klass(ex_oop);
+      if (ex_k != nullptr) r.aux_info = ex_k->name()->as_C_string();
+    }
+
+    if (!sg_extract_dmh_target(t0, &r.targets[0])) {
+      r.targets[0].klass = sg_oop_valid(t0) ? t0->klass()->name()->as_C_string() : "null";
+      r.all_exact = false;
+    }
+    if (!sg_extract_dmh_target(t2, &r.targets[1])) {
+      r.targets[1].klass = sg_oop_valid(t2) ? t2->klass()->name()->as_C_string() : "null";
+      r.all_exact = false;
+    }
+    return r;
+  }
+
+  // ---- Case 3c: all other BMH shapes (asType/filter/fold/permute/…) ----
+  r.shape = SgMhWalkResult::BMH_UNKNOWN;
+  return r;
+}
+
 void LinkResolver::resolve_handle_call(CallInfo& result,
                                        const LinkInfo& link_info,
                                        TRAPS) {
@@ -2303,28 +2557,61 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
     //
     // Case B (JDK 21 reflection accessor): read accessor `this` from local 0,
     //   then find the `target` MethodHandle field via JavaFieldStream.
+    bool multi_target_emitted = false;
+    char adapter_diag[384] = "";
     if (top_frame_valid && !is_reflection_accessor) {
-      // Case A
+      // Case A: walk the runtime MH receiver oop to classify its adapter structure.
+      // sg_walk_mh handles: DirectMethodHandle (DIRECT), guardWithTest (GWT),
+      // catchException (GWC), opaque BMH adapters (BMH_UNKNOWN), unknown MH types.
       Method* tcm = top.interpreter_frame_method();
       if (src_ok && tcm != nullptr) {
         int arg_slots = sg_count_param_slots(link_info.signature());
         if (arg_slots >= 0) {
           int recv_local = sg_find_receiver_local_slot(tcm, src_bci, arg_slots);
           if (recv_local >= 0) {
-            intptr_t* local = top.interpreter_frame_local_at(recv_local);
-            if (local != nullptr) {
-              oop mh_recv = *(oop*)local;
-              if (mh_recv != nullptr && oopDesc::is_oop_or_null(mh_recv) &&
-                  java_lang_invoke_DirectMethodHandle::is_instance(mh_recv)) {
-                oop mn = java_lang_invoke_DirectMethodHandle::member(mh_recv);
-                if (mn != nullptr && java_lang_invoke_MemberName::is_instance(mn)) {
-                  Method* tm = (Method*)java_lang_invoke_MemberName::vmtarget(mn);
-                  if (tm != nullptr) {
-                    tgt_class  = tm->method_holder()->name()->as_C_string();
-                    tgt_loader = (uint64_t)(uintptr_t)tm->method_holder()->class_loader_data();
-                    tgt_method = tm->name()->as_C_string();
-                    tgt_desc   = tm->signature()->as_C_string();
-                    tgt_ok = true;
+            intptr_t* local_ptr = top.interpreter_frame_local_at(recv_local);
+            if (local_ptr != nullptr) {
+              oop mh_recv = *(oop*)local_ptr;
+              if (mh_recv != nullptr && oopDesc::is_oop_or_null(mh_recv)) {
+                SgMhWalkResult walk = sg_walk_mh(mh_recv, 6);
+                if (walk.shape == SgMhWalkResult::DIRECT && walk.all_exact) {
+                  // Single exact target → existing callsite_target path.
+                  tgt_class  = walk.targets[0].klass;
+                  tgt_loader = walk.targets[0].loader_id;
+                  tgt_method = walk.targets[0].method;
+                  tgt_desc   = walk.targets[0].descriptor;
+                  tgt_ok = true;
+                } else if ((walk.shape == SgMhWalkResult::GWT ||
+                             walk.shape == SgMhWalkResult::GWC) && walk.all_exact) {
+                  // Multi-target: emit callsite_target_set and skip generic path.
+                  SgMhTargetEntry entries[4];
+                  memset(entries, 0, sizeof(entries));
+                  for (int i = 0; i < walk.n_targets && i < 4; i++) {
+                    entries[i].klass      = walk.targets[i].klass;
+                    entries[i].loader_id  = walk.targets[i].loader_id;
+                    entries[i].method     = walk.targets[i].method;
+                    entries[i].descriptor = walk.targets[i].descriptor;
+                    entries[i].role       = walk.roles[i];
+                    entries[i].valid      = walk.targets[i].valid;
+                  }
+                  const char* shape_str = (walk.shape == SgMhWalkResult::GWT) ? "GWT" : "GWC";
+                  soroush_graph_target_set_callsite(
+                      cat, shape_str, walk.adapter_class, walk.lf_kind, walk.aux_info,
+                      src_class, src_loader, src_method, src_desc,
+                      src_bci, src_opcode, src_cp,
+                      entries, walk.n_targets);
+                  multi_target_emitted = true;
+                } else {
+                  // Adapter with non-exact targets or unknown shape: supply a
+                  // descriptive reason string for the diagnostic record below.
+                  const char* ac = walk.adapter_class ? walk.adapter_class : "unknown";
+                  if (walk.lf_kind != nullptr) {
+                    snprintf(adapter_diag, sizeof(adapter_diag),
+                             "adapter_not_all_exact lf_kind=%s adapter_class=%s",
+                             walk.lf_kind, ac);
+                  } else {
+                    snprintf(adapter_diag, sizeof(adapter_diag),
+                             "adapter_unknown_shape adapter_class=%s", ac);
                   }
                 }
               }
@@ -2371,26 +2658,30 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
       }
     }
 
-    char reason[256] = "";
-    bool exact = src_ok && tgt_ok;
-    if (!exact) {
-      if (!src_ok && !tgt_ok)
-        snprintf(reason, sizeof(reason),
-            "source_compiled_frame_unavailable,target_not_resolved");
-      else if (!src_ok)
-        snprintf(reason, sizeof(reason), is_reflection_accessor
-            ? "reflection_user_frame_not_found_in_stack"
-            : "source_compiled_frame_bci_unavailable");
-      else
-        snprintf(reason, sizeof(reason), is_reflection_accessor
-            ? "reflection_target_adapter_mh_deferred"
-            : "runtime_receiver_not_direct_mh_deferred");
+    if (!multi_target_emitted) {
+      char reason[256] = "";
+      bool exact = src_ok && tgt_ok;
+      if (!exact) {
+        if (!src_ok && !tgt_ok)
+          snprintf(reason, sizeof(reason),
+              "source_compiled_frame_unavailable,target_not_resolved");
+        else if (!src_ok)
+          snprintf(reason, sizeof(reason), is_reflection_accessor
+              ? "reflection_user_frame_not_found_in_stack"
+              : "source_compiled_frame_bci_unavailable");
+        else if (adapter_diag[0])
+          snprintf(reason, sizeof(reason), "%s", adapter_diag);
+        else
+          snprintf(reason, sizeof(reason), is_reflection_accessor
+              ? "reflection_target_adapter_mh_deferred"
+              : "runtime_receiver_not_direct_mh_deferred");
+      }
+      soroush_graph_generic_callsite(cat,
+          src_class, src_loader, src_method, src_desc,
+          src_bci, src_opcode, src_cp,
+          tgt_class, tgt_loader, tgt_method, tgt_desc,
+          src_ok, tgt_ok, exact ? nullptr : reason);
     }
-    soroush_graph_generic_callsite(cat,
-        src_class, src_loader, src_method, src_desc,
-        src_bci, src_opcode, src_cp,
-        tgt_class, tgt_loader, tgt_method, tgt_desc,
-        src_ok, tgt_ok, exact ? nullptr : reason);
   }
 
   JFR_ONLY(Jfr::on_resolution(result, CHECK);)
