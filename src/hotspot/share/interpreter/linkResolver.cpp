@@ -2177,6 +2177,59 @@ static const char* sg_invoke_desc_at(ConstantPool* cp, address bcp) {
   return sig ? sig->as_C_string() : nullptr;
 }
 
+// Returns true when the bytecode at bci in method m is an adapter factory or
+// adaptation call — invokestatic or invokevirtual targeting
+// java/lang/invoke/MethodHandle(s) with return type Ljava/lang/invoke/MethodHandle;.
+// Examples: MethodHandles.foldArguments, MethodHandles.filterArguments,
+//           MethodHandle.bindTo, MethodHandle.asType, etc.
+// Used by Case A2 to suppress recv_slot_oob diagnostics that fire because
+// resolve_handle_call runs inside the adapter-construction chain, not at the
+// actual user invoke site. The real invocation is a separate BCI captured as a
+// callsite_adapter_graph (CAG) record.
+static bool sg_is_mh_factory_call(Method* m, int bci, int opcode) {
+  if (m == nullptr || bci < 0 || bci >= m->code_size()) {
+    fprintf(stderr, "[DBG_FACTORY] null/oob m=%p bci=%d\n", (void*)m, bci); return false;
+  }
+  if (opcode != Bytecodes::_invokestatic &&
+      opcode != Bytecodes::_invokevirtual) {
+    fprintf(stderr, "[DBG_FACTORY] opcode=%d not invokestatic/virtual bci=%d\n", opcode, bci); return false;
+  }
+  ConstantPool* cp = m->constants();
+  if (cp == nullptr || cp->cache() == nullptr) {
+    fprintf(stderr, "[DBG_FACTORY] no cp bci=%d\n", bci); return false;
+  }
+  address bcp = m->bcp_from(bci);
+  // sg_u2at(bcp) reads the native-endian u2 at bcp+1 — the CP-cache index.
+  int cc_idx = sg_u2at(bcp);
+  if (cc_idx < 0 || cc_idx >= cp->cache()->length()) {
+    fprintf(stderr, "[DBG_FACTORY] cc_idx=%d oob cache_len=%d bci=%d\n", cc_idx, cp->cache()->length(), bci); return false;
+  }
+  int raw = cp->cache()->entry_at(cc_idx)->constant_pool_index();
+  if (raw < 1 || raw >= cp->length()) {
+    fprintf(stderr, "[DBG_FACTORY] raw=%d oob cp_len=%d bci=%d\n", raw, cp->length(), bci); return false;
+  }
+  // Holder must be java/lang/invoke/MethodHandle or java/lang/invoke/MethodHandles.
+  Symbol* klass_sym = cp->uncached_klass_ref_at_noresolve(raw);
+  if (klass_sym == nullptr) {
+    fprintf(stderr, "[DBG_FACTORY] null klass_sym raw=%d bci=%d\n", raw, bci); return false;
+  }
+  const char* klass = klass_sym->as_C_string();
+  if (strncmp(klass, "java/lang/invoke/MethodHandle", 29) != 0) {
+    fprintf(stderr, "[DBG_FACTORY] klass=%s not MH bci=%d\n", klass, bci); return false;
+  }
+  // Return type must be exactly Ljava/lang/invoke/MethodHandle;
+  Symbol* sig_sym = cp->uncached_signature_ref_at(raw);
+  if (sig_sym == nullptr) {
+    fprintf(stderr, "[DBG_FACTORY] null sig_sym raw=%d bci=%d\n", raw, bci); return false;
+  }
+  const char* sig    = sig_sym->as_C_string();
+  const char* rparen = strrchr(sig, ')');
+  bool result = rparen != nullptr &&
+         strcmp(rparen + 1, "Ljava/lang/invoke/MethodHandle;") == 0;
+  fprintf(stderr, "[DBG_FACTORY] bci=%d klass=%s sig=%s result=%d\n", bci, klass, sig, (int)result);
+  return result;
+}
+
 // Get field category (1 or 2 slots) for a getfield/getstatic/putfield/putstatic.
 // For fast forms the type is encoded in the raw opcode; otherwise falls back to
 // the CP-cache descriptor.
@@ -3504,6 +3557,10 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
     // LambdaForm/BMH internal and we are in Case A2.  Used by Step 2 to choose
     // between reading from last_Java_sp (Case A) vs top.local_at(0) (Case A2).
     bool is_lf_dispatch_case = false;
+    // src_is_mh_factory_a2: set in Case A2 when the recovered user BCI points to
+    // a MethodHandle adapter factory call (foldArguments, bindTo, etc.) rather than
+    // an actual runtime invocation.  Causes the diagnostic to be suppressed.
+    bool src_is_mh_factory_a2 = false;
 
     if (THREAD->has_last_Java_frame()) {
       top = THREAD->last_frame();
@@ -3615,6 +3672,10 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                   rscan = rscan.sender(&rmap2);
                 }
               }
+              // Detect adapter-factory BCI: if the recovered user BCI points to
+              // a MethodHandle factory/adaptation call (not a runtime invocation),
+              // mark it so the diagnostic is suppressed rather than exported.
+              src_is_mh_factory_a2 = sg_is_mh_factory_call(sm, src_bci, src_opcode);
               break;
             }
             if (!src_ok) {
@@ -3917,6 +3978,16 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
       }
     }
 
+    // Suppress adapter-construction-time noise: when Case A2 recovered a user
+    // BCI that is a MethodHandle factory/adaptation call (foldArguments, bindTo,
+    // asType, etc.) AND the receiver analysis failed (adapter_diag set),
+    // resolve_handle_call fired inside the construction chain rather than at the
+    // actual user invoke site.  Only suppress when the diagnostic is set — if
+    // adapter_diag is empty the receiver resolved exactly and the record is valid.
+    if (!multi_target_emitted && is_lf_dispatch_case && src_is_mh_factory_a2 && adapter_diag[0]) {
+      multi_target_emitted = true;
+    }
+
     if (!multi_target_emitted) {
       char reason[256] = "";
       bool exact = src_ok && tgt_ok;
@@ -3950,7 +4021,7 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
     // same CP constant pool index but will never trigger resolve_handle_call.
     // Only for non-reflection, non-jli-internal attributions where we have the
     // user method available.
-    if (src_ok && src_cp >= 0 && !is_reflection_accessor) {
+    if (src_ok && src_cp >= 0 && !is_reflection_accessor && !(src_is_mh_factory_a2 && adapter_diag[0])) {
       Method* sibling_method = recv_frame_valid  ? recv_frame_method
                              : (top_frame_valid  ? top.interpreter_frame_method()
                                                  : nullptr);
