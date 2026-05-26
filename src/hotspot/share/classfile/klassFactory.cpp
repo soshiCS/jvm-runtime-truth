@@ -240,10 +240,15 @@ static bool should_dump_soroush_class(bool is_hidden, const char* class_name) {
          strstr(class_name, "ByteBuddy") != nullptr;
 }
 
+static const char* soroush_bytecode_dump_dir() {
+  const char* v = getenv("SOROUSH_BYTECODE_DUMP_DIR");
+  return (v != nullptr && v[0] != '\0') ? v : "/tmp/soroush_jvm_dump";
+}
+
 static const char* soroush_class_dump_path(const char* class_name,
                                            char* path,
                                            size_t path_len) {
-  const char* dump_dir = "/tmp/soroush_jvm_dump";
+  const char* dump_dir = soroush_bytecode_dump_dir();
   char generated_name[64];
   if (class_name == nullptr || class_name[0] == '\0') {
     int dump_id = Atomic::add(&g_dump_count, 1);
@@ -279,7 +284,7 @@ static void dump_class_bytes(const char* class_name,
                              int length) {
   if (bytes == nullptr || length <= 0) return;
 
-  const char* dump_dir = "/tmp/soroush_jvm_dump";
+  const char* dump_dir = soroush_bytecode_dump_dir();
   mkdir(dump_dir, 0755);
 
   char path[1024];
@@ -304,7 +309,8 @@ static uint32_t soroush_crc32(const u1* bytes, int length) {
 static void capture_final_class_bytes(const char* class_name,
                                       const u1* bytes,
                                       int length,
-                                      int original_length,
+                                      const u1* orig_bytes,
+                                      int orig_length,
                                       bool transformed,
                                       bool hidden,
                                       const char* load_kind) {
@@ -312,19 +318,29 @@ static void capture_final_class_bytes(const char* class_name,
     return;
   }
 
-  const char* dump_dir = "/tmp/soroush_jvm_dump";
+  const char* dump_dir = soroush_bytecode_dump_dir();
   mkdir(dump_dir, 0755);
 
+  // Always write final bytes to <name>.class.
   char path[1024];
   const char* logged_name = soroush_class_dump_path(class_name, path, sizeof(path));
   bool dumped = write_class_bytes_to_path(path, bytes, length);
-  uint32_t crc = soroush_crc32(bytes, length);
 
+  // When transformed, also write the pre-transformation bytes to <name>.original.class
+  // so that the original bytecode_artifact record gets a distinct, correct file.
+  if (transformed && orig_bytes != nullptr && orig_length > 0) {
+    char orig_path[1280];
+    snprintf(orig_path, sizeof(orig_path), "%.*s", (int)(strlen(path) - 6), path); // strip ".class"
+    strncat(orig_path, ".original.class", sizeof(orig_path) - strlen(orig_path) - 1);
+    write_class_bytes_to_path(orig_path, orig_bytes, orig_length);
+  }
+
+  uint32_t crc = soroush_crc32(bytes, length);
   fprintf(stderr, "[JVM FINAL BYTECODE] class=%s\n", logged_name);
   fprintf(stderr, "[JVM FINAL BYTECODE] transformed=%s\n", transformed ? "yes" : "no");
   fprintf(stderr, "[JVM FINAL BYTECODE] hidden=%s\n", hidden ? "yes" : "no");
   fprintf(stderr, "[JVM FINAL BYTECODE] load_kind=%s\n", load_kind);
-  fprintf(stderr, "[JVM FINAL BYTECODE] original_size=%d\n", original_length);
+  fprintf(stderr, "[JVM FINAL BYTECODE] original_size=%d\n", orig_length > 0 ? orig_length : length);
   fprintf(stderr, "[JVM FINAL BYTECODE] final_size=%d\n", length);
   fprintf(stderr, "[JVM FINAL BYTECODE] crc32=%08x\n", crc);
   fprintf(stderr, "[JVM FINAL BYTECODE] dumped=%s\n", dumped ? path : "<failed>");
@@ -521,7 +537,7 @@ static void recover_runtime_generated_class(const char* class_name,
     return;
   }
 
-  const char* dump_dir = "/tmp/soroush_jvm_dump";
+  const char* dump_dir = soroush_bytecode_dump_dir();
   mkdir(dump_dir, 0755);
 
   char path[1024];
@@ -922,7 +938,8 @@ bool transformed = old_stream != actual_stream || rewritten_bytes != nullptr;
 capture_final_class_bytes(internal_class_name,
  actual_stream->buffer(),
  actual_stream->length(),
- original_len,
+ transformed ? stream->buffer() : nullptr,
+ transformed ? stream->length() : 0,
  transformed,
  cl_info.is_hidden(),
  load_kind);

@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static const long SG_MAX_NODES = 1000000;
 static const long SG_MAX_EDGES = 2000000;
@@ -2361,6 +2363,42 @@ void soroush_graph_export_runtime_targets(const char* path) {
             orig_crc = nodes[(long)orig_id - 1].crc;
           }
 
+          // Reconstruct the expected on-disk path using the same sanitization
+          // that klassFactory.cpp's soroush_class_dump_path() applies (/ → _).
+          // SOROUSH_BYTECODE_DUMP_DIR must match what the JVM used during the run.
+          //
+          // File layout on disk:
+          //   <name>.class          → final bytes (always written by capture_final_class_bytes)
+          //   <name>.original.class → pre-transformation bytes (written only when transformed)
+          //
+          // "original" artifact records from a transformed class point to
+          // <name>.original.class; all others point to <name>.class.
+          const char* bdd = getenv("SOROUSH_BYTECODE_DUMP_DIR");
+          if (bdd == nullptr || bdd[0] == '\0') bdd = "/tmp/soroush_jvm_dump";
+          char san[1024];
+          {
+            size_t ai = 0;
+            for (const char* p = cls_name; *p && ai < sizeof(san) - 1; p++, ai++)
+              san[ai] = (*p == '/') ? '_' : *p;
+            san[ai] = '\0';
+          }
+          char artifact_path[2048];
+          bool artifact_on_disk;
+          if (!is_final) {
+            // Prefer <name>.original.class (exact bytes for this record's CRC).
+            snprintf(artifact_path, sizeof(artifact_path), "%s/%s.original.class", bdd, san);
+            if (access(artifact_path, F_OK) == 0) {
+              artifact_on_disk = true;
+            } else {
+              // Non-transformed class: <name>.class holds the original bytes.
+              snprintf(artifact_path, sizeof(artifact_path), "%s/%s.class", bdd, san);
+              artifact_on_disk = (access(artifact_path, F_OK) == 0);
+            }
+          } else {
+            snprintf(artifact_path, sizeof(artifact_path), "%s/%s.class", bdd, san);
+            artifact_on_disk = (access(artifact_path, F_OK) == 0);
+          }
+
           fprintf(f, "{\"record\":\"bytecode_artifact\",\"class\":");
           sg_json_str(f, cls_name);
           fprintf(f, ",\"loader_id\":\"0x%016llx\","
@@ -2375,6 +2413,12 @@ void soroush_graph_export_runtime_targets(const char* path) {
           fprintf(f, ",\"hidden\":%s", (n->flags & 1) ? "true" : "false");
           if (orig_crc != 0) {
             fprintf(f, ",\"rewritten_from_crc\":\"%08x\"", orig_crc);
+          }
+          if (artifact_on_disk) {
+            fprintf(f, ",\"artifact_path\":");
+            sg_json_str(f, artifact_path);
+          } else {
+            fprintf(f, ",\"artifact_bytes_dumped\":false");
           }
           fprintf(f, "}\n");
           ba_count++; continue;
