@@ -298,9 +298,12 @@ struct SgMhTargetEntry {
 // adapter_class: outermost MH class name (slash-form, may be null).
 // lf_kind: LambdaForm.Kind.name() string (ResourceMark-allocated, may be null).
 // aux_info: exception class name for GWC; null for GWT.
+// semantic_op: "guard_with_test" | "catch_exception" (graph-level semantic label).
+// staticizable: true iff all targets are exact and no unknown nodes.
+// staticization_blockers[0..n_blockers-1]: reason tokens (e.g. "inexact_target").
 // source_ / opcode / cp fields: same semantics as soroush_graph_generic_callsite.
 // targets[0..n_targets-1]: semantic targets in role order.
-// Deduplicates by (category, src_class, src_method, src_desc, src_bci).
+// Deduplicates by (src_class, src_method, src_desc, src_bci).
 // Returns true if stored; false if deduped or dropped (OOM / graph off).
 // No-op when SOROUSH_PROVENANCE_GRAPH=1 is absent.
 bool soroush_graph_target_set_callsite(
@@ -310,6 +313,9 @@ bool soroush_graph_target_set_callsite(
     const char* src_class, uint64_t src_loader_id,
     const char* src_method, const char* src_desc,
     int src_bci, int opcode_byte, int cp_index,
+    const char* semantic_op,
+    bool staticizable,
+    const char** staticization_blockers, int n_blockers,
     const SgMhTargetEntry* targets, int n_targets);
 
 // One node entry passed to soroush_graph_adapter_graph_callsite().

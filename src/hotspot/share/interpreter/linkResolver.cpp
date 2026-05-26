@@ -3054,6 +3054,74 @@ static int sg_desc_arg_count(const char* desc) {
   return count;
 }
 
+static const char* sg_desc_ret(const char* desc) {
+  if (!desc || desc[0] != '(') return nullptr;
+  const char* p = desc + 1;
+  while (*p && *p != ')') {
+    while (*p == '[') p++;
+    if (*p == 'L') { while (*p && *p != ';') p++; if (*p == ';') p++; }
+    else if (*p != ')') p++;
+  }
+  return (*p == ')') ? p + 1 : nullptr;
+}
+
+static int sg_type_token_len(const char* p) {
+  if (!p || !*p) return 0;
+  int dims = 0;
+  while (*p == '[') { dims++; p++; }
+  if (*p == 'L') {
+    const char* q = p;
+    while (*q && *q != ';') q++;
+    return dims + (int)(q - p) + (*q == ';' ? 1 : 0);
+  }
+  static const char kPrims[] = "BIJFDSCVZ";
+  for (const char* pr = kPrims; *pr; pr++) {
+    if (*p == *pr) return dims + 1;
+  }
+  return 0;
+}
+
+static bool sg_types_equal(const char* a, int alen, const char* b, int blen) {
+  return alen > 0 && alen == blen && memcmp(a, b, (size_t)alen) == 0;
+}
+
+static bool sg_desc_param_at(const char* desc, int idx,
+                              const char** out, int* out_len) {
+  if (!desc || desc[0] != '(') return false;
+  const char* p = desc + 1;
+  for (int i = 0; *p && *p != ')'; i++) {
+    int tlen = sg_type_token_len(p);
+    if (tlen <= 0) return false;
+    if (i == idx) { *out = p; *out_len = tlen; return true; }
+    p += tlen;
+  }
+  return false;
+}
+
+static bool sg_is_prim_widen(char f, char t) {
+  if (f == 'B') return t=='S'||t=='I'||t=='J'||t=='F'||t=='D';
+  if (f == 'S') return t=='I'||t=='J'||t=='F'||t=='D';
+  if (f == 'C') return t=='I'||t=='J'||t=='F'||t=='D';
+  if (f == 'I') return t=='J'||t=='F'||t=='D';
+  if (f == 'J') return t=='F'||t=='D';
+  if (f == 'F') return t=='D';
+  return false;
+}
+
+static bool sg_is_prim_narrow(char f, char t) {
+  if (f == 'J') return t=='I'||t=='S'||t=='B'||t=='C';
+  if (f == 'D') return t=='F'||t=='J'||t=='I'||t=='S'||t=='B'||t=='C';
+  if (f == 'F') return t=='J'||t=='I'||t=='S'||t=='B'||t=='C';
+  if (f == 'I') return t=='S'||t=='B'||t=='C';
+  return false;
+}
+
+static const char* sg_node_best_desc(const SgAdapterNode* node) {
+  if (node->to_desc) return node->to_desc;
+  if (node->has_target && node->target.descriptor) return node->target.descriptor;
+  return nullptr;
+}
+
 static void sg_node_infer_semantic_type_conv(SgAdapterNode* node) {
   const char* from_desc = node->from_desc;
   const char* to_desc   = node->to_desc;
@@ -3102,6 +3170,29 @@ static void sg_node_infer_semantic_type_conv(SgAdapterNode* node) {
       return;
     }
   }
+
+  {
+    int fd_len = sg_type_token_len(fd);
+    int td_len = sg_type_token_len(td);
+    if (fd_len == 1 && td_len == 1 && fd[0] != td[0]) {
+      if (sg_is_prim_widen(fd[0], td[0])) {
+        node->semantic_op = "primitive_widen";
+        node->from_type_buf[0] = fd[0]; node->from_type_buf[1] = '\0';
+        node->to_type_buf[0]   = td[0]; node->to_type_buf[1]   = '\0';
+        node->from_type = node->from_type_buf;
+        node->to_type   = node->to_type_buf;
+        return;
+      }
+      if (sg_is_prim_narrow(fd[0], td[0])) {
+        node->semantic_op = "primitive_narrow";
+        node->from_type_buf[0] = fd[0]; node->from_type_buf[1] = '\0';
+        node->to_type_buf[0]   = td[0]; node->to_type_buf[1]   = '\0';
+        node->from_type = node->from_type_buf;
+        node->to_type   = node->to_type_buf;
+        return;
+      }
+    }
+  }
   node->semantic_op = "cast";
 }
 
@@ -3120,12 +3211,80 @@ static void sg_compute_node_semantic(SgAdapterNode* node,
     else if (strcmp(role, "cleanup") == 0) node->semantic_op = "try_finally_cleanup";
     return;
   }
-  if (strcmp(lf, "COLLECTOR") == 0) {
+  if (strcmp(lf, "COLLECTOR") == 0 || strcmp(lf, "COLLECT") == 0) {
     node->semantic_op = "collect_arguments";
+    return;
+  }
+  if (strcmp(lf, "SPREAD") == 0) {
+    node->semantic_op = "spread_arguments";
     return;
   }
   if (strcmp(gk, "type_conversion") == 0) {
     sg_node_infer_semantic_type_conv(node);
+    return;
+  }
+}
+
+static void sg_classify_dual_target_semantics(SgMhWalkResult* r) {
+  if (!r || r->n_graph_nodes < 2) return;
+  const char* outer_desc = r->outer_desc;
+  if (!outer_desc) return;
+
+  SgAdapterNode* primary   = nullptr;
+  SgAdapterNode* secondary = nullptr;
+  for (int i = 0; i < r->n_graph_nodes; i++) {
+    if (r->graph_nodes[i].id == 0) primary   = &r->graph_nodes[i];
+    if (r->graph_nodes[i].id == 1) secondary = &r->graph_nodes[i];
+  }
+  if (!primary || !secondary) return;
+  if (primary->semantic_op || secondary->semantic_op) return;
+  if (secondary->node_classification &&
+      strcmp(secondary->node_classification, "bound_data") == 0) return;
+
+  const char* prim_desc = sg_node_best_desc(primary);
+  const char* sec_desc  = sg_node_best_desc(secondary);
+  if (!prim_desc || !sec_desc) return;
+
+  int outer_argc = sg_desc_arg_count(outer_desc);
+  int prim_argc  = sg_desc_arg_count(prim_desc);
+  int sec_argc   = sg_desc_arg_count(sec_desc);
+  if (outer_argc < 0 || prim_argc < 0 || sec_argc < 0) return;
+
+  const char* outer_ret = sg_desc_ret(outer_desc);
+  const char* prim_ret  = sg_desc_ret(prim_desc);
+  const char* sec_ret   = sg_desc_ret(sec_desc);
+  if (!outer_ret || !prim_ret || !sec_ret) return;
+
+  int outer_ret_len = sg_type_token_len(outer_ret);
+  int prim_ret_len  = sg_type_token_len(prim_ret);
+  int sec_ret_len   = sg_type_token_len(sec_ret);
+
+  if (!sg_types_equal(outer_ret, outer_ret_len, prim_ret, prim_ret_len)) {
+    const char* sec_p0 = nullptr; int sec_p0_len = 0;
+    if (sg_desc_param_at(sec_desc, 0, &sec_p0, &sec_p0_len) &&
+        sg_types_equal(prim_ret, prim_ret_len, sec_p0, sec_p0_len) &&
+        sg_types_equal(outer_ret, outer_ret_len, sec_ret, sec_ret_len)) {
+      secondary->semantic_op = "filter_return";
+      return;
+    }
+  }
+
+  if (prim_argc == outer_argc + 1 && sec_ret_len > 0 && sec_ret[0] != 'V') {
+    const char* prim_p0 = nullptr; int prim_p0_len = 0;
+    if (sg_desc_param_at(prim_desc, 0, &prim_p0, &prim_p0_len) &&
+        sg_types_equal(sec_ret, sec_ret_len, prim_p0, prim_p0_len)) {
+      secondary->semantic_op = "fold_combiner";
+      return;
+    }
+  }
+  if (prim_argc == outer_argc && sec_ret_len == 1 && sec_ret[0] == 'V') {
+    secondary->semantic_op = "fold_combiner";
+    return;
+  }
+
+  if (outer_argc == prim_argc - 1 + sec_argc &&
+      sg_types_equal(outer_ret, outer_ret_len, prim_ret, prim_ret_len)) {
+    secondary->semantic_op = "filter_argument";
     return;
   }
 }
@@ -3364,6 +3523,8 @@ static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
   // Determine graph_kind.
   if      (strcmp(lf, "TRY_FINALLY")  == 0) r.graph_kind = "try_finally";
   else if (strcmp(lf, "COLLECTOR")    == 0) r.graph_kind = "collector";
+  else if (strcmp(lf, "COLLECT")      == 0) r.graph_kind = "collect";
+  else if (strcmp(lf, "SPREAD")       == 0) r.graph_kind = "spread";
   else if (strcmp(lf, "LOOP")         == 0) r.graph_kind = "loop";
   else if (strcmp(lf, "TABLE_SWITCH") == 0) r.graph_kind = "table_switch";
   else if (mh_count == 0)                   r.graph_kind = "bound_data";
@@ -3373,6 +3534,12 @@ static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
 
   for (int si = 0; si < r.n_graph_nodes; si++) {
     sg_compute_node_semantic(&r.graph_nodes[si], lf, r.graph_kind);
+  }
+
+  if (strcmp(lf, "GENERIC") == 0 || lf[0] == '\0') {
+    if (strcmp(r.graph_kind, "dual_target") == 0) {
+      sg_classify_dual_target_semantics(&r);
+    }
   }
 
   r.staticizable = all_exact;
@@ -3958,8 +4125,8 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
               tgt_method = walk.targets[0].method;
               tgt_desc   = walk.targets[0].descriptor;
               tgt_ok = true;
-            } else if ((walk.shape == SgMhWalkResult::GWT ||
-                         walk.shape == SgMhWalkResult::GWC) && walk.all_exact) {
+            } else if (walk.shape == SgMhWalkResult::GWT ||
+                       walk.shape == SgMhWalkResult::GWC) {
               // Multi-target: emit callsite_target_set and skip generic path.
               SgMhTargetEntry entries[4];
               memset(entries, 0, sizeof(entries));
@@ -3971,11 +4138,18 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 entries[i].role       = walk.roles[i];
                 entries[i].valid      = walk.targets[i].valid;
               }
-              const char* shape_str = (walk.shape == SgMhWalkResult::GWT) ? "GWT" : "GWC";
+              const char* shape_str  = (walk.shape == SgMhWalkResult::GWT) ? "GWT" : "GWC";
+              const char* ts_sem_op  = (walk.shape == SgMhWalkResult::GWT)
+                                       ? "guard_with_test" : "catch_exception";
+              bool ts_static = walk.all_exact;
+              const char* ts_blk[1] = {};
+              int ts_n_blk = 0;
+              if (!walk.all_exact) ts_blk[ts_n_blk++] = "inexact_target";
               if (soroush_graph_target_set_callsite(
                   cat, shape_str, walk.adapter_class, walk.lf_kind, walk.aux_info,
                   src_class, src_loader, src_method, src_desc,
                   src_bci, src_opcode, src_cp,
+                  ts_sem_op, ts_static, ts_blk, ts_n_blk,
                   entries, walk.n_targets)) {
                 multi_target_emitted = true;
               } else {

@@ -176,6 +176,10 @@ struct SgTsCallsite {
   char*     adapter_class;
   char*     lf_kind;
   char*     aux_info;       // GWC exception class name; null for GWT
+  char*     semantic_op;    // "guard_with_test" | "catch_exception"
+  bool      staticizable;
+  int       n_staticization_blockers;
+  char      staticization_blockers[4][64];
   char*     src_class;
   uint64_t  src_loader_id;
   char*     src_method;
@@ -539,11 +543,13 @@ bool soroush_graph_target_set_callsite(
     const char* src_class, uint64_t src_loader_id,
     const char* src_method, const char* src_desc,
     int src_bci, int opcode_byte, int cp_index,
+    const char* semantic_op,
+    bool staticizable,
+    const char** staticization_blockers, int n_blockers,
     const SgMhTargetEntry* targets, int n_targets) {
   if (!soroush_graph_enabled()) return false;
   if (targets == nullptr || n_targets <= 0 || n_targets > 4) return false;
 
-  // Dedup key identical to soroush_graph_generic_callsite.
   // Dedup key: (src_class, src_method, src_desc, src_bci) — category excluded.
   uint32_t h = sg_hash_str(src_class)
              ^ sg_hash_str(src_method) ^ sg_hash_str(src_desc)
@@ -575,6 +581,18 @@ bool soroush_graph_target_set_callsite(
   n->adapter_class = sg_strdup(adapter_class);
   n->lf_kind       = sg_strdup(lf_kind);
   n->aux_info      = sg_strdup(aux_info);
+  n->semantic_op   = sg_strdup(semantic_op);
+  n->staticizable  = staticizable;
+  n->n_staticization_blockers = 0;
+  if (staticization_blockers != nullptr) {
+    for (int bi = 0; bi < n_blockers && bi < 4; bi++) {
+      if (staticization_blockers[bi]) {
+        snprintf(n->staticization_blockers[n->n_staticization_blockers++],
+                 sizeof(n->staticization_blockers[0]),
+                 "%s", staticization_blockers[bi]);
+      }
+    }
+  }
   n->src_class     = sg_strdup(src_class);
   n->src_loader_id = src_loader_id;
   n->src_method    = sg_strdup(src_method);
@@ -1939,6 +1957,19 @@ void soroush_graph_export_runtime_targets(const char* path) {
           if (c->aux_info) {
             fprintf(f, ",\"exception_class\":");
             sg_json_str(f, c->aux_info);
+          }
+          if (c->semantic_op) {
+            fprintf(f, ",\"semantic_op\":");
+            sg_json_str(f, c->semantic_op);
+          }
+          fprintf(f, ",\"staticizable\":%s", c->staticizable ? "true" : "false");
+          if (c->n_staticization_blockers > 0) {
+            fprintf(f, ",\"staticization_blockers\":[");
+            for (int bi = 0; bi < c->n_staticization_blockers; bi++) {
+              if (bi > 0) fprintf(f, ",");
+              sg_json_str(f, c->staticization_blockers[bi]);
+            }
+            fprintf(f, "]");
           }
           fprintf(f, ",\"evidence\":\"OBSERVED_ONLY\",\"source_class\":");
           sg_json_str(f, c->src_class);
