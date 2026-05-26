@@ -197,8 +197,9 @@ static uint32_t             g_ts_count  = 0;
 // Each entry is a GENERIC or named-kind BMH callsite whose bound MH components
 // were extracted (asType, filterArguments, foldArguments, tryFinally, etc.).
 
-#define SG_AG_BUCKETS  256u
-#define SG_AG_MAX_NODES  8
+#define SG_AG_BUCKETS    256u
+#define SG_AG_MAX_NODES   16
+#define SG_AG_MAX_EDGES   16
 
 struct SgAgNode {
   int      id;
@@ -209,7 +210,16 @@ struct SgAgNode {
   uint64_t loader_id;
   char*    method;
   char*    descriptor;
+  char*    node_adapter_class;
+  char*    node_classification;
+  char*    exact_false_reason;
   bool     exact;
+};
+
+struct SgAgEdge {
+  int   from_id;
+  int   to_id;
+  char  kind[32];
 };
 
 struct SgAgCallsite {
@@ -227,6 +237,8 @@ struct SgAgCallsite {
   int      cp_index;
   int      n_nodes;
   SgAgNode nodes[SG_AG_MAX_NODES];
+  int      n_edges;
+  SgAgEdge edges[SG_AG_MAX_EDGES];
   bool     all_exact;
   uint32_t hash;
   struct SgAgCallsite* next;
@@ -416,7 +428,9 @@ bool soroush_graph_generic_callsite(
   if (!soroush_graph_enabled()) return false;
 
   // Dedup key: category + src_class + src_method + src_desc + src_bci.
-  uint32_t h = sg_hash_str(category) ^ sg_hash_str(src_class)
+  // Dedup key: (src_class, src_method, src_desc, src_bci) — category excluded
+  // so that invokeExact and invoke firings for the same BCI collapse to first-in.
+  uint32_t h = sg_hash_str(src_class)
              ^ sg_hash_str(src_method) ^ sg_hash_str(src_desc)
              ^ (uint32_t)(unsigned)src_bci;
   uint32_t bucket = h & (SG_GEN_BUCKETS - 1u);
@@ -426,19 +440,32 @@ bool soroush_graph_generic_callsite(
   pthread_mutex_lock(&g_gen_lock);
 
   // Dedup check: walk the chain.
+  // Prefer-exact rule: if the existing entry is a diagnostic (!exact) and the
+  // incoming entry is exact, upgrade the existing entry in place so that the
+  // diagnostic does not suppress a later-arriving target.
   for (SgGenCallsite* c = g_gen_buckets[bucket]; c != nullptr; c = c->next) {
     if (c->hash == h
         && src_bci == c->src_bci
-        && (category == c->category ||
-            (category && c->category && strcmp(category, c->category) == 0))
         && (src_class == c->src_class ||
             (src_class && c->src_class && strcmp(src_class, c->src_class) == 0))
         && (src_method == c->src_method ||
             (src_method && c->src_method && strcmp(src_method, c->src_method) == 0))
         && (src_desc == c->src_desc ||
             (src_desc && c->src_desc && strcmp(src_desc, c->src_desc) == 0))) {
+      if (exact && !c->exact) {
+        // Upgrade diagnostic → exact in place.
+        if (c->diag_reason) { free(c->diag_reason); c->diag_reason = nullptr; }
+        if (c->target_class)  { free(c->target_class);  }
+        if (c->target_method) { free(c->target_method); }
+        if (c->target_desc)   { free(c->target_desc);   }
+        c->target_class      = sg_strdup(target_class);
+        c->target_loader_id  = target_loader_id;
+        c->target_method     = sg_strdup(target_method);
+        c->target_desc       = sg_strdup(target_desc);
+        c->exact = true;
+      }
       pthread_mutex_unlock(&g_gen_lock);
-      return c->exact; // first-in-wins: already recorded
+      return c->exact; // first-in-wins or upgraded-to-exact
     }
   }
 
@@ -509,7 +536,8 @@ bool soroush_graph_target_set_callsite(
   if (targets == nullptr || n_targets <= 0 || n_targets > 4) return false;
 
   // Dedup key identical to soroush_graph_generic_callsite.
-  uint32_t h = sg_hash_str(category) ^ sg_hash_str(src_class)
+  // Dedup key: (src_class, src_method, src_desc, src_bci) — category excluded.
+  uint32_t h = sg_hash_str(src_class)
              ^ sg_hash_str(src_method) ^ sg_hash_str(src_desc)
              ^ (uint32_t)(unsigned)src_bci;
   uint32_t bucket = h & (SG_TS_BUCKETS - 1u);
@@ -519,8 +547,6 @@ bool soroush_graph_target_set_callsite(
   for (SgTsCallsite* c = g_ts_buckets[bucket]; c != nullptr; c = c->next) {
     if (c->hash == h
         && src_bci == c->src_bci
-        && (category == c->category ||
-            (category && c->category && strcmp(category, c->category) == 0))
         && (src_class == c->src_class ||
             (src_class && c->src_class && strcmp(src_class, c->src_class) == 0))
         && (src_method == c->src_method ||
@@ -528,7 +554,7 @@ bool soroush_graph_target_set_callsite(
         && (src_desc == c->src_desc ||
             (src_desc && c->src_desc && strcmp(src_desc, c->src_desc) == 0))) {
       pthread_mutex_unlock(&g_ts_lock);
-      return true; // first-in-wins
+      return true; // first-in-wins (category-agnostic)
     }
   }
 
@@ -585,11 +611,16 @@ bool soroush_graph_adapter_graph_callsite(
     const char* src_method, const char* src_desc,
     int src_bci, int opcode_byte, int cp_index,
     const SgAdapterNodeEntry* nodes, int n_nodes,
+    const SgAdapterEdgeEntry* edges, int n_edges,
     bool all_exact) {
   if (!soroush_graph_enabled()) return false;
   if (nodes == nullptr || n_nodes <= 0 || n_nodes > SG_AG_MAX_NODES) return false;
 
-  uint32_t h = sg_hash_str(category) ^ sg_hash_str(src_class)
+  // Dedup key: (src_class, src_method, src_desc, src_bci) — deliberately excluding
+  // category so that a direct invokeExact record and a Case-A2 re-attributed
+  // invoke record for the same callsite BCI are treated as duplicates and only
+  // the first-in record is kept.
+  uint32_t h = sg_hash_str(src_class)
              ^ sg_hash_str(src_method) ^ sg_hash_str(src_desc)
              ^ (uint32_t)(unsigned)src_bci;
   uint32_t bucket = h & (SG_AG_BUCKETS - 1u);
@@ -599,8 +630,6 @@ bool soroush_graph_adapter_graph_callsite(
   for (SgAgCallsite* c = g_ag_buckets[bucket]; c != nullptr; c = c->next) {
     if (c->hash == h
         && src_bci == c->src_bci
-        && (category == c->category ||
-            (category && c->category && strcmp(category, c->category) == 0))
         && (src_class == c->src_class ||
             (src_class && c->src_class && strcmp(src_class, c->src_class) == 0))
         && (src_method == c->src_method ||
@@ -608,7 +637,7 @@ bool soroush_graph_adapter_graph_callsite(
         && (src_desc == c->src_desc ||
             (src_desc && c->src_desc && strcmp(src_desc, c->src_desc) == 0))) {
       pthread_mutex_unlock(&g_ag_lock);
-      return true; // first-in-wins
+      return true; // first-in-wins (category-agnostic)
     }
   }
 
@@ -632,15 +661,30 @@ bool soroush_graph_adapter_graph_callsite(
   n->n_nodes       = (n_nodes <= SG_AG_MAX_NODES) ? n_nodes : SG_AG_MAX_NODES;
 
   for (int i = 0; i < n->n_nodes; i++) {
-    n->nodes[i].id         = nodes[i].id;
-    n->nodes[i].role       = sg_strdup(nodes[i].role);
-    n->nodes[i].from_desc  = sg_strdup(nodes[i].from_desc);
-    n->nodes[i].to_desc    = sg_strdup(nodes[i].to_desc);
-    n->nodes[i].klass      = sg_strdup(nodes[i].klass);
-    n->nodes[i].loader_id  = nodes[i].loader_id;
-    n->nodes[i].method     = sg_strdup(nodes[i].method);
-    n->nodes[i].descriptor = sg_strdup(nodes[i].descriptor);
-    n->nodes[i].exact      = nodes[i].exact;
+    n->nodes[i].id                 = nodes[i].id;
+    n->nodes[i].role               = sg_strdup(nodes[i].role);
+    n->nodes[i].from_desc          = sg_strdup(nodes[i].from_desc);
+    n->nodes[i].to_desc            = sg_strdup(nodes[i].to_desc);
+    n->nodes[i].klass              = sg_strdup(nodes[i].klass);
+    n->nodes[i].loader_id          = nodes[i].loader_id;
+    n->nodes[i].method             = sg_strdup(nodes[i].method);
+    n->nodes[i].descriptor         = sg_strdup(nodes[i].descriptor);
+    n->nodes[i].node_adapter_class = sg_strdup(nodes[i].node_adapter_class);
+    n->nodes[i].node_classification= sg_strdup(nodes[i].node_classification);
+    n->nodes[i].exact_false_reason = sg_strdup(nodes[i].exact_false_reason);
+    n->nodes[i].exact              = nodes[i].exact;
+  }
+
+  n->n_edges = 0;
+  if (edges != nullptr && n_edges > 0) {
+    int ne = (n_edges <= SG_AG_MAX_EDGES) ? n_edges : SG_AG_MAX_EDGES;
+    n->n_edges = ne;
+    for (int i = 0; i < ne; i++) {
+      n->edges[i].from_id = edges[i].from_id;
+      n->edges[i].to_id   = edges[i].to_id;
+      snprintf(n->edges[i].kind, sizeof(n->edges[i].kind), "%s",
+               edges[i].kind ? edges[i].kind : "contains");
+    }
   }
 
   n->hash = h;
@@ -1648,8 +1692,66 @@ void soroush_graph_export_runtime_targets(const char* path) {
   //
   // exact=true  → callsite_target record (source + target both exact).
   // exact=false → diagnostic record (explains what was not captured).
+  //
+  // Part C dedup: diagnostic records are suppressed when an exact record
+  // (callsite_target, callsite_target_set, callsite_adapter_graph) already
+  // exists for the same (src_class, src_method, src_bci).  This ensures that
+  // sibling-BCI diagnostics emitted at CP-resolution time are superseded by
+  // the exact records produced later via LF-frame attribution (Part A).
   // -------------------------------------------------------------------------
   {
+    // ---- Build exact-callsite dedup set ----
+    // FNV-1a hash of (src_class || "|" || src_method || "|" || bci).
+    // Covers g_gen_buckets (exact=true), g_ag_buckets, and g_ts_buckets.
+    // Uses a flat open-chaining table; entries are malloc'd (export-time only).
+    struct SgDedupEntry { uint32_t h; const char* cls; const char* meth; int bci;
+                          struct SgDedupEntry* nxt; };
+#define SG_DEDUP_BKTS 512u
+    SgDedupEntry* sg_ded[SG_DEDUP_BKTS];
+    memset(sg_ded, 0, sizeof(sg_ded));
+
+    auto sg_ded_hash = [](const char* cls, const char* meth, int bci) -> uint32_t {
+      uint32_t h = 2166136261u;
+      for (const char* p = cls;  p && *p; ++p) h = (h ^ (uint8_t)*p) * 16777619u;
+      h = (h ^ '|') * 16777619u;
+      for (const char* p = meth; p && *p; ++p) h = (h ^ (uint8_t)*p) * 16777619u;
+      h = (h ^ (uint32_t)(unsigned)bci) * 16777619u;
+      return h;
+    };
+    auto sg_ded_add = [&](const char* cls, const char* meth, int bci) {
+      if (!cls || !meth || bci < 0) return;
+      uint32_t h = sg_ded_hash(cls, meth, bci);
+      uint32_t s = h % SG_DEDUP_BKTS;
+      for (SgDedupEntry* e = sg_ded[s]; e; e = e->nxt)
+        if (e->h == h && e->bci == bci &&
+            strcmp(e->cls, cls) == 0 && strcmp(e->meth, meth) == 0) return;
+      SgDedupEntry* ne = (SgDedupEntry*)malloc(sizeof(SgDedupEntry));
+      if (!ne) return;
+      ne->h = h; ne->cls = cls; ne->meth = meth; ne->bci = bci;
+      ne->nxt = sg_ded[s]; sg_ded[s] = ne;
+    };
+    auto sg_ded_has = [&](const char* cls, const char* meth, int bci) -> bool {
+      if (!cls || !meth || bci < 0) return false;
+      uint32_t h = sg_ded_hash(cls, meth, bci);
+      uint32_t s = h % SG_DEDUP_BKTS;
+      for (SgDedupEntry* e = sg_ded[s]; e; e = e->nxt)
+        if (e->h == h && e->bci == bci &&
+            strcmp(e->cls, cls) == 0 && strcmp(e->meth, meth) == 0) return true;
+      return false;
+    };
+    // Populate from exact callsite_target records in g_gen_buckets
+    for (uint32_t b = 0; b < SG_GEN_BUCKETS; b++)
+      for (SgGenCallsite* c = g_gen_buckets[b]; c; c = c->next)
+        if (c->exact) sg_ded_add(c->src_class, c->src_method, c->src_bci);
+    // Populate from callsite_adapter_graph records (g_ag_buckets)
+    for (uint32_t b = 0; b < SG_AG_BUCKETS; b++)
+      for (SgAgCallsite* c = g_ag_buckets[b]; c; c = c->next)
+        sg_ded_add(c->src_class, c->src_method, c->src_bci);
+    // Populate from callsite_target_set records (g_ts_buckets)
+    for (uint32_t b = 0; b < SG_TS_BUCKETS; b++)
+      for (SgTsCallsite* c = g_ts_buckets[b]; c; c = c->next)
+        sg_ded_add(c->src_class, c->src_method, c->src_bci);
+
     // Snapshot count under lock; walk buckets lock-free at shutdown.
     pthread_mutex_lock(&g_gen_lock);
     uint32_t gen_snap = g_gen_count;
@@ -1696,6 +1798,12 @@ void soroush_graph_export_runtime_targets(const char* path) {
             fprintf(f, "}\n");
             ct_count++;
           } else {
+            // Part C dedup: suppress diagnostic if an exact record exists for
+            // the same (src_class, src_method, src_bci).  Exact records produced
+            // via LF-frame attribution (Part A) supersede sibling-BCI diagnostics.
+            if (sg_ded_has(c->src_class, c->src_method, c->src_bci)) {
+              continue;
+            }
             // Emit diagnostic with all source fields that ARE known.
             // The opcode name lookup (same table as exact records above).
             const char* d_op_name = nullptr;
@@ -1754,6 +1862,16 @@ void soroush_graph_export_runtime_targets(const char* path) {
         }
       }
     }
+
+    // Free the dedup table entries
+    for (uint32_t b = 0; b < SG_DEDUP_BKTS; b++) {
+      for (SgDedupEntry* e = sg_ded[b]; e; ) {
+        SgDedupEntry* nx = e->nxt;
+        free(e);
+        e = nx;
+      }
+    }
+#undef SG_DEDUP_BKTS
   }
 
   // -------------------------------------------------------------------------
@@ -1904,6 +2022,18 @@ void soroush_graph_export_runtime_targets(const char* path) {
               sg_json_str(f, n->to_desc);
             }
             fprintf(f, ",\"exact\":%s", n->exact ? "true" : "false");
+            if (n->node_classification) {
+              fprintf(f, ",\"classification\":");
+              sg_json_str(f, n->node_classification);
+            }
+            if (n->node_adapter_class) {
+              fprintf(f, ",\"adapter_class\":");
+              sg_json_str(f, n->node_adapter_class);
+            }
+            if (!n->exact && n->exact_false_reason) {
+              fprintf(f, ",\"exact_false_reason\":");
+              sg_json_str(f, n->exact_false_reason);
+            }
             if (n->exact && n->klass) {
               fprintf(f, ",\"class\":");
               sg_json_str(f, n->klass);
@@ -1920,7 +2050,19 @@ void soroush_graph_export_runtime_targets(const char* path) {
             }
             fprintf(f, "}");
           }
-          fprintf(f, "]}\n");
+          fprintf(f, "]");
+          if (c->n_edges > 0) {
+            fprintf(f, ",\"edges\":[");
+            for (int i = 0; i < c->n_edges; i++) {
+              if (i > 0) fprintf(f, ",");
+              fprintf(f, "{\"from\":%d,\"to\":%d,\"kind\":",
+                      c->edges[i].from_id, c->edges[i].to_id);
+              sg_json_str(f, c->edges[i].kind);
+              fprintf(f, "}");
+            }
+            fprintf(f, "]");
+          }
+          fprintf(f, "}\n");
           ct_count++;
         }
       }

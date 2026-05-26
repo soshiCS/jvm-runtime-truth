@@ -603,6 +603,199 @@ soroush_graph_dump_summary();   // existing graph summary
 
 ---
 
+## 4E. MH callsite attribution export — new record types
+
+Three record types added by the MethodHandle callsite attribution system
+(`soroush_graph_generic_callsite`, `soroush_graph_target_set_callsite`,
+`soroush_graph_adapter_graph_callsite` in `soroushProvenanceGraph.cpp`; populated
+from `resolve_handle_call` in `classfile/linkResolver.cpp`). All require
+`SOROUSH_PROVENANCE_GRAPH=1`. Gated by the same fail-safe / fail-closed rules as
+§4D: emit an explicit `diagnostic` rather than guess, never fabricate a target.
+
+**Hard reliability rules (enforced in the exporter):**
+- No fallback, no best-effort, no fake target, no fake callsite, no guessed BCI
+- No guessed adapter semantics, no silent omission, no `?` descriptors, no `loader_id=0`
+- If a site cannot be represented exactly → emit explicit `diagnostic`
+- Export fails closed (diagnostic record + continues, never aborts)
+
+### `callsite_target`
+
+A MH callsite resolved to a single exact target at runtime. Emitted when the
+receiver at `resolve_handle_call` time is a `DirectMethodHandle` (DMH) whose
+`MemberName` resolves to a concrete Java method.
+
+Fields:
+- `category` — `"methodhandle_invokeExact"` or `"methodhandle_invoke"` or
+  `"methodhandle_invokeBasic"` etc.
+- `evidence` — always `"OBSERVED_ONLY"` (fired at first resolution, not linkage-time)
+- `source_class`, `source_loader_id`, `source_method`, `source_descriptor` — the
+  user callsite (user frame recovered via vframeStream walk past all
+  `java/lang/invoke/` frames — see Case A2 below)
+- `source_bci` — exact BCI of the invoke instruction in the user frame
+- `source_opcode` — e.g. `"invokevirtual"` (the bytecode at `source_bci`)
+- `source_capture` — `"exact"` (attribution is precise; never emitted if attribution failed)
+- `target_class`, `target_loader_id`, `target_method`, `target_descriptor` — the
+  exact resolved method (from the DMH MemberName)
+
+**Dedup:** category-agnostic; one record per `(source_class, source_method,
+source_descriptor, source_bci)` tuple regardless of whether invoked via
+`invokeExact` or `invoke`. Prefer-exact upgrade: if a diagnostic arrived first for
+the same BCI and a later exact record arrives, the entry is upgraded in place.
+
+### `callsite_target_set`
+
+A MH callsite resolved to a structured set of targets (guardWithTest, catchException).
+Emitted when the BMH at resolution time has `lf_kind == GUARD` or
+`lf_kind == GUARD_WITH_CATCH`.
+
+Fields (in addition to source fields above):
+- `adapter_shape` — `"GWT"` (guardWithTest) or `"GWC"` (catchException/guardWithCatch)
+- `adapter_class` — internal name of the BMH species class
+- `lf_kind` — `"GUARD"` or `"GUARD_WITH_CATCH"`
+- `exception_class` — (GWC only) internal name of the caught exception type
+- `targets` — array of target records, each with:
+  - `role` — `"test"` / `"true_target"` / `"false_target"` (GWT) or
+    `"try_target"` / `"handler"` (GWC)
+  - `valid` — boolean; false if the slot was not extractable
+  - `class`, `loader_id`, `method`, `descriptor` — present when `valid=true`
+
+### `callsite_adapter_graph`
+
+A MH callsite whose receiver is an adapter BMH (not a DMH). The structure of the
+adapter chain is extracted read-only from the BMH species fields at resolution time.
+Emitted for all non-GWT/GWC adapter forms.
+
+Fields (in addition to source fields above):
+- `adapter_class` — BMH species class name (e.g. `BoundMethodHandle$Species_LL`)
+- `adapter_kind` — structural classification of the adapter:
+  - `"dual_target"` — BMH with two MH slots (e.g. filterReturnValue, foldArguments,
+    asType with two-component chain, asCollector)
+  - `"multi_target"` — BMH with three or more MH slots (e.g. filterArguments with
+    two filters)
+  - `"try_finally"` — `TRY_FINALLY` lf_kind; target + cleanup(s)
+  - `"type_conversion"` — single adapted target with type descriptor info
+    (e.g. insertArguments-produced single-slot BMH)
+- `lf_kind` — LambdaForm kind string from the BMH (`"GENERIC"`, `"TRY_FINALLY"`,
+  `"COLLECT"`, etc.)
+- `outer_descriptor` — (when present) the erased type descriptor at the outer call boundary
+- `evidence` — `"OBSERVED_ONLY"`
+- `all_exact` — boolean; true iff every node in `nodes` has `exact=true`
+- `nodes` — array of adapter-graph node records, each with:
+  - `id` — integer index
+  - `role` — `"primary_target"`, `"secondary_component"`, `"component_N"`,
+    `"adapted_target"`, `"target"`, `"cleanup"`
+  - `exact` — boolean; false if the slot was itself a BMH/adapter (not a DMH)
+  - `class`, `loader_id`, `method`, `descriptor` — present when `exact=true`
+  - `from_descriptor`, `to_descriptor` — type conversion descriptors when present
+
+**LF-frame attribution (Case A2).** `resolve_handle_call` fires from inside
+`java/lang/invoke/` when an LF adapter chain is dispatching (e.g. tryFinally's
+LambdaForm invoking a component MH). The top frame is then an LF frame, not the
+user callsite. Case A2 in `resolve_handle_call` walks the `vframeStream` past ALL
+`java/lang/invoke/` frames (including compiled/deopt/stub frames which raw frame
+walking cannot skip) to recover the original user frame and its exact BCI. Without
+this walk, tryFinally (Site E) and foldArguments (Site D) would be attributed to
+LF internal frames instead of the user callsite.
+
+**Sibling BCI scan (`sg_emit_sibling_bcis`).** After emitting the primary record
+for a BCI, the system scans all other BCIs in the same method for `invoke*`
+bytecodes that share the same CP cache entry (and thus always hit the dedup and
+never fire `resolve_handle_call` independently). For each such sibling BCI, a
+`diagnostic` record is emitted explaining that the site was covered by the primary
+record at the dedup BCI. Reason code: `recv_analyzer_recv_slot_oob` when the MH
+receiver slot cannot be analyzed at that BCI (the stack state is different from the
+primary site).
+
+---
+
+## 4F. Adapter callsite coverage matrix
+
+Validated adapter coverage across four demo programs under
+`-Xverify:all -Xint -cp <demos>` with
+`SOROUSH_PROVENANCE_GRAPH=1 SOROUSH_EXPORT_RUNTIME_TARGETS=<path>`.
+All sites are attributed to the user callsite (not an LF-internal frame).
+No site is silently omitted — every site produces exactly one of: `callsite_target`,
+`callsite_target_set`, `callsite_adapter_graph`, or explicit `diagnostic`.
+
+### MHGenericAdapterDemo — GENERIC-kind BMH adapter forms
+
+| Site | Adapter form | BCI | Record type | adapter_kind | lf_kind | all_exact | nodes | Notes |
+|------|-------------|-----|-------------|--------------|---------|-----------|-------|-------|
+| A | asType | 69 | `callsite_adapter_graph` | `dual_target` | GENERIC | false | 2 | primary=intToStr (exact); secondary=unboxing component (not exact: BMH slot not a DMH) |
+| B | filterArguments | 153 | `callsite_adapter_graph` | `multi_target` | GENERIC | **true** | 3 | primary=add, secondary=square, component_2=negate — all exact |
+| C | filterReturnValue | 184 | `callsite_adapter_graph` | `dual_target` | GENERIC | **true** | 2 | primary=add, secondary=intToStr — both exact |
+| D | foldArguments | 249 | `callsite_adapter_graph` | `dual_target` | GENERIC | **true** | 2 | primary=describe, secondary=add — both exact; attributed via Case A2 vframeStream walk |
+| E | tryFinally | 310 | `callsite_adapter_graph` | `try_finally` | TRY_FINALLY | false | 4 | target + 3 cleanup slots all not-exact (each slot is itself a BMH); attributed via Case A2 |
+| F | asCollector | 360 | `callsite_adapter_graph` | `dual_target` | GENERIC | false | 2 | primary=combineInts (exact); secondary=array-collector BMH (not exact) |
+| G | insertArguments | 400 | `callsite_adapter_graph` | `type_conversion` | GENERIC | **true** | 1 | adapted_target=add with bound-value (I)I→(II)I — exact |
+
+**Attribution:** all 7 sites attributed to `MHGenericAdapterDemo.main`.
+**Silent omissions:** 0.
+**why Sites A / E / F have `all_exact=false`:** the secondary / cleanup node slots
+hold a BMH (adapter), not a DMH. Only DMH slots are extractable via the read-only
+C++ structure walk. This is expected and documented by the `exact=false` node, not
+silently omitted.
+
+### MHAdapterDemo — direct DMH callsites and asType adapter
+
+| Site | Form | BCI | Record type | target / shape | Notes |
+|------|------|-----|-------------|----------------|-------|
+| H | invokeExact on static DMH | 37 | `callsite_target` | `MHAdapterDemo::add (II)I` | direct DMH, cat=invokeExact |
+| I | invoke on same static DMH | 58 | `callsite_target` | `MHAdapterDemo::add (II)I` | same target; different CP entry from H |
+| J | invoke on asType BMH | 109 | `callsite_adapter_graph` | multi_target, lf=GENERIC, all_exact=false, nodes=3 | primary=add (exact); secondary=unboxing BMH (not exact); component_2=ValueConversions::boxInteger (exact) |
+| K | invokeExact on virtual DMH | 162 | `callsite_target` | `MHAdapterDemo::greet` | instance method DMH |
+
+**Silent omissions:** 0. Diagnostics: bci=45 and bci=122 in `main` are sibling BCIs
+(recv_analyzer_recv_slot_oob — different stack depth from the primary invoke site).
+
+### MHCombinatorDemo — guardWithTest, catchException, asType, plain DMH
+
+| Site | Form | BCI | Record type | shape / targets | Notes |
+|------|------|-----|-------------|-----------------|-------|
+| P | guardWithTest | 69 | `callsite_target_set` | GWT lf=GUARD, 3 targets | test=isEven, true=onEven, false=onOdd — all exact |
+| Q | catchException | 159 | `callsite_target_set` | GWC lf=GUARD_WITH_CATCH, 2 targets | try=mayThrow, handler=handleEx — both exact; exception_class=java/lang/Exception |
+| R | asType adapter | 209 | `callsite_adapter_graph` | dual_target lf=GENERIC all_exact=false nodes=2 | primary=onEven (exact); secondary=unboxing BMH (not exact) |
+| S | plain DMH (float→String) | 252 | `callsite_target` | `MHCombinatorDemo::floatToStr` | direct DMH, distinct (F)String signature |
+
+**Silent omissions:** 0. Diagnostics: bci=90 (main), bci=17 (mayThrow), bci=4
+(handleEx), bci=169 (main), bci=1 (onEven), bci=1 (floatToStr) — all sibling BCIs
+from the sibling scan (recv_analyzer_recv_slot_oob). Also, bci=61 (main) emits a
+`callsite_target` for onEven; bci=149 (main) for mayThrow — these fire when the GWT/GWC
+component handles are themselves resolved as DMH callsites internally.
+
+### MHCallsiteDemo — invokeExact and invoke on static and virtual DMH
+
+| Site | Form | BCI | Record type | target | Notes |
+|------|------|-----|-------------|--------|-------|
+| (E in file) | invokeExact on static DMH | 35 | `callsite_target` | `MHCallsiteDemo::staticAdd (II)I` | |
+| (F in file) | invoke on same static DMH | 55 | `callsite_target` | `MHCallsiteDemo::staticAdd (II)I` | |
+| (G in file) | invokeExact on virtual DMH | 105 | `callsite_target` | `MHCallsiteDemo::instanceGreet` | |
+
+**Silent omissions:** 0. Diagnostics: bci=43 (main) and bci=1 (instanceGreet) —
+sibling BCIs (recv_analyzer_recv_slot_oob).
+
+### Summary across all 4 demos
+
+| Record type | Count | What it covers |
+|-------------|-------|----------------|
+| `callsite_target` | 9 | Direct DMH invocations — single exact target |
+| `callsite_target_set` | 2 | Multi-target conditional adapters (GWT, GWC) |
+| `callsite_adapter_graph` | 8 | Structural adapter BMH chains |
+| `diagnostic` (sibling scan) | 15+ | Sibling BCIs sharing CP entry with a covered site |
+| Silent omissions | **0** | |
+
+**Known not-exact nodes and why:**
+
+| Adapter form | Not-exact slot | Why |
+|--------------|---------------|-----|
+| asType (Sites A, J, R) | secondary_component | The type-erased unboxing BMH is itself a `BoundMethodHandle`; C++ read-only walk cannot extract its inner target without unsafe accessor |
+| tryFinally (Site E) | all 4 nodes (target + cleanups) | Each slot is a BMH wrapping another adapter; the inner chain is not extractable in a single pass at resolve time |
+| asCollector (Site F) | secondary_component | The array-collector trampoline is an internal BMH with no direct Java-method slot |
+
+These are all emitted as `exact=false` nodes in the graph — never silently omitted.
+
+---
+
 ## 5. Memory files — read map
 
 The cross-session memory lives in
@@ -773,6 +966,37 @@ instrumentation, and rare/custom Code-attribute hardening — all verified under
     LoaderIdentityDemo, MHExecDemo, AsyncDemo, and Spring Boot 4 (31 method
     identities, 4037 runtime targets, 8998 bytecode artifacts).
 
+13. **MH callsite attribution — three new JSONL record types + full adapter coverage
+    (§4E/§4F):** closes the gap between MH execution tracing (§4C) and a semantic,
+    fail-closed description of *what* each MH callsite calls at the adapter level.
+    Three new record types: `callsite_target` (single exact DMH target),
+    `callsite_target_set` (GWT/GWC multi-target), `callsite_adapter_graph`
+    (structural BMH chain). All emitted from `resolve_handle_call` in
+    `classfile/linkResolver.cpp` via three new side-table functions in
+    `soroushProvenanceGraph.{cpp,hpp}`. Key engineering:
+    - **Case A2 (LF-frame attribution):** when `resolve_handle_call` fires from
+      inside `java/lang/invoke/` (e.g. tryFinally's cleanup LF invoking a component),
+      a `vframeStream` walk skips all `java/lang/invoke/` frames to recover the
+      original user callsite BCI and frame — fixing attribution for foldArguments
+      (Site D, bci=249) and tryFinally (Site E, bci=310) in MHGenericAdapterDemo.
+    - **Category-agnostic dedup:** all three side tables (g_gen_buckets,
+      g_ag_buckets, g_ts_buckets) dedup by (class, method, descriptor, bci) without
+      including `category`, so invokeExact and invoke firings for the same BCI are
+      treated as duplicates (first-in-wins / prefer-exact upgrade).
+    - **Prefer-exact upgrade:** when a diagnostic arrives first for a BCI in
+      g_gen_buckets, a later exact `callsite_target` upgrades the entry in place
+      so the diagnostic never suppresses the exact record.
+    - **Sibling BCI scan (`sg_emit_sibling_bcis`):** after emitting the primary
+      record, scans the user method for other `invoke*` BCIs sharing the same CP
+      cache entry; emits explicit `diagnostic` records for each — no silent omission.
+    - **Hard reliability rules enforced:** no fake target, no fake callsite, no
+      guessed BCI, no `?` descriptor, no `loader_id=0`; if attribution fails →
+      explicit diagnostic; export fails closed.
+    Verified: 4 demos (`MHGenericAdapterDemo`, `MHAdapterDemo`, `MHCombinatorDemo`,
+    `MHCallsiteDemo`) under `-Xverify:all -Xint`; 19 MH callsites covered; 0 silent
+    omissions; all 7 GENERIC adapter sites in MHGenericAdapterDemo correctly
+    attributed to `MHGenericAdapterDemo.main`; full coverage matrix in §4F.
+
 ### Files changed (working tree vs last commit `9ca2ecfe356`)
 - `src/hotspot/share/classfile/soroushClassfileRewriter.cpp` — the bulk: convergence, widening emit, StackMapTable synthesis, exception-EXIT guard, constructor support, cp-index parsing, unknown-Code-attribute guard. **Exact method-token trace ABI:** per-method `CONSTANT_Integer` token + `soroushTraceEnter/Exit(I)V` methodrefs (replacing per-method ENTER/EXIT Strings + single `soroushTrace(String)`); captures the descriptor and registers each method via `soroush_method_token_register`.
 - `src/hotspot/share/classfile/soroushClassfileRewriter.hpp` — `TransformResult` census fields; `insert_entry_trace`/`insert_entry_exit_trace` now take `loader_id`/`hidden`/`artifact_crc`.
@@ -783,6 +1007,7 @@ instrumentation, and rare/custom Code-attribute hardening — all verified under
 - Native plumbing: `prims/jvm.h` (`JVM_SoroushTraceEnter`/`Exit` + 2 async prototypes; `JVM_SoroushTrace` removed), `java.base/.../System.java` (`soroushTraceEnter`/`soroushTraceExit` + 2 async native decls; `soroushTrace(String)` removed), `java.base/.../native/libjava/System.c` (registration; `soroushTrace` removed), `make/data/hotspot-symbols/symbols-unix` (exports for `JVM_SoroushTraceEnter`/`Exit` + 2 async; `JVM_SoroushTrace` removed).
 - Async JDK integration (gated `if (SOROUSH_ASYNC)` + `static final` gate field): `java.base/.../util/concurrent/{ThreadPoolExecutor,ForkJoinPool,ForkJoinTask}.java`.
 - MH/LambdaForm execution tracing (§4C): `interpreter/linkResolver.cpp` (read-only MH-structure walk + `[JVM MH EXEC]` diagnostics at `resolve_handle_call`); `prims/jvm.cpp` (LambdaFormExecution overlay in `JVM_SoroushTrace` + `soroush_runtime_current_exec_id`); `classfile/klassFactory.cpp` (additive `SOROUSH_TRACE_MH_EXEC` + hidden `SOROUSH_TRACE_MH_EXEC_HIDDEN` rewriter toggles for MH-internal classes).
+- **MH callsite attribution (§4E/§4F):** `classfile/linkResolver.cpp` — Case A2 vframeStream walk, sibling BCI scan call, primary record emission; `classfile/soroushProvenanceGraph.{cpp,hpp}` — three new side tables (`g_gen_buckets`, `g_ag_buckets`, `g_ts_buckets`) + functions `soroush_graph_generic_callsite`, `soroush_graph_adapter_graph_callsite`, `soroush_graph_target_set_callsite` + Phase 3.6 export loop for adapter graph records + category-agnostic dedup + prefer-exact upgrade in g_gen_buckets. **IMPORTANT:** `linkResolver.cpp` edits live in `jdk21u/src/hotspot/share/classfile/linkResolver.cpp` (the build path); the export copy at `jdk21u-export/src/hotspot/share/interpreter/linkResolver.cpp` must be kept in sync via `cp classfile/... interpreter/...` after each build.
 - (Earlier subsystems also touched: `jvm.cpp`/`jvm.h`, `System.java`/`System.c`, `java.cpp`, `systemDictionary.cpp`, `methodHandles.cpp`, `linkResolver.cpp`, `runtime/reflection.cpp`.)
 - **Not yet committed** — all of this is in the working tree on top of `9ca2ecfe356`.
 
@@ -866,32 +1091,49 @@ silently not match. Simple unprefixed class names (`GraphDemo`,
 From `project_jvm_remaining_work.md`, still open: broader real-world benchmarks
 and a persistent/queryable graph backend. The **unified provenance graph** exists
 at v1 (§4A), has **async / cross-thread causality** (§4B: Executors,
-CompletableFuture/ForkJoinPool, Thread.start), and now **MethodHandle/LambdaForm
-execution tracing** (§4C). MH-execution follow-ups: per-invocation
-invokeBasic/linkTo* interception is not done (asm stubs — unsafe); bound
-receiver/argument *values* aren't read (no `BoundMethodHandle` species accessor);
-the link-time structural walk is best-effort (the appendix is usually the invoker,
-not the user MH). Async follow-ups: linkage when a task body is *not* instrumented
-(no worker Execution to attach), task-identity-hash collisions, logical
-CompletableFuture dependent-stage chains (vs. per-stage submit/run), and
-virtual-thread / structured-concurrency carrier causality. Graph follow-ups:
-**distinct-loader-aware class identity is now DONE** (Class/GeneratedClass/
-BytecodeArtifact keyed by `ClassLoaderData*`, Method transitively; see §4A
-"Loader-precise identity" + `LoaderIdentityDemo`), and **exact execution identity
-is now DONE** for instrumented methods (method-token trace ABI: exact
-descriptor + loader/hidden, no `?`/`loader_id=0` fallback; see §4A "Exact
-execution identity" + `OverloadIdentityDemo`); the legacy best-effort string trace
-path (`System.soroushTrace(String)` + `rewrite_soroush_main`) has been **removed**
-— the token ABI is the sole execution tracer. Remaining graph follow-ups: the
-divergence-NOTE side table is direct-mapped (diagnostic-only collisions);
-scoping/filtering by prefix (it currently records all loaded classes — Spring broad
-runs hit the 1M node cap); edge dedup; and a persistent/queryable backend
-(the **semantic JSONL export layer is now DONE** — see §4D; in-memory + shutdown
-export works; a persistent live-queryable backend remains open). Smaller rewriter
-follow-ups: recovering the conservative over-skips — operand-stack ref-type
-tracking / common-supertype frame merging for the exception-EXIT guard,
+CompletableFuture/ForkJoinPool, Thread.start), **MethodHandle/LambdaForm
+execution tracing** (§4C), and now **MH callsite attribution** (§4E/§4F: three
+new record types, full adapter coverage, Case A2 LF-frame recovery, sibling BCI
+scan — DONE, all 19 callsites covered across 4 demos, 0 silent omissions).
+
+MH-execution follow-ups: per-invocation invokeBasic/linkTo* interception is not
+done (asm stubs — unsafe); bound receiver/argument *values* aren't read (no
+`BoundMethodHandle` species accessor); the link-time structural walk is best-effort
+(the appendix is usually the invoker, not the user MH).
+
+MH callsite attribution follow-ups: `all_exact=false` nodes remain for adapter
+slots that are themselves BMH instances (asType secondary unboxing component,
+tryFinally cleanup slots, asCollector array-collector slot) — these require a
+recursive BMH structure walk, which would need multiple stack reads at an
+already-tricky point in the JVM. The `sibling_bci_scan` diagnostic reason code
+`recv_analyzer_recv_slot_oob` indicates a BCI whose stack state doesn't match
+the primary invoke — a future improvement would trace these sites via
+instrumentation instead of the structure walk.
+
+Async follow-ups: linkage when a task body is *not* instrumented (no worker
+Execution to attach), task-identity-hash collisions, logical CompletableFuture
+dependent-stage chains (vs. per-stage submit/run), and virtual-thread /
+structured-concurrency carrier causality.
+
+Graph follow-ups: **distinct-loader-aware class identity is now DONE**
+(Class/GeneratedClass/BytecodeArtifact keyed by `ClassLoaderData*`, Method
+transitively; see §4A "Loader-precise identity" + `LoaderIdentityDemo`), and
+**exact execution identity is now DONE** for instrumented methods (method-token
+trace ABI: exact descriptor + loader/hidden, no `?`/`loader_id=0` fallback; see
+§4A "Exact execution identity" + `OverloadIdentityDemo`); the legacy best-effort
+string trace path (`System.soroushTrace(String)` + `rewrite_soroush_main`) has
+been **removed** — the token ABI is the sole execution tracer. Remaining graph
+follow-ups: the divergence-NOTE side table is direct-mapped (diagnostic-only
+collisions); scoping/filtering by prefix (it currently records all loaded classes —
+Spring broad runs hit the 1M node cap); edge dedup; and a persistent/queryable
+backend (the **semantic JSONL export layer is now DONE** — see §4D; in-memory +
+shutdown export works; a persistent live-queryable backend remains open).
+
+Smaller rewriter follow-ups: recovering the conservative over-skips — operand-stack
+ref-type tracking / common-supertype frame merging for the exception-EXIT guard,
 operand-stack-aware constructor delegation detection (to instrument
 `super(new Foo())` shapes), and an env-configurable allowlist for known-harmless
-custom Code sub-attributes. Note the Phase-2 NOP path (`soroush_transform_code_attribute`,
-test-only) is *not* hardened (copies unknown attrs, lacks type-annotation
-remapping); the real instrumentation runs through Phase 3/5 (`*_entry_code`).
+custom Code sub-attributes. Note the Phase-2 NOP path
+(`soroush_transform_code_attribute`, test-only) is *not* hardened (copies unknown
+attrs, lacks type-annotation remapping); the real instrumentation runs through
+Phase 3/5 (`*_entry_code`).

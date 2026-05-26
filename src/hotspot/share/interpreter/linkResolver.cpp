@@ -2613,6 +2613,103 @@ static SgRecvResult sg_analyze_mh_receiver(Method* m, int invoke_bci, int arg_sl
 }
 
 // ---------------------------------------------------------------------------
+// sg_emit_sibling_bcis — sibling-BCI silent-omission eliminator.
+//
+// When resolve_handle_call fires for BCI X (the first invocation of a CP cache
+// entry), multiple other BCIs in the same method may share that CP cache entry
+// and thus NEVER trigger resolve_handle_call themselves.  This function finds
+// all such sibling BCIs and emits a diagnostic for each, so that no executed
+// MethodHandle callsite is silently omitted.
+//
+// For each sibling BCI, we run the stack simulator to determine whether the
+// MH receiver is:
+//   (a) the same local slot as at the primary BCI → diagnostic "sibling_bci_same_local"
+//   (b) a different local slot                    → diagnostic "sibling_bci_distinct_receiver"
+//   (c) analysis failed                           → diagnostic "sibling_bci_unanalyzable"
+//
+// Hard rule: the diagnostic is always emitted at resolve time.  If a later
+// LF-frame attribution fire produces an exact record for the same (class, method,
+// bci), the export dedup phase keeps only the exact record (Part C).
+// ---------------------------------------------------------------------------
+static void sg_emit_sibling_bcis(
+    const char*  cat,
+    Method*      user_method,   // the attributed user method
+    int          primary_bci,   // the BCI that triggered resolve_handle_call
+    int          primary_recv_local,  // local slot at primary_bci (-1 = unknown)
+    int          src_cp,        // CP constant pool index of the shared CP entry
+    const char*  src_class,     uint64_t src_loader,
+    const char*  src_method_name, const char* src_desc,
+    int          arg_slots)     // parameter slots in the MH type (for simulator)
+{
+  if (user_method == nullptr || src_cp < 0) return;
+  ConstantPool* cpool = user_method->constants();
+  if (cpool == nullptr || cpool->cache() == nullptr) return;
+
+  int  code_size = user_method->code_size();
+  bool any_sibling = false;
+
+  for (int scan_bci = 0; scan_bci < code_size; ) {
+    address scan_bcp = user_method->bcp_from(scan_bci);
+    Bytecodes::Code bc = Bytecodes::code_at(user_method, scan_bcp);
+
+    // Only care about invoke* bytecodes (after rewriting may be _invokehandle)
+    bool is_inv = (bc == Bytecodes::_invokevirtual  ||
+                   bc == Bytecodes::_invokehandle   ||
+                   bc == Bytecodes::_invokespecial  ||
+                   bc == Bytecodes::_invokestatic   ||
+                   bc == Bytecodes::_invokeinterface);
+    if (is_inv && scan_bci != primary_bci) {
+      int scan_cp = -1;
+      if (scan_bci + 2 < code_size) {
+        int cc_idx = sg_u2at(scan_bcp + 1);
+        if (cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+          scan_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+        }
+      }
+      if (scan_cp == src_cp) {
+        // This BCI shares the same CP constant pool index as primary_bci.
+        // The CP cache entry is already resolved (we're IN resolve_handle_call
+        // for it), so this sibling will never trigger resolve_handle_call.
+        char reason[256];
+        if (arg_slots >= 0) {
+          SgRecvResult sr = sg_analyze_mh_receiver(user_method, scan_bci, arg_slots);
+          if (sr.mode == SG_RECV_LOCAL) {
+            if (primary_recv_local >= 0 && sr.local_n == primary_recv_local) {
+              snprintf(reason, sizeof(reason),
+                       "sibling_bci_same_local local=%d cp_index=%d",
+                       sr.local_n, src_cp);
+            } else {
+              snprintf(reason, sizeof(reason),
+                       "sibling_bci_distinct_receiver local=%d primary_local=%d cp_index=%d",
+                       sr.local_n, primary_recv_local, src_cp);
+            }
+          } else {
+            snprintf(reason, sizeof(reason),
+                     "sibling_bci_unanalyzable diag=%s cp_index=%d",
+                     sr.diag[0] ? sr.diag : "?", src_cp);
+          }
+        } else {
+          snprintf(reason, sizeof(reason),
+                   "sibling_bci_arg_slots_unknown cp_index=%d", src_cp);
+        }
+        int scan_opcode = (int)(uint8_t)bc;
+        soroush_graph_generic_callsite(cat,
+            src_class, src_loader, src_method_name, src_desc,
+            scan_bci, scan_opcode, scan_cp,
+            nullptr, 0, nullptr, nullptr,
+            /*src_ok=*/true, /*tgt_ok=*/false, reason);
+        any_sibling = true;
+      }
+    }
+
+    int bc_len = Bytecodes::length_at(user_method, scan_bcp);
+    if (bc_len <= 0) break;
+    scan_bci += bc_len;
+  }
+  (void)any_sibling;
+}
+
+// ---------------------------------------------------------------------------
 // MethodHandle adapter-structure walking (runtime receiver inspection v2).
 //
 // Taxonomy (JDK 21 field layout, audited from source):
@@ -2651,11 +2748,22 @@ struct SgMhTarget {
 // SgAdapterNode: one node in an extracted GENERIC-BMH adapter graph.
 struct SgAdapterNode {
   int         id;
-  const char* role;       // "adapted_target", "primary_target", "secondary_component", …
-  const char* from_desc;  // outer adapter type descriptor (type_conversion nodes only)
-  const char* to_desc;    // inner component's own type descriptor
-  SgMhTarget  target;     // valid when has_target == true
+  const char* role;               // "adapted_target", "primary_target", "nested_argL0", …
+  const char* from_desc;          // outer adapter type descriptor (type_conversion only)
+  const char* to_desc;            // inner component's own type descriptor
+  const char* node_adapter_class; // non-null for non-exact BMH nodes: species class name
+  const char* node_classification;// "user_target","helper_adapter","helper_invoker","helper_boxing",
+                                  // "helper_reflection","internal_jdk","bound_data","unknown"
+  const char* exact_false_reason; // null when exact=true; reason string otherwise
+  SgMhTarget  target;             // valid when has_target == true
   bool        has_target;
+};
+
+// SgAdapterEdge: directed edge "parent contains child" in the nested BMH graph.
+struct SgAdapterEdge {
+  int         from_id;
+  int         to_id;
+  const char* kind;  // "contains"
 };
 
 struct SgMhWalkResult {
@@ -2681,7 +2789,9 @@ struct SgMhWalkResult {
 
   // ADAPTER_GRAPH fields:
   int           n_graph_nodes;
-  SgAdapterNode graph_nodes[8];
+  SgAdapterNode graph_nodes[16];
+  int           n_graph_edges;
+  SgAdapterEdge graph_edges[16];
   const char*   graph_kind;      // "type_conversion", "dual_target", "multi_target", …
   const char*   outer_desc;      // MH type descriptor as presented to the caller
   bool          graph_all_exact;
@@ -2817,6 +2927,140 @@ static int sg_bmh_species_l_count(oop mh_oop) {
   return count;
 }
 
+// Return true if klass is definitively java.lang.invoke.* or sun.invoke.* machinery —
+// i.e., never a user/business callable target.
+static bool sg_is_invoke_internal(const char* klass) {
+  if (!klass) return false;
+  return strncmp(klass, "java/lang/invoke/", 17) == 0 ||
+         strncmp(klass, "sun/invoke/", 11) == 0;
+}
+
+// Classify an exact DMH target by package.
+static const char* sg_classify_exact(const char* klass) {
+  if (!klass) return "unknown";
+  if (strncmp(klass, "sun/invoke/", 11) == 0)          return "helper_boxing";
+  if (strncmp(klass, "java/lang/reflect/", 18) == 0 ||
+      strcmp(klass, "java/lang/Class") == 0)            return "helper_reflection";
+  if (sg_is_invoke_internal(klass)                   ||
+      strncmp(klass, "java/", 5) == 0                ||
+      strncmp(klass, "javax/", 6) == 0               ||
+      strncmp(klass, "sun/", 4) == 0                 ||
+      strncmp(klass, "jdk/", 4) == 0)                  return "internal_jdk";
+  return "user_target";
+}
+
+// Classify a non-exact adapter node by its adapter class name.
+static const char* sg_classify_nonexact(const char* adapter_class) {
+  if (!adapter_class) return "unknown";
+  if (strcmp(adapter_class, "java/lang/invoke/SimpleMethodHandle") == 0)
+    return "helper_invoker";
+  if (strstr(adapter_class, "BoundMethodHandle$Species_"))
+    return "helper_adapter";
+  if (sg_is_invoke_internal(adapter_class)) return "internal_jdk";
+  return "unknown";
+}
+
+// Role labels for nested BMH slots.
+static const char* sg_nested_role(int index) {
+  static const char* nested_roles[] = {
+    "nested_argL0","nested_argL1","nested_argL2","nested_argL3",
+    "nested_argL4","nested_argL5","nested_argL6","nested_argL7"
+  };
+  return (index >= 0 && index < 8) ? nested_roles[index] : "nested_argLN";
+}
+
+// Recursively descend into a nested BMH, appending child nodes and "contains"
+// edges to r.  parent_id is the node id whose slot contains this BMH.
+// visited[0..n_visited-1] prevents infinite loops on cyclic MH graphs.
+// depth decrements on each recursive call; recursion stops at 0.
+// *leaf_all_exact is set to false if any reachable leaf cannot be resolved to a DMH.
+static void sg_recurse_into_bmh(
+    oop mh_oop, int parent_id,
+    SgMhWalkResult* r,
+    oop* visited, int* n_visited,
+    int depth, bool* all_user_exact)
+{
+  // Depth/capacity guard. If the class is JDK-internal machinery, depth exhaustion
+  // does NOT indicate a hidden user target — leave all_user_exact unchanged.
+  if (r->n_graph_nodes >= 16) {
+    if (all_user_exact && sg_oop_valid(mh_oop)) {
+      if (!sg_is_invoke_internal(mh_oop->klass()->name()->as_C_string()))
+        *all_user_exact = false;
+    }
+    return;
+  }
+  if (depth <= 0) {
+    if (all_user_exact && sg_oop_valid(mh_oop)) {
+      if (!sg_is_invoke_internal(mh_oop->klass()->name()->as_C_string()))
+        *all_user_exact = false;
+    }
+    return;
+  }
+  if (!sg_oop_valid(mh_oop) || !java_lang_invoke_MethodHandle::is_instance(mh_oop)) {
+    if (all_user_exact) *all_user_exact = false;
+    return;
+  }
+  // Cycle detection.
+  for (int v = 0; v < *n_visited; v++) {
+    if (visited[v] == mh_oop) return;  // already visited; not a user target blocker
+  }
+  if (*n_visited < 8) visited[(*n_visited)++] = mh_oop;
+
+  int n_l = sg_bmh_species_l_count(mh_oop);
+  if (n_l <= 0 || n_l > 8) {
+    // n_l == 0: SimpleMethodHandle (LF-driven, no bound args) — always invoke machinery.
+    // n_l > 8: oversized species — conservative skip; classify by package.
+    if (all_user_exact && sg_oop_valid(mh_oop)) {
+      if (!sg_is_invoke_internal(mh_oop->klass()->name()->as_C_string()))
+        *all_user_exact = false;
+    }
+    return;
+  }
+
+  for (int i = 0; i < n_l && r->n_graph_nodes < 16; i++) {
+    oop f = sg_bmh_arg_at(mh_oop, i);
+    // Non-MH slot: bound data value (Class object, int, etc.) — not a hidden user target.
+    if (!sg_oop_valid(f) || !java_lang_invoke_MethodHandle::is_instance(f)) continue;
+
+    int child_id = r->n_graph_nodes;
+    SgAdapterNode& child = r->graph_nodes[r->n_graph_nodes++];
+    memset(&child, 0, sizeof(child));
+    child.id      = child_id;
+    child.role    = sg_nested_role(i);
+    child.to_desc = sg_mh_descriptor(f);
+
+    // Add "contains" edge from parent to this child.
+    if (r->n_graph_edges < 16) {
+      r->graph_edges[r->n_graph_edges].from_id = parent_id;
+      r->graph_edges[r->n_graph_edges].to_id   = child_id;
+      r->graph_edges[r->n_graph_edges].kind    = "contains";
+      r->n_graph_edges++;
+    }
+
+    oop unwrapped = sg_unwrap_delegating(f, 4);
+    if (sg_extract_dmh_target(unwrapped, &child.target)) {
+      child.has_target        = true;
+      child.node_classification = sg_classify_exact(child.target.klass);
+    } else if (java_lang_invoke_MethodHandle::is_instance(unwrapped)) {
+      // Non-DMH MH: record species class, recurse.
+      child.has_target           = false;
+      child.node_adapter_class   = unwrapped->klass()->name()->as_C_string();
+      child.node_classification  = sg_classify_nonexact(child.node_adapter_class);
+      child.exact_false_reason   = child.node_classification;  // role as reason
+      if (!sg_is_invoke_internal(child.node_adapter_class) && all_user_exact)
+        *all_user_exact = false;
+      sg_recurse_into_bmh(unwrapped, child_id, r, visited, n_visited,
+                          depth - 1, all_user_exact);
+    } else {
+      // Some other non-MH value where a MH was expected — conservative.
+      child.has_target          = false;
+      child.node_classification = "unknown";
+      child.exact_false_reason  = "not_a_methodhandle";
+      if (all_user_exact) *all_user_exact = false;
+    }
+  }
+}
+
 // Walk a BoundMethodHandle (any LambdaForm kind) and extract its adapter graph.
 //
 // Strategy: enumerate argL{0..N-1} fields (the bound reference components of
@@ -2861,14 +3105,25 @@ static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
   }
   if (n_l > 8) n_l = 8;
 
+  // Cycle detection buffer seeded with the outermost BMH itself.
+  oop visited_buf[8];
+  int n_visited = 0;
+  visited_buf[n_visited++] = mh_oop;
+
   int mh_count = 0;
+  // all_exact: true iff all user/business targets (non-JDK-internal classes) are
+  // recovered exactly.  JDK-internal adapter nodes (SimpleMethodHandle, Species_*)
+  // may remain non-exact without clearing this flag.
   bool all_exact = true;
 
   for (int i = 0; i < n_l; i++) {
     oop f = sg_bmh_arg_at(mh_oop, i);
+    // Use current array position as ID — must be captured BEFORE the increment
+    // so that IDs remain unique even after sg_recurse_into_bmh adds children.
+    int my_id = r.n_graph_nodes;
     SgAdapterNode& node = r.graph_nodes[r.n_graph_nodes++];
     memset(&node, 0, sizeof(node));
-    node.id = i;
+    node.id = my_id;
 
     // Role assignment.
     if (strcmp(lf, "TRY_FINALLY") == 0) {
@@ -2901,7 +3156,10 @@ static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
     }
 
     if (!sg_oop_valid(f)) {
-      node.has_target = false;
+      // Null/invalid argL slot — conservative: mark as unknown blocker.
+      node.has_target           = false;
+      node.node_classification  = "unknown";
+      node.exact_false_reason   = "null_slot";
       all_exact = false;
       continue;
     }
@@ -2909,14 +3167,35 @@ static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
     if (java_lang_invoke_MethodHandle::is_instance(f)) {
       mh_count++;
       oop unwrapped = sg_unwrap_delegating(f, 4);
-      node.has_target = sg_extract_dmh_target(unwrapped, &node.target);
-      if (!node.has_target) all_exact = false;
       node.to_desc = sg_mh_descriptor(f);
       if (n_l == 1) node.from_desc = r.outer_desc; // outer→inner for single-target adapters
+      if (sg_extract_dmh_target(unwrapped, &node.target)) {
+        node.has_target          = true;
+        node.node_classification = sg_classify_exact(node.target.klass);
+      } else if (java_lang_invoke_MethodHandle::is_instance(unwrapped)) {
+        // Nested BMH: record species class, recurse to find children.
+        node.has_target           = false;
+        node.node_adapter_class   = unwrapped->klass()->name()->as_C_string();
+        node.node_classification  = sg_classify_nonexact(node.node_adapter_class);
+        node.exact_false_reason   = node.node_classification;
+        // Only block all_exact if this is not a known JDK-internal adapter.
+        if (!sg_is_invoke_internal(node.node_adapter_class)) all_exact = false;
+        sg_recurse_into_bmh(unwrapped, my_id, &r, visited_buf, &n_visited,
+                            3, &all_exact);
+      } else {
+        // Non-BMH, non-DMH MH: unknown.
+        node.has_target           = false;
+        node.node_classification  = "unknown";
+        node.exact_false_reason   = "unknown_mh_type";
+        all_exact = false;
+      }
     } else {
       // Non-MH bound value (bindTo / insertArguments with concrete values).
-      node.has_target = false;
-      all_exact = false;
+      // This is bound data, not a hidden user MH target.
+      node.has_target           = false;
+      node.node_classification  = "bound_data";
+      node.exact_false_reason   = "non_mh_bound_value";
+      // Do NOT clear all_exact: bound data is never a user callable target.
     }
   }
 
@@ -2933,6 +3212,66 @@ static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
   r.graph_all_exact = all_exact;
   r.shape = SgMhWalkResult::ADAPTER_GRAPH;
   return r;
+}
+
+// ---------------------------------------------------------------------------
+// sg_recover_mh_recv_from_java_sp — runtime MH receiver recovery.
+//
+// When the symbolic stack simulator fails to locate the MH receiver in a local
+// variable (e.g., receiver is a method-return temporary, chained expression,
+// field read, array element, or the simulator's stack accounting drifts on
+// complex bytecode sequences), this function recovers the ACTUAL runtime
+// MethodHandle object directly from the live Java expression stack via
+// JavaThread::last_Java_sp().
+//
+// Design: receiver-origin is IRRELEVANT.  We care only what MH object was
+// actually being invoked at runtime, regardless of how it was produced.
+//
+// Contract (valid during call_VM, interpreter mode only):
+//   JavaThread::last_Java_sp() is saved into the JavaThread anchor at
+//   call_VM entry (NOT the frame's last_sp field, which is set to NULL on
+//   aarch64 — that is what makes interpreter_frame_expression_stack_at
+//   unsafe here).  last_Java_sp holds the Java expression-stack pointer (esp)
+//   at the moment of the invokevirtual, pointing to the most recently pushed
+//   Java slot (the last argument).
+//
+//   Stack layout at invokevirtual entry (stack grows toward lower addresses):
+//
+//     lower address  ← last_Java_sp  →  [arg_{n-1}]   (last arg, e.g. int 5)
+//                                        [arg_{n-2}]
+//                                        ...
+//                                        [arg_0]        ← last_Java_sp + (arg_slots-1)
+//                                        [receiver MH]  ← last_Java_sp + arg_slots
+//     higher address
+//
+//   arg_slots = sg_count_param_slots(invocation_descriptor), i.e. the number
+//   of parameter slots NOT counting the receiver.
+//
+// Safe for: local MH, field MH, array-element MH, method-return MH,
+//           chained temporary MH, nested combinator MH.
+// Not applied for Case A2 (recv_frame_valid=true) where last_Java_sp reflects
+// a LF dispatch frame's stack, not the user callsite frame.
+// ---------------------------------------------------------------------------
+static oop sg_recover_mh_recv_from_java_sp(JavaThread* thread, int arg_slots) {
+  if (thread == nullptr || arg_slots < 0) return nullptr;
+
+  intptr_t* java_sp = (intptr_t*)thread->last_Java_sp();
+  if (java_sp == nullptr) return nullptr;
+
+  // Receiver is arg_slots slots above the stack top (higher address).
+  intptr_t* recv_slot = java_sp + arg_slots;
+
+  // Bounds check against thread's Java stack region.
+  uintptr_t recv_addr  = (uintptr_t)recv_slot;
+  uintptr_t stack_end  = (uintptr_t)thread->stack_end();   // lowest valid address
+  uintptr_t stack_base = (uintptr_t)thread->stack_base();  // highest valid address
+  if (recv_addr < stack_end || recv_addr + sizeof(intptr_t) > stack_base) return nullptr;
+
+  oop candidate = *(oop*)recv_slot;
+  if (!sg_oop_valid(candidate)) return nullptr;
+  if (!java_lang_invoke_MethodHandle::is_instance(candidate)) return nullptr;
+
+  return candidate;
 }
 
 // Walk a MethodHandle oop and classify its adapter structure.
@@ -3155,6 +3494,16 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
     bool is_reflection_accessor = false;
     bool top_frame_valid = false;
     frame top;
+    // recv_frame: the frame from which we read the MH receiver local variable.
+    // Equals `top` for direct user callsites; equals the walked-to user frame when
+    // resolve_handle_call fires from inside a java/lang/invoke/* LambdaForm.
+    frame recv_frame;
+    bool  recv_frame_valid = false;
+    Method* recv_frame_method = nullptr;
+    // is_lf_dispatch_case: true iff the top interpreter frame is a java/lang/invoke
+    // LambdaForm/BMH internal and we are in Case A2.  Used by Step 2 to choose
+    // between reading from last_Java_sp (Case A) vs top.local_at(0) (Case A2).
+    bool is_lf_dispatch_case = false;
 
     if (THREAD->has_last_Java_frame()) {
       top = THREAD->last_frame();
@@ -3208,8 +3557,96 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
               break;
             }
 
+          } else if (strncmp(holder, "java/lang/invoke/", 17) == 0) {
+            // ---- Case A2: top frame is a java/lang/invoke LambdaForm/BMH internal.
+            // resolve_handle_call fires from inside an adapter chain (e.g. tryFinally
+            // LF dispatching to a component MH).  Walk the vframeStream past ALL
+            // java/lang/invoke frames — including intermediate stub/adapter frames
+            // that raw frame walking cannot skip — to recover the original user
+            // callsite AND to read the actual MH receiver from user frame locals.
+            // vframeStream handles compiled/deopt/stub frames transparently.
+            is_lf_dispatch_case = true;
+            bool found_user_frame = false;
+            for (vframeStream vfst(THREAD); !vfst.at_end(); vfst.next()) {
+              Method* sm = vfst.method();
+              if (sm == nullptr) continue;
+              const char* sh = sm->method_holder()->name()->as_C_string();
+              if (strncmp(sh, "java/lang/invoke/", 17) == 0) continue;
+              int u_bci = vfst.bci();
+              if (u_bci < 0) break;
+              src_class  = sh;
+              src_loader = (uint64_t)(uintptr_t)sm->method_holder()->class_loader_data();
+              src_method = sm->name()->as_C_string();
+              src_desc   = sm->signature()->as_C_string();
+              src_bci    = u_bci;
+              if (u_bci < sm->code_size()) {
+                address bcp = sm->bcp_from(u_bci);
+                src_opcode = (int)(uint8_t)Bytecodes::java_code_at(sm, bcp);
+                if (u_bci + 2 < sm->code_size()) {
+                  int cc_idx = sg_u2at(bcp + 1);
+                  ConstantPool* cpool = sm->constants();
+                  if (cpool != nullptr && cpool->cache() != nullptr
+                      && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+                    src_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+                  }
+                }
+              }
+              src_ok = true;
+              recv_frame_method = sm;
+              found_user_frame  = true;
+              // Get the raw frame for interpreter_frame_local_at.
+              // Walk raw frames from top to find the matching interpreted frame.
+              {
+                RegisterMap rmap2(THREAD,
+                                  RegisterMap::UpdateMap::skip,
+                                  RegisterMap::ProcessFrames::skip,
+                                  RegisterMap::WalkContinuation::skip);
+                frame rscan = THREAD->last_frame();
+                while (true) {
+                  if (rscan.is_interpreted_frame()) {
+                    Method* rm = rscan.interpreter_frame_method();
+                    if (rm == sm && rscan.interpreter_frame_bci() == u_bci) {
+                      recv_frame       = rscan;
+                      recv_frame_valid = true;
+                      break;
+                    }
+                  }
+                  if (rscan.is_first_frame()) break;
+                  rscan = rscan.sender(&rmap2);
+                }
+              }
+              break;
+            }
+            if (!src_ok) {
+              // Could not recover user frame — attribute to the LF frame itself.
+              src_bci = top.interpreter_frame_bci();
+              if (src_bci >= 0) {
+                src_class  = holder;
+                src_loader = (uint64_t)(uintptr_t)cm->method_holder()->class_loader_data();
+                src_method = cm->name()->as_C_string();
+                src_desc   = cm->signature()->as_C_string();
+                if (src_bci < cm->code_size()) {
+                  address bcp = cm->bcp_from(src_bci);
+                  src_opcode = (int)(uint8_t)Bytecodes::java_code_at(cm, bcp);
+                  if (src_bci + 2 < cm->code_size()) {
+                    int cc_idx = sg_u2at(bcp + 1);
+                    ConstantPool* cpool = cm->constants();
+                    if (cpool != nullptr && cpool->cache() != nullptr
+                        && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+                      src_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+                    }
+                  }
+                }
+                src_ok = true;
+                recv_frame        = top;
+                recv_frame_valid  = top_frame_valid;
+                recv_frame_method = cm;
+              }
+            }
+            (void)found_user_frame;
+
           } else {
-            // ---- Case A: normal user MH callsite ----
+            // ---- Case A: normal user MH callsite (top frame IS the user frame) ----
             src_bci = top.interpreter_frame_bci();
             if (src_bci >= 0) {
               src_class  = holder;
@@ -3230,6 +3667,9 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 }
               }
               src_ok = true;
+              recv_frame        = top;
+              recv_frame_valid  = top_frame_valid;
+              recv_frame_method = cm;
             }
           }
         }
@@ -3238,112 +3678,189 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
 
     // ---- Runtime receiver inspection ----
     //
-    // Case A (normal user MH callsite): the MH is stored in a local variable.
-    //   Use bytecode forward-scan + backward-walk to find which local slot holds
-    //   the receiver, then read it via interpreter_frame_local_at(N).
-    //   interpreter_frame_local_at uses rfp-relative addressing and is safe
-    //   during call_VM regardless of last_sp state.
-    //   interpreter_frame_expression_stack_at MUST NOT be used here because
-    //   last_sp is asserted NULL at call_VM entry on aarch64, making the
-    //   expression-stack address fall back to sp() (C stack pointer).
+    // Case A / A2 (user or recovered user frame): recover the MH receiver oop
+    //   using a two-step strategy:
+    //
+    //   Step 1 (primary): symbolic stack simulator locates the receiver in a
+    //     local variable; read via interpreter_frame_local_at (FP-relative,
+    //     safe during call_VM on aarch64 regardless of last_sp state).
+    //
+    //   Step 2 (fallback): when the simulator fails — receiver is a stack
+    //     temporary from a method return, chained expression, field read, or
+    //     array element — recover the actual receiver oop from the live Java
+    //     expression stack via sg_recover_mh_recv_from_java_sp().
+    //     thread->last_Java_sp() was saved into the JavaThread anchor at
+    //     call_VM entry; it is NOT the frame's last_sp field (which IS null).
+    //     This makes receiver origin IRRELEVANT: local, field, array, method
+    //     return, or inline temporary are all recovered identically.
+    //     Skip for Case A2 (recv_frame_valid=true) where last_Java_sp reflects
+    //     a LF dispatch frame's stack, not the user callsite frame.
     //
     // Case B (JDK 21 reflection accessor): read accessor `this` from local 0,
     //   then find the `target` MethodHandle field via JavaFieldStream.
     bool multi_target_emitted = false;
     char adapter_diag[384] = "";
-    if (top_frame_valid && !is_reflection_accessor) {
-      // Case A: walk the runtime MH receiver oop to classify its adapter structure.
-      // sg_walk_mh handles: DirectMethodHandle (DIRECT), guardWithTest (GWT),
-      // catchException (GWC), opaque BMH adapters (BMH_UNKNOWN), unknown MH types.
-      Method* tcm = top.interpreter_frame_method();
+    // primary_recv_local: local slot of the MH receiver at src_bci.  Used by
+    // the sibling BCI scan (Part B) to distinguish same-receiver vs distinct.
+    int  primary_recv_local = -1;
+    int  primary_arg_slots  = sg_count_param_slots(link_info.signature());
+    if ((recv_frame_valid || top_frame_valid) && !is_reflection_accessor) {
+      // Case A / A2: walk the runtime MH receiver oop.
+      // Use recv_frame (user frame) and recv_frame_method (user method) for
+      // receiver reading.  Fall back to top/top's method if recv_frame not set.
+      frame&  use_frame  = recv_frame_valid  ? recv_frame  : top;
+      Method* tcm        = recv_frame_valid  ? recv_frame_method
+                                             : top.interpreter_frame_method();
       if (src_ok && tcm != nullptr) {
-        int arg_slots = sg_count_param_slots(link_info.signature());
+        int arg_slots = primary_arg_slots;
         if (arg_slots >= 0) {
-          // Use the symbolic stack simulator (replaces sg_find_receiver_local_slot).
-          // It handles complex argument expressions like invokestatic Integer.valueOf()
-          // that the old backward-scan heuristic could not cross.
+          // Step 1: symbolic stack simulator — tries to find receiver in a local.
           SgRecvResult recv_r = sg_analyze_mh_receiver(tcm, src_bci, arg_slots);
+          oop mh_recv = nullptr;
           if (recv_r.mode == SG_RECV_LOCAL) {
-            intptr_t* local_ptr = top.interpreter_frame_local_at(recv_r.local_n);
+            primary_recv_local = recv_r.local_n;
+            intptr_t* local_ptr = use_frame.interpreter_frame_local_at(recv_r.local_n);
             if (local_ptr != nullptr) {
-              oop mh_recv = *(oop*)local_ptr;
-              if (mh_recv != nullptr && oopDesc::is_oop_or_null(mh_recv)) {
-                SgMhWalkResult walk = sg_walk_mh(mh_recv, 6);
-                if (walk.shape == SgMhWalkResult::DIRECT && walk.all_exact) {
-                  // Single exact target → existing callsite_target path.
-                  tgt_class  = walk.targets[0].klass;
-                  tgt_loader = walk.targets[0].loader_id;
-                  tgt_method = walk.targets[0].method;
-                  tgt_desc   = walk.targets[0].descriptor;
-                  tgt_ok = true;
-                } else if ((walk.shape == SgMhWalkResult::GWT ||
-                             walk.shape == SgMhWalkResult::GWC) && walk.all_exact) {
-                  // Multi-target: emit callsite_target_set and skip generic path.
-                  SgMhTargetEntry entries[4];
-                  memset(entries, 0, sizeof(entries));
-                  for (int i = 0; i < walk.n_targets && i < 4; i++) {
-                    entries[i].klass      = walk.targets[i].klass;
-                    entries[i].loader_id  = walk.targets[i].loader_id;
-                    entries[i].method     = walk.targets[i].method;
-                    entries[i].descriptor = walk.targets[i].descriptor;
-                    entries[i].role       = walk.roles[i];
-                    entries[i].valid      = walk.targets[i].valid;
-                  }
-                  const char* shape_str = (walk.shape == SgMhWalkResult::GWT) ? "GWT" : "GWC";
-                  soroush_graph_target_set_callsite(
-                      cat, shape_str, walk.adapter_class, walk.lf_kind, walk.aux_info,
-                      src_class, src_loader, src_method, src_desc,
-                      src_bci, src_opcode, src_cp,
-                      entries, walk.n_targets);
-                  multi_target_emitted = true;
-                } else if (walk.shape == SgMhWalkResult::ADAPTER_GRAPH) {
-                  // GENERIC/named BMH: adapter graph extracted.
-                  SgAdapterNodeEntry entries[8];
-                  memset(entries, 0, sizeof(entries));
-                  int ne = (walk.n_graph_nodes < 8) ? walk.n_graph_nodes : 8;
-                  for (int i = 0; i < ne; i++) {
-                    entries[i].id        = walk.graph_nodes[i].id;
-                    entries[i].role      = walk.graph_nodes[i].role;
-                    entries[i].from_desc = walk.graph_nodes[i].from_desc;
-                    entries[i].to_desc   = walk.graph_nodes[i].to_desc;
-                    if (walk.graph_nodes[i].has_target) {
-                      entries[i].klass      = walk.graph_nodes[i].target.klass;
-                      entries[i].loader_id  = walk.graph_nodes[i].target.loader_id;
-                      entries[i].method     = walk.graph_nodes[i].target.method;
-                      entries[i].descriptor = walk.graph_nodes[i].target.descriptor;
-                      entries[i].exact      = true;
-                    }
-                  }
-                  soroush_graph_adapter_graph_callsite(
-                    cat,
-                    walk.adapter_class, walk.graph_kind, walk.lf_kind, walk.outer_desc,
-                    src_class, src_loader, src_method, src_desc,
-                    src_bci, src_opcode, src_cp,
-                    entries, ne, walk.graph_all_exact);
-                  multi_target_emitted = true;
-                } else {
-                  // BMH_UNKNOWN / MH_UNKNOWN: shape not recognised or extraction failed.
-                  const char* ac = walk.adapter_class ? walk.adapter_class : "unknown";
-                  if (walk.lf_kind != nullptr) {
-                    snprintf(adapter_diag, sizeof(adapter_diag),
-                             "adapter_not_all_exact lf_kind=%s adapter_class=%s",
-                             walk.lf_kind, ac);
-                  } else {
-                    snprintf(adapter_diag, sizeof(adapter_diag),
-                             "adapter_unknown_shape adapter_class=%s", ac);
-                  }
+              oop candidate = *(oop*)local_ptr;
+              if (sg_oop_valid(candidate) &&
+                  java_lang_invoke_MethodHandle::is_instance(candidate)) {
+                mh_recv = candidate;
+              }
+            }
+          }
+          // Step 2: runtime stack fallback — Case A (top frame IS the user frame).
+          // Read the actual MH receiver from the live Java expression stack via
+          // thread->last_Java_sp() (saved in the JavaThread anchor at call_VM
+          // entry, NOT the frame's last_sp which is NULL on aarch64).
+          // Stack at invokevirtual entry (grows toward lower addresses):
+          //   last_Java_sp → [last_arg]  ...  [arg_0]  [receiver_MH]
+          //                                           ↑ last_Java_sp + arg_slots
+          // Skip for Case A2 (is_lf_dispatch_case=true): last_Java_sp there
+          // reflects the LF dispatch frame's stack, not the user callsite frame.
+          if (mh_recv == nullptr && !is_lf_dispatch_case) {
+            oop candidate = sg_recover_mh_recv_from_java_sp(
+                JavaThread::cast(THREAD), arg_slots);
+            if (candidate != nullptr) {
+              mh_recv = candidate;
+            }
+          }
+          // Step 2a: Case A2 — read MH from local[0] of the LF dispatch top frame.
+          // In Case A2, `top` is the innermost java/lang/invoke LF frame whose
+          // local[0] is always the MethodHandle being invoked (the `this` of
+          // invokeExact/invoke).  FP-relative, safe during call_VM on aarch64.
+          if (mh_recv == nullptr && is_lf_dispatch_case) {
+            intptr_t* local0 = top.interpreter_frame_local_at(0);
+            if (local0 != nullptr) {
+              oop candidate = *(oop*)local0;
+              if (sg_oop_valid(candidate) &&
+                  java_lang_invoke_MethodHandle::is_instance(candidate)) {
+                mh_recv = candidate;
+              }
+            }
+          }
+          // Step 3: walk whichever MH oop we obtained.
+          if (mh_recv != nullptr) {
+            SgMhWalkResult walk = sg_walk_mh(mh_recv, 6);
+            if (walk.shape == SgMhWalkResult::DIRECT && walk.all_exact) {
+              // Single exact target → existing callsite_target path.
+              tgt_class  = walk.targets[0].klass;
+              tgt_loader = walk.targets[0].loader_id;
+              tgt_method = walk.targets[0].method;
+              tgt_desc   = walk.targets[0].descriptor;
+              tgt_ok = true;
+            } else if ((walk.shape == SgMhWalkResult::GWT ||
+                         walk.shape == SgMhWalkResult::GWC) && walk.all_exact) {
+              // Multi-target: emit callsite_target_set and skip generic path.
+              SgMhTargetEntry entries[4];
+              memset(entries, 0, sizeof(entries));
+              for (int i = 0; i < walk.n_targets && i < 4; i++) {
+                entries[i].klass      = walk.targets[i].klass;
+                entries[i].loader_id  = walk.targets[i].loader_id;
+                entries[i].method     = walk.targets[i].method;
+                entries[i].descriptor = walk.targets[i].descriptor;
+                entries[i].role       = walk.roles[i];
+                entries[i].valid      = walk.targets[i].valid;
+              }
+              const char* shape_str = (walk.shape == SgMhWalkResult::GWT) ? "GWT" : "GWC";
+              soroush_graph_target_set_callsite(
+                  cat, shape_str, walk.adapter_class, walk.lf_kind, walk.aux_info,
+                  src_class, src_loader, src_method, src_desc,
+                  src_bci, src_opcode, src_cp,
+                  entries, walk.n_targets);
+              multi_target_emitted = true;
+            } else if (walk.shape == SgMhWalkResult::ADAPTER_GRAPH) {
+              // GENERIC/named BMH: adapter graph extracted.
+              SgAdapterNodeEntry node_entries[16];
+              memset(node_entries, 0, sizeof(node_entries));
+              int ne = (walk.n_graph_nodes < 16) ? walk.n_graph_nodes : 16;
+              for (int i = 0; i < ne; i++) {
+                node_entries[i].id                 = walk.graph_nodes[i].id;
+                node_entries[i].role               = walk.graph_nodes[i].role;
+                node_entries[i].from_desc          = walk.graph_nodes[i].from_desc;
+                node_entries[i].to_desc            = walk.graph_nodes[i].to_desc;
+                node_entries[i].node_adapter_class = walk.graph_nodes[i].node_adapter_class;
+                node_entries[i].node_classification= walk.graph_nodes[i].node_classification;
+                node_entries[i].exact_false_reason = walk.graph_nodes[i].exact_false_reason;
+                if (walk.graph_nodes[i].has_target) {
+                  node_entries[i].klass      = walk.graph_nodes[i].target.klass;
+                  node_entries[i].loader_id  = walk.graph_nodes[i].target.loader_id;
+                  node_entries[i].method     = walk.graph_nodes[i].target.method;
+                  node_entries[i].descriptor = walk.graph_nodes[i].target.descriptor;
+                  node_entries[i].exact      = true;
                 }
+              }
+              SgAdapterEdgeEntry edge_entries[16];
+              memset(edge_entries, 0, sizeof(edge_entries));
+              int nee = (walk.n_graph_edges < 16) ? walk.n_graph_edges : 16;
+              for (int i = 0; i < nee; i++) {
+                edge_entries[i].from_id = walk.graph_edges[i].from_id;
+                edge_entries[i].to_id   = walk.graph_edges[i].to_id;
+                edge_entries[i].kind    = walk.graph_edges[i].kind;
+              }
+              soroush_graph_adapter_graph_callsite(
+                cat,
+                walk.adapter_class, walk.graph_kind, walk.lf_kind, walk.outer_desc,
+                src_class, src_loader, src_method, src_desc,
+                src_bci, src_opcode, src_cp,
+                node_entries, ne, edge_entries, nee, walk.graph_all_exact);
+              multi_target_emitted = true;
+            } else {
+              // BMH_UNKNOWN / MH_UNKNOWN: shape not recognised or extraction failed.
+              const char* ac = walk.adapter_class ? walk.adapter_class : "unknown";
+              if (walk.lf_kind != nullptr) {
+                snprintf(adapter_diag, sizeof(adapter_diag),
+                         "adapter_not_all_exact lf_kind=%s adapter_class=%s",
+                         walk.lf_kind, ac);
+              } else {
+                snprintf(adapter_diag, sizeof(adapter_diag),
+                         "adapter_unknown_shape adapter_class=%s", ac);
               }
             }
           } else {
-            // Simulator could not prove receiver origin — record diagnostic reason.
-            snprintf(adapter_diag, sizeof(adapter_diag),
-                     "recv_analyzer_%s", recv_r.diag);
+            // All recovery paths exhausted — emit explicit diagnostic.
+            if (recv_r.mode != SG_RECV_LOCAL) {
+              snprintf(adapter_diag, sizeof(adapter_diag),
+                       "recv_analyzer_%s", recv_r.diag);
+            } else {
+              snprintf(adapter_diag, sizeof(adapter_diag), "recv_local_oop_invalid");
+            }
           }
         }
       }
     } else if (top_frame_valid && is_reflection_accessor) {
       // Case B: accessor `this` is local 0; find its `target` field.
+      //
+      // The accessor's `target` field (set by MethodHandleAccessorFactory) is a
+      // MethodHandle that may be:
+      //   (a) a DirectMethodHandle   — 0-param or trivial asType returns raw DMH
+      //   (b) a BoundMethodHandle adapter wrapping a DMH
+      //       MethodHandleAccessorFactory.makeSpecializedTarget always applies
+      //       dropArguments (static methods), asType (type adaptation), or
+      //       asSpreader (>3-param methods/constructors), all of which produce BMHs.
+      //
+      // Strategy: use sg_walk_mh to traverse any adapter chain and extract the
+      // underlying reflected Method*.  This makes target recovery independent of
+      // whether the accessor used a plain DMH or any depth of BMH wrapping.
       intptr_t* local0 = top.interpreter_frame_local_at(0);
       if (local0 != nullptr) {
         oop accessor_obj = *(oop*)local0;
@@ -3358,18 +3875,31 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
               if (strcmp(fn->as_C_string(), "target") == 0 &&
                   strncmp(fs->as_C_string(), "Ljava/lang/invoke/MethodHandle;", 31) == 0) {
                 fieldDescriptor& fd = jfs.field_descriptor();
-                oop mh_recv = accessor_obj->obj_field(fd.offset());
-                if (mh_recv != nullptr && oopDesc::is_oop_or_null(mh_recv) &&
-                    java_lang_invoke_DirectMethodHandle::is_instance(mh_recv)) {
-                  oop mn = java_lang_invoke_DirectMethodHandle::member(mh_recv);
-                  if (mn != nullptr && java_lang_invoke_MemberName::is_instance(mn)) {
-                    Method* tm = (Method*)java_lang_invoke_MemberName::vmtarget(mn);
-                    if (tm != nullptr) {
-                      tgt_class  = tm->method_holder()->name()->as_C_string();
-                      tgt_loader = (uint64_t)(uintptr_t)tm->method_holder()->class_loader_data();
-                      tgt_method = tm->name()->as_C_string();
-                      tgt_desc   = tm->signature()->as_C_string();
-                      tgt_ok = true;
+                oop target_mh = accessor_obj->obj_field(fd.offset());
+                if (target_mh != nullptr && sg_oop_valid(target_mh) &&
+                    java_lang_invoke_MethodHandle::is_instance(target_mh)) {
+                  SgMhWalkResult walk = sg_walk_mh(target_mh, 6);
+                  if (walk.shape == SgMhWalkResult::DIRECT &&
+                      walk.n_targets > 0 && walk.targets[0].valid) {
+                    // Fast path: target is already a DMH (0-param, trivial asType).
+                    tgt_class  = walk.targets[0].klass;
+                    tgt_loader = walk.targets[0].loader_id;
+                    tgt_method = walk.targets[0].method;
+                    tgt_desc   = walk.targets[0].descriptor;
+                    tgt_ok = true;
+                  } else if (walk.shape == SgMhWalkResult::ADAPTER_GRAPH) {
+                    // Adapter path: target is a BMH chain (asType/dropArguments/
+                    // asSpreader).  Walk graph nodes to find the first valid DMH
+                    // — that is the actual reflected method.
+                    for (int ni = 0; ni < walk.n_graph_nodes && !tgt_ok; ni++) {
+                      const SgAdapterNode& gn = walk.graph_nodes[ni];
+                      if (gn.has_target && gn.target.valid) {
+                        tgt_class  = gn.target.klass;
+                        tgt_loader = gn.target.loader_id;
+                        tgt_method = gn.target.method;
+                        tgt_desc   = gn.target.descriptor;
+                        tgt_ok = true;
+                      }
                     }
                   }
                 }
@@ -3404,6 +3934,20 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
           src_bci, src_opcode, src_cp,
           tgt_class, tgt_loader, tgt_method, tgt_desc,
           src_ok, tgt_ok, exact ? nullptr : reason);
+    }
+
+    // ---- Part B: sibling BCI scan ----
+    // Emit diagnostics for all sibling BCIs in the user method that share the
+    // same CP constant pool index but will never trigger resolve_handle_call.
+    // Only for non-reflection, non-jli-internal attributions where we have the
+    // user method available.
+    if (src_ok && src_cp >= 0 && !is_reflection_accessor) {
+      Method* sibling_method = recv_frame_valid  ? recv_frame_method
+                             : (top_frame_valid  ? top.interpreter_frame_method()
+                                                 : nullptr);
+      sg_emit_sibling_bcis(cat, sibling_method, src_bci, primary_recv_local,
+                           src_cp, src_class, src_loader, src_method, src_desc,
+                           primary_arg_slots);
     }
   }
 

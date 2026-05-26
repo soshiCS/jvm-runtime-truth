@@ -316,15 +316,27 @@ bool soroush_graph_target_set_callsite(
 // All string pointers are transient (ResourceMark-allocated or static);
 // the callee sg_strdup's them immediately.
 struct SgAdapterNodeEntry {
-  int         id;          // sequential from 0 (argL-index order)
-  const char* role;        // "adapted_target", "primary_target", "secondary_component", …
-  const char* from_desc;   // outer adapter type descriptor (type_conversion only; null otherwise)
-  const char* to_desc;     // inner component's own descriptor (null if unavailable)
-  const char* klass;       // exact target class slash-form (null if not exact)
-  uint64_t    loader_id;   // CLD pointer (0 if not exact)
-  const char* method;      // exact target method name (null if not exact)
-  const char* descriptor;  // exact target descriptor (null if not exact)
-  bool        exact;       // true = klass/loader_id/method/descriptor all exact
+  int         id;                  // stable ID (unique within this record)
+  const char* role;                // "adapted_target", "primary_target", "nested_argL0", …
+  const char* from_desc;           // outer adapter type descriptor (type_conversion nodes only)
+  const char* to_desc;             // inner component's own descriptor (null if unavailable)
+  const char* klass;               // exact target class slash-form (null if not exact)
+  uint64_t    loader_id;           // CLD pointer (0 if not exact)
+  const char* method;              // exact target method name (null if not exact)
+  const char* descriptor;          // exact target descriptor (null if not exact)
+  const char* node_adapter_class;  // for non-exact BMH nodes: BMH species class name
+  const char* node_classification; // "user_target","helper_adapter","helper_invoker",
+                                   // "helper_boxing","helper_reflection","internal_jdk",
+                                   // "bound_data","unknown"
+  const char* exact_false_reason;  // null when exact=true; reason token otherwise
+  bool        exact;               // true = klass/loader_id/method/descriptor all exact
+};
+
+// One edge in the adapter graph (always "contains" for nested BMH relationships).
+struct SgAdapterEdgeEntry {
+  int         from_id;  // parent node id
+  int         to_id;    // child node id
+  const char* kind;     // "contains"
 };
 
 // Record an adapter graph callsite (asType, filterArguments, foldArguments,
@@ -335,9 +347,10 @@ struct SgAdapterNodeEntry {
 // lf_kind: LambdaForm.Kind.name() string (may be "GENERIC"; null handled).
 // outer_desc: MH type descriptor as presented to the caller (null if unavailable).
 // source_/opcode/cp fields: same semantics as soroush_graph_generic_callsite.
-// nodes[0..n_nodes-1]: adapter component nodes in argL-index order.
-// all_exact: true iff every node with a target is exactly resolved.
-// Deduplicates by (category, src_class, src_method, src_desc, src_bci).
+// nodes[0..n_nodes-1]: adapter component nodes (flat, including nested BMH children).
+// edges[0..n_edges-1]: "contains" edges from BMH parent nodes to nested children.
+// all_exact: true iff every MH-bearing slot at any nesting level is a proven DMH.
+// Deduplicates by (src_class, src_method, src_desc, src_bci).
 // Returns true if stored; false if deduped or dropped (OOM / graph off).
 // No-op when SOROUSH_PROVENANCE_GRAPH=1 is absent.
 bool soroush_graph_adapter_graph_callsite(
@@ -348,6 +361,7 @@ bool soroush_graph_adapter_graph_callsite(
     const char* src_method, const char* src_desc,
     int src_bci, int opcode_byte, int cp_index,
     const SgAdapterNodeEntry* nodes, int n_nodes,
+    const SgAdapterEdgeEntry* edges, int n_edges,
     bool all_exact);
 
 // Semantic JSONL export of runtime target revelation records.
