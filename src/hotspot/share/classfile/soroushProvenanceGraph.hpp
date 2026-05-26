@@ -329,6 +329,11 @@ struct SgAdapterNodeEntry {
                                    // "helper_boxing","helper_reflection","internal_jdk",
                                    // "bound_data","unknown"
   const char* exact_false_reason;  // null when exact=true; reason token otherwise
+  const char* semantic_op;         // proven semantic (null if not provable):
+                                   // "unbox","box","cast","insert_argument","drop_argument",
+                                   // "try_finally_body","try_finally_cleanup","collect_arguments"
+  const char* from_type;           // source type for type-pair ops (null if not applicable)
+  const char* to_type;             // destination type for type-pair ops (null if not applicable)
   bool        exact;               // true = klass/loader_id/method/descriptor all exact
 };
 
@@ -350,6 +355,8 @@ struct SgAdapterEdgeEntry {
 // nodes[0..n_nodes-1]: adapter component nodes (flat, including nested BMH children).
 // edges[0..n_edges-1]: "contains" edges from BMH parent nodes to nested children.
 // all_exact: true iff every MH-bearing slot at any nesting level is a proven DMH.
+// staticizable: true iff callsite can be safely staticized (all_exact && no unknown nodes).
+// staticization_blockers[0..n_blockers-1]: reasons why staticizable=false.
 // Deduplicates by (src_class, src_method, src_desc, src_bci).
 // Returns true if stored; false if deduped or dropped (OOM / graph off).
 // No-op when SOROUSH_PROVENANCE_GRAPH=1 is absent.
@@ -362,7 +369,9 @@ bool soroush_graph_adapter_graph_callsite(
     int src_bci, int opcode_byte, int cp_index,
     const SgAdapterNodeEntry* nodes, int n_nodes,
     const SgAdapterEdgeEntry* edges, int n_edges,
-    bool all_exact);
+    bool all_exact,
+    bool staticizable,
+    const char** staticization_blockers, int n_blockers);
 
 // Semantic JSONL export of runtime target revelation records.
 // Called at VM shutdown from before_exit when SOROUSH_EXPORT_RUNTIME_TARGETS

@@ -2808,8 +2808,15 @@ struct SgAdapterNode {
   const char* node_classification;// "user_target","helper_adapter","helper_invoker","helper_boxing",
                                   // "helper_reflection","internal_jdk","bound_data","unknown"
   const char* exact_false_reason; // null when exact=true; reason string otherwise
+  const char* semantic_op;        // proven semantic: "unbox","box","cast","insert_argument",
+                                  // "drop_argument","try_finally_body","try_finally_cleanup",
+                                  // "collect_arguments"; null if not provable
+  const char* from_type;          // source type for type-pair ops (points into from_type_buf)
+  const char* to_type;            // destination type for type-pair ops (points into to_type_buf)
   SgMhTarget  target;             // valid when has_target == true
   bool        has_target;
+  char        from_type_buf[64];  // storage for dynamic from_type string
+  char        to_type_buf[64];    // storage for dynamic to_type string
 };
 
 // SgAdapterEdge: directed edge "parent contains child" in the nested BMH graph.
@@ -2848,6 +2855,9 @@ struct SgMhWalkResult {
   const char*   graph_kind;      // "type_conversion", "dual_target", "multi_target", …
   const char*   outer_desc;      // MH type descriptor as presented to the caller
   bool          graph_all_exact;
+  bool          staticizable;              // true iff all user targets exact & no unknown nodes
+  int           n_staticization_blockers;
+  char          staticization_blockers[8][64];
   char          graph_diag[192]; // non-empty when extraction partially or fully failed
 };
 
@@ -3022,6 +3032,105 @@ static const char* sg_nested_role(int index) {
   return (index >= 0 && index < 8) ? nested_roles[index] : "nested_argLN";
 }
 
+// ---------------------------------------------------------------------------
+// Semantic lowering helpers
+// ---------------------------------------------------------------------------
+
+static int sg_desc_arg_count(const char* desc) {
+  if (!desc || desc[0] != '(') return -1;
+  int count = 0;
+  const char* p = desc + 1;
+  while (*p && *p != ')') {
+    while (*p == '[') p++;
+    if (*p == 'L') {
+      count++;
+      while (*p && *p != ';') p++;
+      if (*p == ';') p++;
+    } else if (*p && *p != ')') {
+      count++;
+      p++;
+    }
+  }
+  return count;
+}
+
+static void sg_node_infer_semantic_type_conv(SgAdapterNode* node) {
+  const char* from_desc = node->from_desc;
+  const char* to_desc   = node->to_desc;
+  if (!from_desc || !to_desc) return;
+  int from_argc = sg_desc_arg_count(from_desc);
+  int to_argc   = sg_desc_arg_count(to_desc);
+  if (from_argc < 0 || to_argc < 0) return;
+  if (to_argc > from_argc) { node->semantic_op = "insert_argument"; return; }
+  if (from_argc > to_argc) { node->semantic_op = "drop_argument";   return; }
+
+  static const struct {
+    const char* prim;
+    const char* prim_name;
+    const char* boxed_desc;
+    const char* boxed_class;
+  } kBoxPairs[] = {
+    { "I", "int",     "Ljava/lang/Integer;",   "java/lang/Integer"   },
+    { "J", "long",    "Ljava/lang/Long;",      "java/lang/Long"      },
+    { "D", "double",  "Ljava/lang/Double;",    "java/lang/Double"    },
+    { "F", "float",   "Ljava/lang/Float;",     "java/lang/Float"     },
+    { "Z", "boolean", "Ljava/lang/Boolean;",   "java/lang/Boolean"   },
+    { "B", "byte",    "Ljava/lang/Byte;",      "java/lang/Byte"      },
+    { "S", "short",   "Ljava/lang/Short;",     "java/lang/Short"     },
+    { "C", "char",    "Ljava/lang/Character;", "java/lang/Character" },
+    { nullptr, nullptr, nullptr, nullptr }
+  };
+
+  const char* fd = from_desc + 1;
+  const char* td = to_desc   + 1;
+  for (int pi = 0; kBoxPairs[pi].prim != nullptr; pi++) {
+    size_t blen = strlen(kBoxPairs[pi].boxed_desc);
+    if (strncmp(fd, kBoxPairs[pi].boxed_desc, blen) == 0 && td[0] == kBoxPairs[pi].prim[0]) {
+      node->semantic_op = "unbox";
+      snprintf(node->from_type_buf, sizeof(node->from_type_buf), "%s", kBoxPairs[pi].boxed_class);
+      snprintf(node->to_type_buf,   sizeof(node->to_type_buf),   "%s", kBoxPairs[pi].prim_name);
+      node->from_type = node->from_type_buf;
+      node->to_type   = node->to_type_buf;
+      return;
+    }
+    if (fd[0] == kBoxPairs[pi].prim[0] && strncmp(td, kBoxPairs[pi].boxed_desc, blen) == 0) {
+      node->semantic_op = "box";
+      snprintf(node->from_type_buf, sizeof(node->from_type_buf), "%s", kBoxPairs[pi].prim_name);
+      snprintf(node->to_type_buf,   sizeof(node->to_type_buf),   "%s", kBoxPairs[pi].boxed_class);
+      node->from_type = node->from_type_buf;
+      node->to_type   = node->to_type_buf;
+      return;
+    }
+  }
+  node->semantic_op = "cast";
+}
+
+static void sg_compute_node_semantic(SgAdapterNode* node,
+                                     const char* lf_kind,
+                                     const char* graph_kind) {
+  if (!node) return;
+  node->semantic_op = nullptr;
+  node->from_type   = nullptr;
+  node->to_type     = nullptr;
+  const char* lf   = lf_kind   ? lf_kind   : "";
+  const char* gk   = graph_kind ? graph_kind : "";
+  const char* role = node->role  ? node->role  : "";
+  if (strcmp(lf, "TRY_FINALLY") == 0) {
+    if      (strcmp(role, "target")  == 0) node->semantic_op = "try_finally_body";
+    else if (strcmp(role, "cleanup") == 0) node->semantic_op = "try_finally_cleanup";
+    return;
+  }
+  if (strcmp(lf, "COLLECTOR") == 0) {
+    node->semantic_op = "collect_arguments";
+    return;
+  }
+  if (strcmp(gk, "type_conversion") == 0) {
+    sg_node_infer_semantic_type_conv(node);
+    return;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Recursively descend into a nested BMH, appending child nodes and "contains"
 // edges to r.  parent_id is the node id whose slot contains this BMH.
 // visited[0..n_visited-1] prevents infinite loops on cyclic MH graphs.
@@ -3261,6 +3370,26 @@ static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
   else if (mh_count == 1)                   r.graph_kind = "type_conversion";
   else if (mh_count == 2)                   r.graph_kind = "dual_target";
   else                                      r.graph_kind = "multi_target";
+
+  for (int si = 0; si < r.n_graph_nodes; si++) {
+    sg_compute_node_semantic(&r.graph_nodes[si], lf, r.graph_kind);
+  }
+
+  r.staticizable = all_exact;
+  r.n_staticization_blockers = 0;
+  if (!all_exact) {
+    snprintf(r.staticization_blockers[r.n_staticization_blockers++],
+             sizeof(r.staticization_blockers[0]), "inexact_target");
+  }
+  for (int si = 0; si < r.n_graph_nodes; si++) {
+    const char* cls = r.graph_nodes[si].node_classification;
+    if (cls && strcmp(cls, "unknown") == 0 && r.n_staticization_blockers < 8) {
+      r.staticizable = false;
+      snprintf(r.staticization_blockers[r.n_staticization_blockers++],
+               sizeof(r.staticization_blockers[0]),
+               "unknown_node_%d", r.graph_nodes[si].id);
+    }
+  }
 
   r.graph_all_exact = all_exact;
   r.shape = SgMhWalkResult::ADAPTER_GRAPH;
@@ -3865,6 +3994,9 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 node_entries[i].node_adapter_class = walk.graph_nodes[i].node_adapter_class;
                 node_entries[i].node_classification= walk.graph_nodes[i].node_classification;
                 node_entries[i].exact_false_reason = walk.graph_nodes[i].exact_false_reason;
+                node_entries[i].semantic_op        = walk.graph_nodes[i].semantic_op;
+                node_entries[i].from_type          = walk.graph_nodes[i].from_type;
+                node_entries[i].to_type            = walk.graph_nodes[i].to_type;
                 if (walk.graph_nodes[i].has_target) {
                   node_entries[i].klass      = walk.graph_nodes[i].target.klass;
                   node_entries[i].loader_id  = walk.graph_nodes[i].target.loader_id;
@@ -3881,12 +4013,16 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 edge_entries[i].to_id   = walk.graph_edges[i].to_id;
                 edge_entries[i].kind    = walk.graph_edges[i].kind;
               }
+              const char* sblk[8] = {};
+              for (int bi = 0; bi < walk.n_staticization_blockers && bi < 8; bi++)
+                sblk[bi] = walk.staticization_blockers[bi];
               if (soroush_graph_adapter_graph_callsite(
                 cat,
                 walk.adapter_class, walk.graph_kind, walk.lf_kind, walk.outer_desc,
                 src_class, src_loader, src_method, src_desc,
                 src_bci, src_opcode, src_cp,
-                node_entries, ne, edge_entries, nee, walk.graph_all_exact)) {
+                node_entries, ne, edge_entries, nee, walk.graph_all_exact,
+                walk.staticizable, sblk, walk.n_staticization_blockers)) {
                 multi_target_emitted = true;
               } else {
                 snprintf(adapter_diag, sizeof(adapter_diag), "record_storage_oom");

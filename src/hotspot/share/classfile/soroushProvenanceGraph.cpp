@@ -215,6 +215,9 @@ struct SgAgNode {
   char*    node_adapter_class;
   char*    node_classification;
   char*    exact_false_reason;
+  char*    semantic_op;   // null if not provable
+  char*    from_type;     // null unless semantic_op is a type-pair op
+  char*    to_type;       // null unless semantic_op is a type-pair op
   bool     exact;
 };
 
@@ -242,6 +245,9 @@ struct SgAgCallsite {
   int      n_edges;
   SgAgEdge edges[SG_AG_MAX_EDGES];
   bool     all_exact;
+  bool     staticizable;
+  char*    staticization_blockers[8];
+  int      n_staticization_blockers;
   uint32_t hash;
   struct SgAgCallsite* next;
 };
@@ -614,7 +620,9 @@ bool soroush_graph_adapter_graph_callsite(
     int src_bci, int opcode_byte, int cp_index,
     const SgAdapterNodeEntry* nodes, int n_nodes,
     const SgAdapterEdgeEntry* edges, int n_edges,
-    bool all_exact) {
+    bool all_exact,
+    bool staticizable,
+    const char** staticization_blockers, int n_blockers) {
   if (!soroush_graph_enabled()) return false;
   if (nodes == nullptr || n_nodes <= 0 || n_nodes > SG_AG_MAX_NODES) return false;
 
@@ -659,7 +667,16 @@ bool soroush_graph_adapter_graph_callsite(
   n->src_bci       = src_bci;
   n->opcode_byte   = opcode_byte;
   n->cp_index      = cp_index;
-  n->all_exact     = all_exact;
+  n->all_exact               = all_exact;
+  n->staticizable            = staticizable;
+  n->n_staticization_blockers = 0;
+  if (staticization_blockers != nullptr) {
+    int nb = (n_blockers < 8) ? n_blockers : 8;
+    for (int i = 0; i < nb; i++) {
+      n->staticization_blockers[i] = sg_strdup(staticization_blockers[i]);
+      if (n->staticization_blockers[i]) n->n_staticization_blockers++;
+    }
+  }
   n->n_nodes       = (n_nodes <= SG_AG_MAX_NODES) ? n_nodes : SG_AG_MAX_NODES;
 
   for (int i = 0; i < n->n_nodes; i++) {
@@ -674,6 +691,9 @@ bool soroush_graph_adapter_graph_callsite(
     n->nodes[i].node_adapter_class = sg_strdup(nodes[i].node_adapter_class);
     n->nodes[i].node_classification= sg_strdup(nodes[i].node_classification);
     n->nodes[i].exact_false_reason = sg_strdup(nodes[i].exact_false_reason);
+    n->nodes[i].semantic_op        = sg_strdup(nodes[i].semantic_op);
+    n->nodes[i].from_type          = sg_strdup(nodes[i].from_type);
+    n->nodes[i].to_type            = sg_strdup(nodes[i].to_type);
     n->nodes[i].exact              = nodes[i].exact;
   }
 
@@ -2045,6 +2065,18 @@ void soroush_graph_export_runtime_targets(const char* path) {
               fprintf(f, ",\"exact_false_reason\":");
               sg_json_str(f, n->exact_false_reason);
             }
+            if (n->semantic_op) {
+              fprintf(f, ",\"semantic_op\":");
+              sg_json_str(f, n->semantic_op);
+            }
+            if (n->from_type) {
+              fprintf(f, ",\"from_type\":");
+              sg_json_str(f, n->from_type);
+            }
+            if (n->to_type) {
+              fprintf(f, ",\"to_type\":");
+              sg_json_str(f, n->to_type);
+            }
             if (n->exact && n->klass) {
               fprintf(f, ",\"class\":");
               sg_json_str(f, n->klass);
@@ -2070,6 +2102,15 @@ void soroush_graph_export_runtime_targets(const char* path) {
                       c->edges[i].from_id, c->edges[i].to_id);
               sg_json_str(f, c->edges[i].kind);
               fprintf(f, "}");
+            }
+            fprintf(f, "]");
+          }
+          fprintf(f, ",\"staticizable\":%s", c->staticizable ? "true" : "false");
+          if (c->n_staticization_blockers > 0) {
+            fprintf(f, ",\"staticization_blockers\":[");
+            for (int i = 0; i < c->n_staticization_blockers; i++) {
+              if (i > 0) fprintf(f, ",");
+              sg_json_str(f, c->staticization_blockers[i]);
             }
             fprintf(f, "]");
           }
