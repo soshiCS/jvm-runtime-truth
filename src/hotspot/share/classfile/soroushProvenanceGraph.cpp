@@ -1565,6 +1565,7 @@ void soroush_graph_export_runtime_targets(const char* path) {
   fprintf(stderr, "[JVM EXPORT] writing runtime targets to %s\n", path);
 
   long mi_count = 0, ct_count = 0, rt_count = 0, gc_count = 0, ba_count = 0, diag_count = 0;
+  bool write_ok = true; // set false if any fprintf write fails (ferror)
 
   // -------------------------------------------------------------------------
   // Phase 1: method_identity records from the token registry.
@@ -1606,6 +1607,8 @@ void soroush_graph_export_runtime_targets(const char* path) {
             tok->artifact_crc);
     mi_count++;
   }
+
+  if (ferror(f)) write_ok = false;
 
   // -------------------------------------------------------------------------
   // Phase 2: callsite_target records from the indy callsite side table.
@@ -1680,6 +1683,8 @@ void soroush_graph_export_runtime_targets(const char* path) {
       ct_count++;
     }
   }
+
+  if (ferror(f)) write_ok = false;
 
   // -------------------------------------------------------------------------
   // Phase 3: generic callsite_target / diagnostic records from the
@@ -1874,6 +1879,8 @@ void soroush_graph_export_runtime_targets(const char* path) {
 #undef SG_DEDUP_BKTS
   }
 
+  if (ferror(f)) write_ok = false;
+
   // -------------------------------------------------------------------------
   // Phase 3.5: callsite_target_set records from the multi-target MH side table
   // (g_ts_buckets).  Each record is a guardWithTest or catchException callsite
@@ -1952,6 +1959,8 @@ void soroush_graph_export_runtime_targets(const char* path) {
       }
     }
   }
+
+  if (ferror(f)) write_ok = false;
 
   // -------------------------------------------------------------------------
   // Phase 3.6: callsite_adapter_graph records from the GENERIC/named BMH
@@ -2068,6 +2077,8 @@ void soroush_graph_export_runtime_targets(const char* path) {
       }
     }
   }
+
+  if (ferror(f)) write_ok = false;
 
   // -------------------------------------------------------------------------
   // Phase 4-7: graph-derived records.
@@ -2377,18 +2388,27 @@ void soroush_graph_export_runtime_targets(const char* path) {
   } // end graph_enabled branch
 
 sg_export_summary:
+  if (ferror(f)) write_ok = false;
   fprintf(f, "{\"record\":\"export_summary\","
           "\"method_identity_count\":%ld,"
           "\"callsite_target_count\":%ld,"
           "\"runtime_target_count\":%ld,"
           "\"generated_class_count\":%ld,"
           "\"bytecode_artifact_count\":%ld,"
-          "\"diagnostic_count\":%ld}\n",
-          mi_count, ct_count, rt_count, gc_count, ba_count, diag_count);
+          "\"diagnostic_count\":%ld,"
+          "\"complete\":%s}\n",
+          mi_count, ct_count, rt_count, gc_count, ba_count, diag_count,
+          write_ok ? "true" : "false");
   fclose(f);
+  if (!write_ok) {
+    fprintf(stderr,
+            "[JVM EXPORT] WARNING: write error(s) occurred — output at %s is INCOMPLETE\n",
+            path);
+  }
   fprintf(stderr,
-          "[JVM EXPORT] done: %s"
+          "[JVM EXPORT] %s: %s"
           " (method_identity=%ld callsite_target=%ld runtime_target=%ld"
           " generated_class=%ld bytecode_artifact=%ld diagnostic=%ld)\n",
+          write_ok ? "done" : "INCOMPLETE",
           path, mi_count, ct_count, rt_count, gc_count, ba_count, diag_count);
 }

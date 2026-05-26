@@ -3782,12 +3782,15 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 entries[i].valid      = walk.targets[i].valid;
               }
               const char* shape_str = (walk.shape == SgMhWalkResult::GWT) ? "GWT" : "GWC";
-              soroush_graph_target_set_callsite(
+              if (soroush_graph_target_set_callsite(
                   cat, shape_str, walk.adapter_class, walk.lf_kind, walk.aux_info,
                   src_class, src_loader, src_method, src_desc,
                   src_bci, src_opcode, src_cp,
-                  entries, walk.n_targets);
-              multi_target_emitted = true;
+                  entries, walk.n_targets)) {
+                multi_target_emitted = true;
+              } else {
+                snprintf(adapter_diag, sizeof(adapter_diag), "record_storage_oom");
+              }
             } else if (walk.shape == SgMhWalkResult::ADAPTER_GRAPH) {
               // GENERIC/named BMH: adapter graph extracted.
               SgAdapterNodeEntry node_entries[16];
@@ -3817,13 +3820,16 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 edge_entries[i].to_id   = walk.graph_edges[i].to_id;
                 edge_entries[i].kind    = walk.graph_edges[i].kind;
               }
-              soroush_graph_adapter_graph_callsite(
+              if (soroush_graph_adapter_graph_callsite(
                 cat,
                 walk.adapter_class, walk.graph_kind, walk.lf_kind, walk.outer_desc,
                 src_class, src_loader, src_method, src_desc,
                 src_bci, src_opcode, src_cp,
-                node_entries, ne, edge_entries, nee, walk.graph_all_exact);
-              multi_target_emitted = true;
+                node_entries, ne, edge_entries, nee, walk.graph_all_exact)) {
+                multi_target_emitted = true;
+              } else {
+                snprintf(adapter_diag, sizeof(adapter_diag), "record_storage_oom");
+              }
             } else {
               // BMH_UNKNOWN / MH_UNKNOWN: shape not recognised or extraction failed.
               const char* ac = walk.adapter_class ? walk.adapter_class : "unknown";
@@ -3929,11 +3935,14 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
               ? "reflection_target_adapter_mh_deferred"
               : "runtime_receiver_not_direct_mh_deferred");
       }
-      soroush_graph_generic_callsite(cat,
+      if (!soroush_graph_generic_callsite(cat,
           src_class, src_loader, src_method, src_desc,
           src_bci, src_opcode, src_cp,
           tgt_class, tgt_loader, tgt_method, tgt_desc,
-          src_ok, tgt_ok, exact ? nullptr : reason);
+          src_ok, tgt_ok, exact ? nullptr : reason)) {
+        fprintf(stderr, "[soroush] record_storage_oom: generic callsite lost src=%s.%s bci=%d\n",
+                src_class ? src_class : "?", src_method ? src_method : "?", src_bci);
+      }
     }
 
     // ---- Part B: sibling BCI scan ----
