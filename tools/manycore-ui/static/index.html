@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ManyCore UI — Runtime Target Explorer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ── Navbar ──────────────────────────────────────────────────────────── -->
+<nav id="navbar">
+  <span class="logo">🔬 ManyCore</span>
+  <div class="run-controls">
+    <select id="run-selector"><option value="">— select run —</option></select>
+    <span id="run-status-badge"></span>
+  </div>
+  <span class="spacer"></span>
+  <span id="run-stats-label" class="run-stats"></span>
+  <button class="btn-ghost btn-sm" id="btn-diags" disabled>Diagnostics</button>
+  <button class="btn-ghost btn-sm" id="btn-validate" disabled>Validate</button>
+  <button class="btn-ghost btn-sm" id="btn-output" disabled>Output</button>
+  <div class="export-wrap">
+    <button class="btn-ghost btn-sm" id="btn-export" disabled>⬇ Export</button>
+    <div class="export-menu hidden" id="export-menu">
+      <button id="btn-dl-jsonl">Download JSONL</button>
+      <button id="btn-dl-artifacts">Download artifacts.zip</button>
+      <button id="btn-dl-full">Download full run.zip</button>
+    </div>
+  </div>
+  <button class="btn-primary btn-sm" id="btn-new-run">▶ New Run</button>
+</nav>
+
+<!-- ── 3-panel layout ──────────────────────────────────────────────────── -->
+<div id="main-layout">
+
+  <!-- Left: class list -->
+  <div class="panel" id="left-panel">
+    <div class="panel-header">
+      <span class="title">Classes</span>
+      <input id="class-filter" type="text" placeholder="filter…">
+    </div>
+    <div class="panel-body" id="class-list">
+      <div class="empty-state"><span class="icon">📂</span>Start a run to see classes</div>
+    </div>
+  </div>
+
+  <!-- Middle: methods + callsites -->
+  <div class="panel" id="middle-panel">
+    <div class="panel-header">
+      <span class="title" id="middle-title">Select a class</span>
+    </div>
+    <div class="panel-body" id="callsite-list">
+      <div class="empty-state"><span class="icon">🔍</span>Select a class to see callsites</div>
+    </div>
+  </div>
+
+  <!-- Right: target + bytecode -->
+  <div class="panel" id="right-panel">
+    <div class="panel-header">
+      <span class="title" id="right-title">Select a callsite</span>
+      <div class="right-tabs">
+        <button class="tab-btn active" data-tab="targets">Targets</button>
+        <button class="tab-btn" data-tab="bytecode">Bytecode</button>
+      </div>
+    </div>
+    <div id="targets-view"  class="tab-content active">
+      <div class="empty-state"><span class="icon">🎯</span>Select a callsite to see its targets</div>
+    </div>
+    <div id="bytecode-view" class="tab-content">
+      <div class="empty-state"><span class="icon">📄</span>Click "View Bytecode" on a target</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Run form modal ──────────────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="run-modal">
+  <div class="modal-box">
+    <h2>New Run</h2>
+
+    <div class="form-row">
+      <label>JAR file *</label>
+      <input type="file" id="jar-input" accept=".jar">
+    </div>
+
+    <div class="form-row">
+      <label>Run mode</label>
+      <div class="radio-group">
+        <label><input type="radio" name="run-mode" value="java-jar" checked> java -jar</label>
+        <label><input type="radio" name="run-mode" value="main-class"> main class</label>
+      </div>
+    </div>
+
+    <div class="form-row" id="main-class-row" style="display:none">
+      <label>Main class</label>
+      <input type="text" id="main-class-input" placeholder="com.example.Main">
+    </div>
+
+    <div class="form-two-col">
+      <div class="form-row">
+        <label>Program args</label>
+        <input type="text" id="prog-args-input" placeholder="arg1 arg2">
+      </div>
+      <div class="form-row">
+        <label>Timeout (seconds)</label>
+        <input type="number" id="timeout-input" value="60" min="1" max="600">
+      </div>
+    </div>
+
+    <div class="form-row">
+      <label>JVM args</label>
+      <input type="text" id="jvm-args-input" placeholder="-Xmx512m -ea">
+      <div class="hint">Space-separated. -Xint and -Xverify:all are added automatically.</div>
+    </div>
+
+    <div class="form-row">
+      <label>Extra classpath entries (dependency JARs)</label>
+      <input type="text" id="extra-cp-input" placeholder="/path/dep1.jar:/path/dep2.jar">
+    </div>
+
+    <div class="form-row">
+      <label>Environment variables</label>
+      <textarea id="env-vars-input" placeholder="KEY=VALUE&#10;ANOTHER=VALUE"></textarea>
+    </div>
+
+    <div class="form-row">
+      <label>User/App prefixes <span style="font-weight:400;color:#94a3b8">(optional)</span></label>
+      <textarea id="user-prefixes-input" placeholder="com/example&#10;org/myapp" style="min-height:70px"></textarea>
+      <div class="hint">One prefix per line (or comma-separated, slash-notation). Sets rewriter scope, APP badge in class list, and export filtering. Leave blank to instrument all classes.</div>
+    </div>
+
+    <div class="form-row">
+      <label>Working directory (optional)</label>
+      <input type="text" id="working-dir-input" placeholder="leave blank to use run dir">
+    </div>
+
+    <div class="section-title">Advanced</div>
+
+    <div class="form-row">
+      <label>Max MH walk depth <span style="font-weight:400;color:#94a3b8">(optional)</span></label>
+      <input type="number" id="mh-depth-input" placeholder="default" min="1" max="50" style="width:120px">
+      <div class="hint">Maximum MethodHandle adapter chain walk depth. Leave blank for default.</div>
+    </div>
+
+    <div class="form-two-col">
+      <div class="form-row">
+        <label>Custom JDK path</label>
+        <input type="text" id="jdk-path-input"
+          placeholder="/Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk">
+        <div class="hint">Leave blank to use default.</div>
+      </div>
+      <div class="form-row">
+        <label>javap path</label>
+        <input type="text" id="javap-path-input"
+          placeholder="…/jdk/bin/javap">
+        <div class="hint">Leave blank to use default.</div>
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button class="btn-ghost" id="run-modal-cancel">Cancel</button>
+      <button class="btn-primary" id="run-modal-submit">▶ Run</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Validate modal ──────────────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="validate-modal">
+  <div class="modal-box">
+    <h2>Validation</h2>
+    <div id="validate-content"><div class="loading"><span class="spinner"></span> running checks…</div></div>
+    <div class="form-actions">
+      <button class="btn-ghost" id="validate-modal-close">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Output modal (stdout/stderr) ────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="output-modal">
+  <div class="modal-box" style="width:800px">
+    <h2>Run Output</h2>
+    <div class="section-title">stdout</div>
+    <pre class="output-pre" id="stdout-content">…</pre>
+    <div class="section-title">stderr (last 500 lines)</div>
+    <pre class="output-pre" id="stderr-content">…</pre>
+    <div class="form-actions">
+      <button class="btn-ghost" id="output-modal-close">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Diagnostics modal ───────────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="diag-modal">
+  <div class="modal-box" style="width:760px">
+    <h2>Diagnostics</h2>
+    <div id="diag-content"><div class="loading">loading…</div></div>
+    <div class="form-actions">
+      <button class="btn-ghost" id="diag-modal-close">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
