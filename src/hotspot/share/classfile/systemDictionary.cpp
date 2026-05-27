@@ -95,6 +95,13 @@
 #include "jfr/jfr.hpp"
 #endif
 
+// Forward declaration: bootstrap-time CAG walk, implemented in linkResolver.cpp.
+// Walks target_mh and emits callsite_adapter_graph (or callsite_target_set).
+void soroush_emit_indy_cag_at_bootstrap(oop target_mh,
+    const char* src_class, uint64_t src_loader,
+    const char* src_method, const char* src_desc,
+    int src_bci, int src_cp);
+
 class InvokeMethodKey : public StackObj {
   private:
     Symbol* _symbol;
@@ -2845,6 +2852,44 @@ void SystemDictionary::invoke_bootstrap_method(BootstrapInfo& bootstrap_specifie
                                                 &appendix, CHECK);
     methodHandle mh(THREAD, method);
     bootstrap_specifier.set_resolved_method(mh, appendix);
+
+    // Bootstrap-time CAG emission: walk the ConstantCallSite target MH now.
+    // This fires once per callsite, independent of LambdaForm sharing (which
+    // prevents resolve_handle_call from firing for sites sharing an already-linked LF).
+    if (soroush_graph_enabled() && trace_id > 0) {
+      oop cs_target = nullptr;
+      if (appendix.not_null() && java_lang_invoke_CallSite::is_instance(appendix()))
+        cs_target = java_lang_invoke_CallSite::target(appendix());
+      else if (appendix.not_null() && java_lang_invoke_MethodHandle::is_instance(appendix()))
+        cs_target = appendix();
+      if (cs_target != nullptr) {
+        ResourceMark rm_cag(THREAD);
+        const char* cag_src_class = bootstrap_specifier.caller()->name()->as_C_string();
+        uint64_t    cag_loader    = 0;
+        {
+          ClassLoaderData* cld = bootstrap_specifier.caller()->class_loader_data();
+          if (cld != nullptr) cag_loader = (uint64_t)(uintptr_t)cld;
+        }
+        const char* cag_method = nullptr;
+        const char* cag_desc   = nullptr;
+        int         cag_bci    = -1;
+        if (THREAD->has_last_Java_frame()) {
+          frame cag_frame = THREAD->last_frame();
+          if (cag_frame.is_interpreted_frame()) {
+            Method* caller_m = cag_frame.interpreter_frame_method();
+            if (caller_m != nullptr) {
+              cag_method = caller_m->name()->as_C_string();
+              cag_desc   = caller_m->signature()->as_C_string();
+              cag_bci    = cag_frame.interpreter_frame_bci();
+            }
+          }
+        }
+        soroush_emit_indy_cag_at_bootstrap(
+            cs_target,
+            cag_src_class, cag_loader, cag_method, cag_desc,
+            cag_bci, bootstrap_specifier.bss_index());
+      }
+    }
 
     if (trace_indy) {
       ResourceMark rm(THREAD);

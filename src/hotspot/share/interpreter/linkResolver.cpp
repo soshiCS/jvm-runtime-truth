@@ -4463,3 +4463,91 @@ void LinkResolver::throw_abstract_method_error(const methodHandle& resolved_meth
 
   THROW_MSG(vmSymbols::java_lang_AbstractMethodError(), ss.as_string());
 }
+
+// Bootstrap-time CAG emission: called from SystemDictionary::invoke_bootstrap_method
+// immediately after linkCallSite returns, to emit callsite_adapter_graph (or
+// callsite_target_set) for every invokedynamic site regardless of LambdaForm sharing.
+// The hook in resolve_handle_call fires only once per LambdaForm object; sites that
+// share a LambdaForm with an earlier site never trigger it.  Walking the MH here at
+// bootstrap time fires once per callsite unconditionally.
+void soroush_emit_indy_cag_at_bootstrap(oop target_mh,
+    const char* src_class, uint64_t src_loader,
+    const char* src_method, const char* src_desc,
+    int src_bci, int src_cp) {
+  if (!soroush_graph_enabled() || !sg_oop_valid(target_mh)) return;
+
+  SgMhWalkResult walk = sg_walk_mh(target_mh, 6);
+
+  const char* cat    = "invokedynamic";
+  const int   opcode = 186;  // invokedynamic bytecode
+
+  if (walk.shape == SgMhWalkResult::ADAPTER_GRAPH) {
+    SgAdapterNodeEntry node_entries[16];
+    memset(node_entries, 0, sizeof(node_entries));
+    int ne = (walk.n_graph_nodes < 16) ? walk.n_graph_nodes : 16;
+    for (int i = 0; i < ne; i++) {
+      node_entries[i].id                  = walk.graph_nodes[i].id;
+      node_entries[i].role                = walk.graph_nodes[i].role;
+      node_entries[i].from_desc           = walk.graph_nodes[i].from_desc;
+      node_entries[i].to_desc             = walk.graph_nodes[i].to_desc;
+      node_entries[i].node_adapter_class  = walk.graph_nodes[i].node_adapter_class;
+      node_entries[i].node_classification = walk.graph_nodes[i].node_classification;
+      node_entries[i].exact_false_reason  = walk.graph_nodes[i].exact_false_reason;
+      node_entries[i].semantic_op         = walk.graph_nodes[i].semantic_op;
+      node_entries[i].from_type           = walk.graph_nodes[i].from_type;
+      node_entries[i].to_type             = walk.graph_nodes[i].to_type;
+      if (walk.graph_nodes[i].has_target) {
+        node_entries[i].klass      = walk.graph_nodes[i].target.klass;
+        node_entries[i].loader_id  = walk.graph_nodes[i].target.loader_id;
+        node_entries[i].method     = walk.graph_nodes[i].target.method;
+        node_entries[i].descriptor = walk.graph_nodes[i].target.descriptor;
+        node_entries[i].exact      = true;
+      }
+    }
+    SgAdapterEdgeEntry edge_entries[16];
+    memset(edge_entries, 0, sizeof(edge_entries));
+    int nee = (walk.n_graph_edges < 16) ? walk.n_graph_edges : 16;
+    for (int i = 0; i < nee; i++) {
+      edge_entries[i].from_id = walk.graph_edges[i].from_id;
+      edge_entries[i].to_id   = walk.graph_edges[i].to_id;
+      edge_entries[i].kind    = walk.graph_edges[i].kind;
+    }
+    const char* sblk[8] = {};
+    for (int bi = 0; bi < walk.n_staticization_blockers && bi < 8; bi++)
+      sblk[bi] = walk.staticization_blockers[bi];
+    soroush_graph_adapter_graph_callsite(
+        cat,
+        walk.adapter_class, walk.graph_kind, walk.lf_kind, walk.outer_desc,
+        src_class, src_loader, src_method, src_desc,
+        src_bci, opcode, src_cp,
+        node_entries, ne, edge_entries, nee,
+        walk.graph_all_exact, walk.staticizable,
+        sblk, walk.n_staticization_blockers);
+  } else if ((walk.shape == SgMhWalkResult::GWT ||
+              walk.shape == SgMhWalkResult::GWC) && walk.all_exact) {
+    SgMhTargetEntry entries[4];
+    memset(entries, 0, sizeof(entries));
+    for (int i = 0; i < walk.n_targets && i < 4; i++) {
+      entries[i].klass      = walk.targets[i].klass;
+      entries[i].loader_id  = walk.targets[i].loader_id;
+      entries[i].method     = walk.targets[i].method;
+      entries[i].descriptor = walk.targets[i].descriptor;
+      entries[i].role       = walk.roles[i];
+      entries[i].valid      = walk.targets[i].valid;
+    }
+    const char* shape_str  = (walk.shape == SgMhWalkResult::GWT) ? "GWT" : "GWC";
+    const char* sem_op     = (walk.shape == SgMhWalkResult::GWT)
+                             ? "guard_with_test" : "catch_exception";
+    bool ts_static = walk.all_exact;
+    const char* ts_blk[1] = {};
+    int ts_n_blk = 0;
+    if (!walk.all_exact) ts_blk[ts_n_blk++] = "inexact_target";
+    soroush_graph_target_set_callsite(
+        cat, shape_str, walk.adapter_class, walk.lf_kind, walk.aux_info,
+        src_class, src_loader, src_method, src_desc,
+        src_bci, opcode, src_cp,
+        sem_op, ts_static, ts_blk, ts_n_blk,
+        entries, walk.n_targets);
+  }
+  // DIRECT shapes already covered by the callsite_target record — no-op here.
+}
