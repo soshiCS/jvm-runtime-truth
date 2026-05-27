@@ -142,11 +142,18 @@ void soroush_graph_indy_callsite(int trace_id,
                                  int src_bss_index,        // bootstrap specifier CP index
                                  const char* indy_name,    // invokedynamic site name
                                  const char* indy_sig,     // invokedynamic site signature
-                                 const char* bootstrap,    // bootstrap method identity
+                                 const char* bootstrap,    // bootstrap method identity (CP-derived)
                                  const char* lmf_impl_cls, // LMF impl class  (null if not LMF)
                                  const char* lmf_impl_mth, // LMF impl method (null if not LMF)
                                  const char* lmf_impl_dsc, // LMF impl desc   (null if not LMF)
-                                 bool frame_captured);     // false → compiled frame
+                                 const char* semantic_op,             // "string_concat" or null
+                                 const char* string_concat_recipe,    // SCF recipe arg (null if not SCF)
+                                 const char* string_concat_constants, // SCF constants JSON array (null if absent)
+                                 bool reconstructable,                 // true when recipe+constants both captured (SCF only)
+                                 bool staticizable,                    // true if fully staticizable
+                                 const char** staticization_blockers,  // blocker reason tokens (may be null)
+                                 int n_blockers,                       // count of blockers
+                                 bool frame_captured);        // false → compiled frame
 
 // Exact source callsite record for reflection and MethodHandle invocations.
 //

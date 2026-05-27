@@ -13,6 +13,7 @@ const S = {
   selectedIdx:     null,      // callsite idx
   activeTab:       "targets", // "targets" | "bytecode"
   userPrefixes:    [],        // from run config, used for APP badge + diag classification
+  showHelperNodes: false,     // toggle: show nodes with no bytecode artifact
 };
 
 // ── API helpers ───────────────────────────────────────────────────────────
@@ -36,6 +37,7 @@ document.addEventListener("DOMContentLoaded", () => {
   wireRunForm();
   wireTabs();
   wireClassFilter();
+  wireJarBrowser();
 });
 
 function wireButtons() {
@@ -68,6 +70,12 @@ function wireButtons() {
   });
   document.addEventListener("click", () => {
     document.getElementById("export-menu").classList.add("hidden");
+  });
+
+  // Helper-node toggle
+  document.getElementById("show-helper-nodes").addEventListener("change", e => {
+    S.showHelperNodes = e.target.checked;
+    renderCurrentTargets();
   });
 
   // Close modals on overlay click
@@ -296,11 +304,27 @@ async function onCallsiteClick(idx) {
   if (!cs) return;
 
   setEl("right-title", `BCI ${cs.source_bci} · ${cs.source_method}`);
+
+  // Show helper-node toggle only for adapter graphs
+  const toggleWrap = document.getElementById("helper-toggle-wrap");
+  if (toggleWrap) {
+    toggleWrap.classList.toggle("hidden", cs.record !== "callsite_adapter_graph");
+  }
+
   document.getElementById("targets-view").innerHTML = renderTargetsView(cs);
   document.getElementById("bytecode-view").innerHTML =
     `<div class="empty-state"><span class="icon">📄</span>Click "View Bytecode" on a target</div>`;
 
   switchTab("targets");
+  wireTargetViewButtons(cs);
+}
+
+// Re-render the targets view in-place (used when toggle changes without re-selecting the callsite)
+function renderCurrentTargets() {
+  if (S.selectedIdx == null) return;
+  const cs = S.callsites.find(c => c.idx === S.selectedIdx);
+  if (!cs) return;
+  document.getElementById("targets-view").innerHTML = renderTargetsView(cs);
   wireTargetViewButtons(cs);
 }
 
@@ -317,13 +341,99 @@ function renderTargetsView(cs) {
   </div>`;
 
   if (cs.record === "callsite_target") {
-    html += renderSingleTarget(cs);
+    if (cs.category === "invokedynamic") {
+      html += renderIndyTargetView(cs);
+    } else {
+      html += renderSingleTarget(cs);
+    }
   } else if (cs.record === "callsite_target_set") {
     html += renderTargetSet(cs);
   } else if (cs.record === "callsite_adapter_graph") {
     html += renderAdapterGraph(cs);
   } else if (cs.record === "diagnostic") {
     html += renderDiagDetail(cs);
+  }
+
+  return html;
+}
+
+function renderIndyTargetView(cs) {
+  const bsm       = cs.bootstrap_method || "";
+  const indyName  = cs.indy_name || "";
+  const indyDesc  = cs.indy_descriptor || "";
+  const isLMF     = cs.lmf_impl != null;
+  const isSCF     = cs.semantic_op === "string_concat" || indyName === "makeConcatWithConstants";
+  const loader    = cs.source_loader_id || "";
+
+  let html = `<div class="target-section">
+    <h4>InvokeDynamic</h4>
+    <div class="kv-grid">
+      <span class="kv-key">Name</span>        <span class="kv-val">${esc(indyName || "—")}</span>
+      <span class="kv-key">Descriptor</span>  <span class="kv-val">${esc(indyDesc || "—")}</span>
+      <span class="kv-key">Bootstrap</span>   <span class="kv-val" style="word-break:break-all;font-size:10px">${esc(bsm || "—")}</span>
+      <span class="kv-key">Evidence</span>    <span class="kv-val">${esc(cs.evidence || "LINKAGE_GUARANTEED")}</span>
+    </div>
+  </div>`;
+
+  if (isLMF) {
+    const li = cs.lmf_impl;
+    html += `<div class="target-section indy-lmf-section">
+      <h4>λ LambdaMetafactory Implementation</h4>
+      <div class="kv-grid">
+        <span class="kv-key">Class</span>      <span class="kv-val node-class">${esc(li.class || "—")}</span>
+        <span class="kv-key">Method</span>     <span class="kv-val">${esc(li.method || "—")}</span>
+        <span class="kv-key">Descriptor</span><span class="kv-val">${esc(shortDesc(li.descriptor || ""))}</span>
+      </div>`;
+    if (li.class && li.method) {
+      html += `<div style="margin-top:8px">
+        <button class="btn-code btn-sm" data-bc-class="${esc(li.class)}" data-bc-loader="${esc(loader)}" data-bc-method="${esc(li.method)}">View impl bytecode</button>
+      </div>`;
+    }
+    html += `</div>`;
+
+  } else if (isSCF) {
+    const recipe    = cs.string_concat_recipe;
+    const consts    = cs.string_concat_constants;
+    const isRecon   = cs.reconstructable === true;
+    const isStatic  = cs.staticizable === true;
+    const blockers  = Array.isArray(cs.staticization_blockers) ? cs.staticization_blockers : [];
+
+    const recipeDisplay = recipe != null
+      ? esc(recipe).replace(//g, '<span class="indy-scf-arg">\\u0001</span>')
+                   .replace(//g, '<span class="indy-scf-const">\\u0002</span>')
+      : `<span style="color:#94a3b8">not captured</span>`;
+
+    let constsDisplay = `<span style="color:#94a3b8">none</span>`;
+    if (Array.isArray(consts) && consts.length > 0) {
+      constsDisplay = consts.map(c =>
+        typeof c === "string" ? `<code>${esc(c)}</code>` :
+        (c && typeof c === "object" && c.type) ? `<span style="color:#94a3b8">[${esc(c.type)}]</span>` :
+        String(c)
+      ).join(", ");
+    } else if (consts != null && !Array.isArray(consts)) {
+      constsDisplay = esc(String(consts));
+    }
+
+    const blockerNote = blockers.length > 0 ? " — " + blockers.map(esc).join(", ") : "";
+    const staticNote  = isStatic ? " — staticizable" : "";
+
+    html += `<div class="target-section indy-scf-section">
+      <h4>String Concatenation <span class="node-semantic-op">string_concat</span></h4>
+      <div class="kv-grid">
+        <span class="kv-key">Recipe</span>    <span class="kv-val indy-recipe">${recipeDisplay}</span>
+        <span class="kv-key">Constants</span> <span class="kv-val">${constsDisplay}</span>
+        <span class="kv-key">Reconstructable</span>
+        <span class="kv-val" style="color:${isRecon?"#15803d":"#dc2626"}">${isRecon ? "✓ yes" + staticNote : "✗ no" + blockerNote}</span>
+      </div>
+      <p class="indy-note">Composite runtime behavior: StringConcatFactory assembles a MH chain at linkage time. The adapter graph below shows the full helper structure.</p>
+    </div>`;
+
+  } else {
+    // Generic indy: unknown BSM
+    html += `<div class="target-section indy-generic-section">
+      <h4>Bootstrap-Composed Callsite</h4>
+      <p class="indy-note">No single direct target method. Runtime behavior is entirely determined by the bootstrap method above. See adapter graph (if emitted) for runtime helper structure.</p>
+    </div>`;
   }
 
   return html;
@@ -388,39 +498,59 @@ function renderTargetSet(cs) {
   return html;
 }
 
+function nodeIsHideable(n) {
+  if ((n.classification || "") === "user_target") return false;
+  // keep nodes that have both class+method (can open bytecode) or an artifact_path
+  if (n.class && n.method) return false;
+  if (n.artifact_path)     return false;
+  return true;
+}
+
 function renderAdapterGraph(cs) {
-  const nodes = cs.nodes || [];
-  const kind  = cs.adapter_kind || "";
-  const allEx = cs.all_exact;
+  const allNodes = cs.nodes || [];
+  const kind     = cs.adapter_kind || "";
+  const allEx    = cs.all_exact;
+
+  const nodes      = S.showHelperNodes ? allNodes : allNodes.filter(n => !nodeIsHideable(n));
+  const hiddenCount = allNodes.length - nodes.length;
 
   let html = `<div class="target-section">
     <h4>Adapter Graph — ${esc(kind)} <span style="font-size:10px;font-weight:400;color:${allEx?"#15803d":"#b45309"}">${allEx?"all_exact=true":"all_exact=false"}</span></h4>
     <div class="node-list">`;
 
-  for (const n of nodes) {
-    const cls = n.classification || "unknown";
-    const badgeClass = { user_target:"node-badge-user", internal_jdk:"node-badge-jdk", helper_boxing:"node-badge-boxing", helper_adapter:"node-badge-adapter", helper_invoker:"node-badge-adapter" }[cls] || "node-badge-adapter";
-    const cardClass  = cls.replace(/_/g,"-").replace("internal-jdk","internal_jdk");
-    const exactStr   = n.exact === false ? `<span style="color:#b45309;font-size:10px"> exact=false${n.exact_false_reason ? " ("+n.exact_false_reason+")" : ""}</span>` : "";
+  if (nodes.length === 0 && hiddenCount > 0) {
+    html += `<div class="empty-state" style="margin:8px 0"><span class="icon">🔒</span>All ${hiddenCount} node(s) are helper/no-bytecode nodes (toggle "show helpers" to reveal)</div>`;
+  } else {
+    for (const n of nodes) {
+      const cls = n.classification || "unknown";
+      const badgeClass = { user_target:"node-badge-user", internal_jdk:"node-badge-jdk", helper_boxing:"node-badge-boxing", helper_adapter:"node-badge-adapter", helper_invoker:"node-badge-adapter" }[cls] || "node-badge-adapter";
+      const exactStr   = n.exact === false ? `<span style="color:#b45309;font-size:10px"> exact=false${n.exact_false_reason ? " ("+n.exact_false_reason+")" : ""}</span>` : "";
+      const semanticOp = n.semantic_op ? `<span class="node-semantic-op">${esc(n.semantic_op)}</span>` : "";
 
-    html += `<div class="node-card ${cls}">
-      <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
-        <span class="node-badge ${badgeClass}">${esc(cls)}</span>
-        <span style="color:#64748b;font-size:10px">node ${n.id}</span>
-        ${exactStr}
-      </div>
-      <div class="kv-grid">
-        <span class="kv-key">Class</span>      <span class="kv-val node-class">${esc(n.class||n.node_adapter_class||"—")}</span>
-        <span class="kv-key">Method</span>     <span class="kv-val node-method">${esc(n.method||"—")}</span>
-        <span class="kv-key">Descriptor</span><span class="kv-val">${esc(shortDesc(n.descriptor||""))}</span>
-      </div>`;
+      html += `<div class="node-card ${cls}">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
+          <span class="node-badge ${badgeClass}">${esc(cls)}</span>
+          <span style="color:#64748b;font-size:10px">node ${n.id}</span>
+          ${semanticOp}
+          ${exactStr}
+        </div>
+        <div class="kv-grid">
+          <span class="kv-key">Class</span>      <span class="kv-val node-class">${esc(n.class||n.node_adapter_class||"—")}</span>
+          <span class="kv-key">Method</span>     <span class="kv-val node-method">${esc(n.method||"—")}</span>
+          <span class="kv-key">Descriptor</span><span class="kv-val">${esc(shortDesc(n.descriptor||""))}</span>
+        </div>`;
 
-    if (n.class && n.method && n.exact !== false) {
-      html += `<div style="margin-top:6px">
-        <button class="btn-code btn-sm" data-bc-class="${esc(n.class)}" data-bc-loader="${esc(n.loader_id||"")}" data-bc-method="${esc(n.method||"")}">View bytecode</button>
-      </div>`;
+      if (n.class && n.method && n.exact !== false) {
+        html += `<div style="margin-top:6px">
+          <button class="btn-code btn-sm" data-bc-class="${esc(n.class)}" data-bc-loader="${esc(n.loader_id||"")}" data-bc-method="${esc(n.method||"")}">View bytecode</button>
+        </div>`;
+      }
+      html += `</div>`;
     }
-    html += `</div>`;
+  }
+
+  if (hiddenCount > 0 && !S.showHelperNodes) {
+    html += `<div class="hidden-nodes-bar">Hidden: ${hiddenCount} helper/no-bytecode node(s)</div>`;
   }
 
   html += `</div></div>`;
@@ -573,7 +703,7 @@ function switchTab(tab) {
 }
 
 // ── Run form ──────────────────────────────────────────────────────────────
-function openRunModal() { show("run-modal"); }
+function openRunModal() { resetJarBrowser(); show("run-modal"); }
 function closeRunModal() { hide("run-modal"); }
 
 async function submitRun() {
@@ -757,6 +887,286 @@ function triggerDownload(url) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+}
+
+// ── JAR Class Browser ─────────────────────────────────────────────────────
+
+// Isolated state for the JAR browser (separate from run-time S).
+const Jar = {
+  classes:  [],        // [{full, pkg, short}]  — from last inspected JAR
+  selected: new Set(), // full class names currently checked
+  filter:   "",        // live search string
+};
+
+function wireJarBrowser() {
+  document.getElementById("jar-input").addEventListener("change", e => {
+    const f = e.target.files[0];
+    if (f) onJarFileSelected(f); else resetJarBrowser();
+  });
+  document.getElementById("jar-class-filter").addEventListener("input", e => {
+    Jar.filter = e.target.value.toLowerCase();
+    renderJarTree();
+  });
+  document.getElementById("jar-select-all").addEventListener("click", jarSelectAllVisible);
+  document.getElementById("jar-clear-all").addEventListener("click",   jarClearAllVisible);
+  document.getElementById("jar-apply").addEventListener("click",       applyJarPrefixes);
+
+  const treeEl = document.getElementById("jar-class-tree");
+  // Toggle package expand/collapse on header click (but not on the checkbox)
+  treeEl.addEventListener("click", e => {
+    const hdr = e.target.closest(".pkg-header");
+    if (!hdr || e.target.closest("input")) return;
+    const body = hdr.nextElementSibling;
+    if (!body) return;
+    body.classList.toggle("collapsed");
+    const icon = hdr.querySelector(".pkg-toggle");
+    if (icon) icon.textContent = body.classList.contains("collapsed") ? "▸" : "▾";
+  });
+  // Checkbox state changes via event delegation
+  treeEl.addEventListener("change", e => {
+    if (e.target.classList.contains("cls-cb")) {
+      const full = e.target.dataset.cls;
+      if (e.target.checked) Jar.selected.add(full);
+      else                  Jar.selected.delete(full);
+      const c = Jar.classes.find(x => x.full === full);
+      if (c) refreshPkgCheckbox(c.pkg);
+      updateJarPreview();
+    } else if (e.target.classList.contains("pkg-cb")) {
+      const pkg     = e.target.dataset.pkg;
+      const checked = e.target.checked;
+      // Toggle all VISIBLE class-cbs that belong to this package
+      treeEl.querySelectorAll(`.cls-cb`).forEach(cb => {
+        const c = Jar.classes.find(x => x.full === cb.dataset.cls);
+        if (c && c.pkg === pkg) {
+          cb.checked = checked;
+          if (checked) Jar.selected.add(c.full);
+          else         Jar.selected.delete(c.full);
+        }
+      });
+      e.target.indeterminate = false;
+      updateJarPreview();
+    }
+  });
+}
+
+async function onJarFileSelected(file) {
+  resetJarBrowser();
+  show("jar-classes-section");
+  document.getElementById("jar-class-tree").innerHTML =
+    `<div class="loading"><span class="spinner"></span> reading JAR…</div>`;
+
+  const fd = new FormData();
+  fd.append("jar", file);
+  try {
+    const resp = await fetch("/api/jar/classes", { method: "POST", body: fd });
+    const data = await resp.json();
+    if (data.error) {
+      document.getElementById("jar-class-tree").innerHTML =
+        `<div class="jar-error">⚠ ${esc(data.error)}</div>`;
+      return;
+    }
+    Jar.classes = data.classes.map(full => ({
+      full,
+      pkg:   full.includes("/") ? full.slice(0, full.lastIndexOf("/")) : "",
+      short: full.includes("/") ? full.slice(full.lastIndexOf("/") + 1) : full,
+    }));
+    document.getElementById("jar-browser-title").textContent =
+      `${Jar.classes.length} classes in JAR`;
+    renderJarTree();
+  } catch (e) {
+    document.getElementById("jar-class-tree").innerHTML =
+      `<div class="jar-error">⚠ Could not read JAR: ${esc(e.message)}</div>`;
+  }
+}
+
+function resetJarBrowser() {
+  Jar.classes = [];
+  Jar.selected.clear();
+  Jar.filter = "";
+  const fi = document.getElementById("jar-class-filter");
+  if (fi) fi.value = "";
+  const t = document.getElementById("jar-class-tree");
+  if (t) t.innerHTML = "";
+  const p = document.getElementById("jar-prefix-preview");
+  if (p) p.textContent = "";
+  hide("jar-classes-section");
+}
+
+function renderJarTree() {
+  const treeEl = document.getElementById("jar-class-tree");
+  const f = Jar.filter;
+
+  // Group visible classes by package
+  const pkgMap = new Map();
+  for (const c of Jar.classes) {
+    if (f && !c.full.toLowerCase().includes(f)) continue;
+    if (!pkgMap.has(c.pkg)) pkgMap.set(c.pkg, []);
+    pkgMap.get(c.pkg).push(c);
+  }
+
+  if (pkgMap.size === 0) {
+    treeEl.innerHTML = `<div class="loading">No classes match.</div>`;
+    updateJarPreview();
+    return;
+  }
+
+  const pkgs = [...pkgMap.keys()].sort();
+  let html = "";
+  for (const pkg of pkgs) {
+    const classes   = pkgMap.get(pkg);
+    const selCount  = classes.filter(c => Jar.selected.has(c.full)).length;
+    const allSel    = selCount === classes.length;
+    const someSel   = selCount > 0 && selCount < classes.length;
+    const pkgLabel  = pkg ? pkg.replace(/\//g, ".") : "(default package)";
+    const pkgAttr   = esc(pkg);
+
+    html += `<div class="pkg-group">
+      <div class="pkg-header">
+        <input type="checkbox" class="pkg-cb" data-pkg="${pkgAttr}"
+          ${allSel ? "checked" : ""} ${someSel ? "data-indet" : ""}>
+        <span class="pkg-name" title="${pkgAttr}">${esc(pkgLabel)}</span>
+        <span class="pkg-count">${selCount}/${classes.length}</span>
+        <span class="pkg-toggle">▾</span>
+      </div>
+      <div class="pkg-body">`;
+
+    for (const c of classes) {
+      html += `<label class="cls-row">
+        <input type="checkbox" class="cls-cb" data-cls="${esc(c.full)}"
+          ${Jar.selected.has(c.full) ? "checked" : ""}>
+        <span class="cls-name" title="${esc(c.full)}">${esc(c.short)}</span>
+      </label>`;
+    }
+    html += `</div></div>`;
+  }
+
+  treeEl.innerHTML = html;
+
+  // Apply indeterminate state (can't be set via HTML attribute)
+  treeEl.querySelectorAll(".pkg-cb[data-indet]").forEach(cb => {
+    cb.indeterminate = true;
+  });
+
+  updateJarPreview();
+}
+
+// Recompute a single package checkbox's tri-state from current DOM
+function refreshPkgCheckbox(pkg) {
+  const treeEl = document.getElementById("jar-class-tree");
+  const pkgCb  = treeEl.querySelector(`.pkg-cb[data-pkg="${CSS.escape(pkg)}"]`);
+  if (!pkgCb) return;
+
+  const clsCbs    = [...treeEl.querySelectorAll(".cls-cb")].filter(cb => {
+    const c = Jar.classes.find(x => x.full === cb.dataset.cls);
+    return c && c.pkg === pkg;
+  });
+  const nChecked  = clsCbs.filter(cb => cb.checked).length;
+  pkgCb.checked       = nChecked === clsCbs.length && clsCbs.length > 0;
+  pkgCb.indeterminate = nChecked > 0 && nChecked < clsCbs.length;
+
+  const countEl = pkgCb.closest(".pkg-header")?.querySelector(".pkg-count");
+  if (countEl) countEl.textContent = `${nChecked}/${clsCbs.length}`;
+}
+
+function jarSelectAllVisible() {
+  const treeEl = document.getElementById("jar-class-tree");
+  treeEl.querySelectorAll(".cls-cb").forEach(cb => {
+    cb.checked = true;
+    Jar.selected.add(cb.dataset.cls);
+  });
+  treeEl.querySelectorAll(".pkg-cb").forEach(cb => {
+    cb.checked = true;
+    cb.indeterminate = false;
+    const countEl = cb.closest(".pkg-header")?.querySelector(".pkg-count");
+    if (countEl) {
+      const total = cb.closest(".pkg-group")?.querySelectorAll(".cls-cb").length || 0;
+      countEl.textContent = `${total}/${total}`;
+    }
+  });
+  updateJarPreview();
+}
+
+function jarClearAllVisible() {
+  const treeEl = document.getElementById("jar-class-tree");
+  treeEl.querySelectorAll(".cls-cb").forEach(cb => {
+    cb.checked = false;
+    Jar.selected.delete(cb.dataset.cls);
+  });
+  treeEl.querySelectorAll(".pkg-cb").forEach(cb => {
+    cb.checked = false;
+    cb.indeterminate = false;
+    const countEl = cb.closest(".pkg-header")?.querySelector(".pkg-count");
+    if (countEl) {
+      const total = cb.closest(".pkg-group")?.querySelectorAll(".cls-cb").length || 0;
+      countEl.textContent = `0/${total}`;
+    }
+  });
+  updateJarPreview();
+}
+
+function applyJarPrefixes() {
+  const prefixes = computeMinimalPrefixes();
+  document.getElementById("user-prefixes-input").value = prefixes.join("\n");
+  // Briefly flash the textarea so the user sees it updated
+  const ta = document.getElementById("user-prefixes-input");
+  ta.style.background = "#dbeafe";
+  setTimeout(() => { ta.style.background = ""; }, 600);
+}
+
+function updateJarPreview() {
+  const el = document.getElementById("jar-prefix-preview");
+  if (!el) return;
+  const n = Jar.selected.size;
+  if (n === 0) { el.textContent = "0 classes selected."; return; }
+  const prefixes = computeMinimalPrefixes();
+  const preview  = prefixes.slice(0, 4).join(", ");
+  const more     = prefixes.length > 4 ? ` +${prefixes.length - 4} more` : "";
+  el.textContent = `${n} selected → ${preview}${more}`;
+}
+
+// Compute the minimal set of slash-notation prefixes that cover all selected classes.
+// Rules:
+//   • If every class in a package is selected → use the package path as prefix.
+//   • If only some classes in a package are selected → list individual class paths.
+//   • Root-package classes (no "/") always use the full class path.
+//   • Deduplicate: drop any prefix already covered by a shorter one already in the result.
+function computeMinimalPrefixes() {
+  if (!Jar.selected.size) return [];
+
+  // Count total and selected per package across ALL classes (not just visible ones)
+  const totals = new Map();
+  const sels   = new Map();
+  for (const c of Jar.classes) {
+    totals.set(c.pkg, (totals.get(c.pkg) || 0) + 1);
+    if (Jar.selected.has(c.full))
+      sels.set(c.pkg, (sels.get(c.pkg) || 0) + 1);
+  }
+
+  const raw = [];
+  for (const [pkg, total] of totals) {
+    const sel = sels.get(pkg) || 0;
+    if (sel === 0) continue;
+    if (sel === total && pkg !== "") {
+      raw.push(pkg);   // whole named package → use package as prefix
+    } else {
+      // partial, or root package → individual class names
+      for (const c of Jar.classes) {
+        if (c.pkg === pkg && Jar.selected.has(c.full))
+          raw.push(c.full);
+      }
+    }
+  }
+
+  // Sort shortest first, then alphabetically
+  raw.sort((a, b) => a.length - b.length || a.localeCompare(b));
+
+  // Remove entries already covered by an earlier (shorter) prefix
+  const result = [];
+  for (const p of raw) {
+    const covered = result.some(r => p === r || p.startsWith(r + "/"));
+    if (!covered) result.push(p);
+  }
+  return result;
 }
 
 function csOneliner(cs) {

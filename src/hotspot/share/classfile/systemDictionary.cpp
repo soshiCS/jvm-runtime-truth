@@ -288,6 +288,43 @@ static bool soroush_is_lambda_metafactory_bsm(oop bsm) {
   return target->method_holder()->name()->equals("java/lang/invoke/LambdaMetafactory");
 }
 
+// Extract BSM label as "ClassName.methodName(sig)" from the constant pool.
+// Uses the CONSTANT_MethodHandle entry referenced by the BootstrapMethods attribute,
+// which is more reliable than inspecting the runtime oop (which may be wrapped in
+// AsVarargsCollector for varargs BSMs like StringConcatFactory.makeConcatWithConstants).
+static void soroush_extract_bsm_label_cp(outputStream* st,
+                                          const constantPoolHandle& pool,
+                                          int bss_index) {
+  if (pool.is_null() || bss_index < 0) {
+    st->print("?");
+    return;
+  }
+  // bootstrap_method_ref_index_at(bss_index) → CP index of CONSTANT_MethodHandle
+  int bsm_mh_idx = pool->bootstrap_method_ref_index_at(bss_index);
+  if (bsm_mh_idx <= 0) {
+    st->print("?");
+    return;
+  }
+  Symbol* klass_name  = pool->klass_name_at(pool->method_handle_klass_index_at(bsm_mh_idx));
+  Symbol* method_name = pool->method_handle_name_ref_at(bsm_mh_idx);
+  Symbol* method_sig  = pool->method_handle_signature_ref_at(bsm_mh_idx);
+  st->print("%s.%s%s",
+            klass_name  ? klass_name->as_C_string()  : "?",
+            method_name ? method_name->as_C_string()  : "?",
+            method_sig  ? method_sig->as_C_string()   : "");
+}
+
+// Returns true when the BSM for bss_index is StringConcatFactory (any method).
+static bool soroush_is_string_concat_factory_bsm_cp(const constantPoolHandle& pool,
+                                                      int bss_index) {
+  if (pool.is_null() || bss_index < 0) return false;
+  int bsm_mh_idx = pool->bootstrap_method_ref_index_at(bss_index);
+  if (bsm_mh_idx <= 0) return false;
+  Symbol* klass_name = pool->klass_name_at(pool->method_handle_klass_index_at(bsm_mh_idx));
+  return klass_name != nullptr &&
+         klass_name->equals("java/lang/invoke/StringConcatFactory");
+}
+
 OopHandle   SystemDictionary::_java_system_loader;
 OopHandle   SystemDictionary::_java_platform_loader;
 
@@ -2680,16 +2717,91 @@ void SystemDictionary::invoke_bootstrap_method(BootstrapInfo& bootstrap_specifie
     }
 
     // Build indy name+sig and bootstrap label for the callsite record.
-    stringStream cs_desc2;
-    cs_desc2.print("%s%s",
-        bootstrap_specifier.name()->as_C_string(),
-        bootstrap_specifier.signature()->as_C_string());
+    // Use CP-based extraction for the BSM label: more reliable than inspecting the
+    // runtime oop directly, which may be wrapped in AsVarargsCollector for varargs BSMs
+    // (e.g. StringConcatFactory.makeConcatWithConstants).
     stringStream cs_bsm2;
-    if (java_lang_invoke_DirectMethodHandle::is_instance(bootstrap_specifier.bsm()())) {
-      soroush_print_member_name(&cs_bsm2,
-          java_lang_invoke_DirectMethodHandle::member(bootstrap_specifier.bsm()()));
-    } else {
-      cs_bsm2.print("%s", bootstrap_specifier.bsm()()->klass()->external_name());
+    soroush_extract_bsm_label_cp(&cs_bsm2,
+        bootstrap_specifier.pool(), bootstrap_specifier.bss_index());
+
+    // StringConcatFactory: extract semantic_op, recipe, and constants.
+    const char* semantic_op                  = nullptr;
+    const char* string_concat_recipe         = nullptr;
+    const char* string_concat_constants_str  = nullptr;
+    bool        cs_reconstructable           = false;
+    bool        cs_staticizable              = (lmf_impl_cls != nullptr);
+    const char* cs_blockers[4]               = { nullptr, nullptr, nullptr, nullptr };
+    int         cs_n_blockers                = 0;
+
+    if (soroush_is_string_concat_factory_bsm_cp(
+            bootstrap_specifier.pool(), bootstrap_specifier.bss_index())) {
+      semantic_op = "string_concat";
+      cs_staticizable = false; // default: blocked unless recipe is recoverable
+      cs_blockers[0] = "missing_string_concat_recipe";
+      cs_n_blockers  = 1;
+
+      // BootstrapInfo.resolve_args() stores static args in one of three forms:
+      //   (a) _arg_values is null       → _argc == 0, no static args
+      //   (b) _arg_values is a String   → _argc == 1, the single arg IS the recipe String
+      //   (c) _arg_values is objArray   → _argc > 1 or array arg at index 0;
+      //                                   [0]=recipe, [1..n]=constants
+      //   (d) _arg_values is typeArray  → pull-mode BSCI; contains {argc, bss_index}
+      //
+      // For makeConcatWithConstants, _argc >= 1 (recipe string is always present).
+      // Case (b) is the most common (simple concat with no constants): the recipe
+      // String oop is stored directly without wrapping to avoid singleton overhead.
+      if (bootstrap_specifier.arg_values().not_null()) {
+        oop av = bootstrap_specifier.arg_values()();
+        oop recipe_oop = nullptr;
+
+        if (java_lang_String::is_instance(av)) {
+          // Case (b): singleton recipe
+          recipe_oop = av;
+          string_concat_constants_str = "[]";
+        } else if (av->is_objArray()) {
+          // Case (c): array — recipe at [0], optional constants at [1..n]
+          objArrayOop scf_args = objArrayOop(av);
+          if (scf_args->length() > 0) {
+            recipe_oop = scf_args->obj_at(0);
+          }
+          if (scf_args->length() > 1) {
+            stringStream consts_ss;
+            consts_ss.print("[");
+            for (int j = 1; j < scf_args->length(); j++) {
+              if (j > 1) consts_ss.print(",");
+              oop c = scf_args->obj_at(j);
+              if (c == nullptr) {
+                consts_ss.print("null");
+              } else if (java_lang_String::is_instance(c)) {
+                const char* sv = java_lang_String::as_utf8_string(c);
+                consts_ss.print("\"");
+                for (const char* p = sv; *p; p++) {
+                  unsigned char uc = (unsigned char)*p;
+                  if      (uc == '"')  consts_ss.print("\\\"");
+                  else if (uc == '\\') consts_ss.print("\\\\");
+                  else if (uc < 0x20) consts_ss.print("\\u%04x", (unsigned)uc);
+                  else consts_ss.print("%c", *p);
+                }
+                consts_ss.print("\"");
+              } else {
+                consts_ss.print("{\"type\":\"%s\"}", c->klass()->external_name());
+              }
+            }
+            consts_ss.print("]");
+            string_concat_constants_str = consts_ss.as_string();
+          } else {
+            string_concat_constants_str = "[]";
+          }
+        }
+        // Case (d): typeArray (pull-mode BSCI) — recipe not yet resolved; leave as null
+
+        if (recipe_oop != nullptr && java_lang_String::is_instance(recipe_oop)) {
+          string_concat_recipe = java_lang_String::as_utf8_string(recipe_oop);
+          cs_reconstructable = true;
+          cs_staticizable    = true;
+          cs_n_blockers      = 0;
+        }
+      }
     }
 
     soroush_graph_indy_callsite(trace_id,
@@ -2701,6 +2813,8 @@ void SystemDictionary::invoke_bootstrap_method(BootstrapInfo& bootstrap_specifie
         bootstrap_specifier.signature()->as_C_string(),
         cs_bsm2.base(),
         lmf_impl_cls, lmf_impl_mth, lmf_impl_dsc,
+        semantic_op, string_concat_recipe, string_concat_constants_str,
+        cs_reconstructable, cs_staticizable, cs_blockers, cs_n_blockers,
         frame_ok);
   }
 

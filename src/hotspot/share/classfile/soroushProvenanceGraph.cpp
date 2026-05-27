@@ -119,6 +119,14 @@ struct SgIndySite {
   char*    lmf_impl_cls;
   char*    lmf_impl_mth;
   char*    lmf_impl_dsc;
+  // StringConcatFactory fields; null/false if BSM != StringConcatFactory
+  char*    semantic_op;                   // "string_concat" or null
+  char*    string_concat_recipe;          // makeConcatWithConstants recipe template
+  char*    string_concat_constants;       // JSON array of constant values, null if none/absent
+  bool     reconstructable;               // true when recipe+constants both captured (SCF only)
+  bool     staticizable;                  // true when fully staticizable (LMF target known or SCF reconstructable)
+  char*    staticization_blockers[4];     // blocker reason tokens (heap-allocated)
+  int      n_staticization_blockers;      // count of populated blockers
 };
 
 static const uint32_t  SG_INDY_SITE_MAX = 1u << 20; // 1M indy sites cap
@@ -340,6 +348,12 @@ void soroush_graph_indy_callsite(int trace_id,
                                  const char* bootstrap,
                                  const char* lmf_impl_cls, const char* lmf_impl_mth,
                                  const char* lmf_impl_dsc,
+                                 const char* semantic_op,
+                                 const char* string_concat_recipe,
+                                 const char* string_concat_constants,
+                                 bool reconstructable,
+                                 bool staticizable,
+                                 const char** staticization_blockers, int n_blockers,
                                  bool frame_captured) {
   if (!soroush_graph_enabled() || trace_id <= 0) return;
   uint32_t tid = (uint32_t)trace_id;
@@ -392,19 +406,37 @@ void soroush_graph_indy_callsite(int trace_id,
   s->src_bci        = src_bci;
   s->src_bss_index  = src_bss_index;
   s->frame_captured = frame_captured;
-  s->indy_name      = sg_strdup(indy_name);
-  s->indy_sig       = sg_strdup(indy_sig);
-  s->bootstrap      = sg_strdup(bootstrap);
-  s->lmf_impl_cls   = sg_strdup(lmf_impl_cls);
-  s->lmf_impl_mth   = sg_strdup(lmf_impl_mth);
-  s->lmf_impl_dsc   = sg_strdup(lmf_impl_dsc);
+  s->indy_name             = sg_strdup(indy_name);
+  s->indy_sig              = sg_strdup(indy_sig);
+  s->bootstrap             = sg_strdup(bootstrap);
+  s->lmf_impl_cls          = sg_strdup(lmf_impl_cls);
+  s->lmf_impl_mth          = sg_strdup(lmf_impl_mth);
+  s->lmf_impl_dsc          = sg_strdup(lmf_impl_dsc);
+  s->semantic_op              = sg_strdup(semantic_op);
+  s->string_concat_recipe     = sg_strdup(string_concat_recipe);
+  s->string_concat_constants  = sg_strdup(string_concat_constants);
+  s->reconstructable          = reconstructable;
+  s->staticizable             = staticizable;
+  s->n_staticization_blockers = 0;
+  memset(s->staticization_blockers, 0, sizeof(s->staticization_blockers));
+  if (staticization_blockers != nullptr) {
+    int nb = (n_blockers < 4) ? n_blockers : 4;
+    for (int i = 0; i < nb; i++) {
+      if (staticization_blockers[i] != nullptr) {
+        s->staticization_blockers[s->n_staticization_blockers] =
+            sg_strdup(staticization_blockers[i]);
+        if (s->staticization_blockers[s->n_staticization_blockers] != nullptr)
+          s->n_staticization_blockers++;
+      }
+    }
+  }
 
   if (g_indy_site_count < tid) g_indy_site_count = tid;
   pthread_mutex_unlock(&g_indy_site_lock);
 
   fprintf(stderr,
           "[JVM CALLSITE] trace_id=%d src=%s.%s%s bci=%d bss_index=%d"
-          " indy=%s%s lmf_impl=%s.%s%s frame=%s\n",
+          " indy=%s%s bsm=%s lmf_impl=%s.%s%s semantic_op=%s frame=%s\n",
           trace_id,
           s->src_class  ? s->src_class  : "?",
           s->src_method ? s->src_method : "?",
@@ -412,9 +444,11 @@ void soroush_graph_indy_callsite(int trace_id,
           src_bci, src_bss_index,
           s->indy_name ? s->indy_name : "?",
           s->indy_sig  ? s->indy_sig  : "",
+          s->bootstrap ? s->bootstrap : "?",
           s->lmf_impl_cls ? s->lmf_impl_cls : "",
           s->lmf_impl_mth ? s->lmf_impl_mth : "",
           s->lmf_impl_dsc ? s->lmf_impl_dsc : "",
+          s->semantic_op ? s->semantic_op : "none",
           frame_captured ? "exact" : "compiled(bci=unknown)");
 }
 
@@ -1718,6 +1752,30 @@ void soroush_graph_export_runtime_targets(const char* path) {
         sg_json_str(f, s->lmf_impl_mth);
         fprintf(f, ",\"lmf_impl_descriptor\":");
         sg_json_str(f, s->lmf_impl_dsc);
+      }
+      if (s->semantic_op != nullptr) {
+        fprintf(f, ",\"semantic_op\":");
+        sg_json_str(f, s->semantic_op);
+      }
+      if (s->string_concat_recipe != nullptr) {
+        fprintf(f, ",\"string_concat_recipe\":");
+        sg_json_str(f, s->string_concat_recipe);
+      }
+      if (s->string_concat_constants != nullptr) {
+        // Already a JSON array string — emit verbatim (not re-escaped).
+        fprintf(f, ",\"string_concat_constants\":%s", s->string_concat_constants);
+      }
+      fprintf(f, ",\"reconstructable\":%s",
+              s->reconstructable ? "true" : "false");
+      fprintf(f, ",\"staticizable\":%s",
+              s->staticizable ? "true" : "false");
+      if (s->n_staticization_blockers > 0) {
+        fprintf(f, ",\"staticization_blockers\":[");
+        for (int bi = 0; bi < s->n_staticization_blockers; bi++) {
+          if (bi > 0) fprintf(f, ",");
+          sg_json_str(f, s->staticization_blockers[bi]);
+        }
+        fprintf(f, "]");
       }
       fprintf(f, "}\n");
       ct_count++;

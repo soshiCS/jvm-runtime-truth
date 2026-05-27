@@ -439,14 +439,37 @@ def callsite_summary(cs: dict) -> dict:
             "descriptor": r.get("target_descriptor", ""),
             "loader_id":  r.get("target_loader_id", ""),
         }
-        # invokedynamic extra
-        if r.get("lmf_impl_method"):
+        s["evidence"] = r.get("evidence", "")
+        # invokedynamic fields: pass through all indy-specific data for UI rendering
+        if r.get("category") == "invokedynamic":
+            s["indy_name"]       = r.get("indy_name", "")
+            s["indy_descriptor"] = r.get("indy_descriptor", r.get("indy_sig", ""))
+            s["bootstrap_method"] = r.get("bootstrap_method", "")
+            # LambdaMetafactory impl method
+            if r.get("lmf_impl_method"):
+                s["lmf_impl"] = {
+                    "class":      _norm(r.get("lmf_impl_class", "")),
+                    "method":     r.get("lmf_impl_method", ""),
+                    "descriptor": r.get("lmf_impl_descriptor", ""),
+                }
+            # StringConcatFactory fields
+            if r.get("semantic_op"):
+                s["semantic_op"] = r.get("semantic_op")
+            if r.get("string_concat_recipe") is not None:
+                s["string_concat_recipe"] = r.get("string_concat_recipe")
+            if r.get("string_concat_constants") is not None:
+                s["string_concat_constants"] = r.get("string_concat_constants")
+            s["reconstructable"] = r.get("reconstructable", False)
+            s["staticizable"] = r.get("staticizable", False)
+            if r.get("staticization_blockers"):
+                s["staticization_blockers"] = r.get("staticization_blockers")
+        elif r.get("lmf_impl_method"):
+            # non-indy record with LMF fields (defensive)
             s["lmf_impl"] = {
                 "class":      _norm(r.get("lmf_impl_class", "")),
                 "method":     r.get("lmf_impl_method", ""),
                 "descriptor": r.get("lmf_impl_descriptor", ""),
             }
-        s["evidence"] = r.get("evidence", "")
     elif rec == "callsite_target_set":
         s["targets"]       = r.get("targets", [])
         s["adapter_shape"] = r.get("adapter_shape", "")
