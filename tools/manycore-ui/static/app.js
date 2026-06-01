@@ -1,6 +1,16 @@
 /* Runtime Truth UI — frontend logic */
 "use strict";
 
+// ── Class category classification constants ────────────────────────────────
+const JDK_PREFIXES = ['java/', 'jdk/', 'sun/', 'com/sun/', 'javax/'];
+const FRAMEWORK_PREFIXES = [
+  'org/springframework/', 'org/hibernate/', 'com/fasterxml/', 'org/apache/',
+  'io/netty/', 'org/slf4j/', 'ch/qos/', 'com/google/', 'io/micrometer/',
+  'org/aopalliance/', 'net/bytebuddy/', 'org/objenesis/', 'javassist/',
+  'reactor/', 'io/projectreactor/', 'org/reactivestreams/',
+];
+const PROXY_RE = /\$\$EnhancerBy|\$\$SpringCGLIB|\$\$FastClassBy|\$Proxy\d|HibernateProxy/;
+
 // ── State ─────────────────────────────────────────────────────────────────
 const S = {
   runId:           null,
@@ -9,12 +19,12 @@ const S = {
   classes:         [],
   classFilter:     "",
   selectedClass:   null,
-  callsites:       [],        // callsite summaries for selected class
-  selectedIdx:     null,      // callsite idx
-  activeTab:       "targets", // "targets" | "bytecode"
-  userPrefixes:    [],        // from run config, used for APP badge + diag classification
-  showHelperNodes: true,      // toggle: show all nodes including runtime-structure nodes
-  showAllClasses:  false,     // toggle: show all loaded classes, not just dispatch-relevant ones
+  callsites:       [],
+  selectedIdx:     null,
+  activeTab:       "targets",
+  userPrefixes:    [],
+  showHelperNodes: true,
+  classFilters:    new Set(['app', 'other']), // active category filters
 };
 
 // ── API helpers ───────────────────────────────────────────────────────────
@@ -77,12 +87,6 @@ function wireButtons() {
   document.getElementById("show-helper-nodes").addEventListener("change", e => {
     S.showHelperNodes = e.target.checked;
     renderCurrentTargets();
-  });
-
-  // Show-all-classes toggle
-  document.getElementById("show-all-classes").addEventListener("change", e => {
-    S.showAllClasses = e.target.checked;
-    renderClassList();
   });
 
   // Close modals on overlay click
@@ -199,64 +203,135 @@ function showRunStats(run) {
 // ── Class list ────────────────────────────────────────────────────────────
 async function loadClasses() {
   S.classes = await api(`/api/runs/${S.runId}/classes`).catch(() => []);
+  // Reset to default view: app + other (catches user code whether or not prefixes are set)
+  S.classFilters = new Set(['app', 'other']);
+  renderCategoryBar();
   renderClassList();
 }
 
-function isDispatchRelevant(c) {
-  const isApp = S.userPrefixes.length > 0 && S.userPrefixes.some(p => c.name.startsWith(p));
-  if (S.userPrefixes.length > 0) {
-    // Prefix set: only APP classes + their specific dispatch targets.
-    // Generated classes are only shown if they match the APP prefix or are
-    // direct targets of user-prefix callsites — not just because they exist.
-    return isApp || c.has_user_callsites_src || c.has_user_callsites_tgt;
+// ── Class category classification ─────────────────────────────────────────
+
+const CAT_META = [
+  { key: 'app',       label: 'APP',   title: 'Application / user-prefix classes'             },
+  { key: 'generated', label: 'GEN',   title: 'Runtime-generated classes (lambdas, CGLIB)'    },
+  { key: 'hidden',    label: 'HID',   title: 'Hidden class instances (+0x…)'                 },
+  { key: 'proxy',     label: 'PROXY', title: 'Dynamic proxy classes (CGLIB, $Proxy, ByteBuddy)' },
+  { key: 'framework', label: 'FW',    title: 'Framework classes (Spring, Hibernate, etc.)'   },
+  { key: 'jdk',       label: 'JDK',   title: 'JDK / platform classes (java.*, jdk.*, sun.*)' },
+  { key: 'other',     label: 'Other', title: 'Uncategorized (likely user code without a prefix set)' },
+];
+
+function classifyClass(c) {
+  const name = c.name;
+  if (/\+0x[0-9a-fA-F]+$/.test(name)) return 'hidden';
+  if (c.generated) return 'generated';
+  if (S.userPrefixes.length > 0 && S.userPrefixes.some(p => name.startsWith(p))) return 'app';
+  if (JDK_PREFIXES.some(p => name.startsWith(p))) return 'jdk';
+  if (FRAMEWORK_PREFIXES.some(p => name.startsWith(p))) return 'framework';
+  if (PROXY_RE.test(name)) return 'proxy';
+  return 'other';
+}
+
+function renderCategoryBar() {
+  const bar = document.getElementById('class-category-bar');
+  if (!bar) return;
+
+  // Count per category across all classes (unfiltered by text)
+  const counts = {};
+  for (const c of S.classes) {
+    const cat = classifyClass(c);
+    c._cat = cat;
+    counts[cat] = (counts[cat] || 0) + 1;
   }
-  // No prefix: show everything dispatch-related including all generated.
-  return c.has_callsites_src || c.has_callsites_tgt || c.generated;
+
+  let html = `<div class="class-filters">`;
+  for (const { key, label, title } of CAT_META) {
+    const n = counts[key] || 0;
+    if (n === 0) continue;
+    const active = S.classFilters.has(key) ? ' active' : '';
+    html += `<button class="cat-chip cat-${key}${active}" data-cat="${key}" title="${esc(title)}">${esc(label)} <span class="cat-count">${n}</span></button>`;
+  }
+  const totalVisible = S.classes.filter(c => S.classFilters.has(c._cat || classifyClass(c))).length;
+  const totalAll     = S.classes.length;
+  if (totalVisible < totalAll) {
+    html += `<button class="cat-chip cat-all" id="cat-all-btn" title="Show all ${totalAll} classes">All</button>`;
+  }
+  html += `</div>`;
+  bar.innerHTML = html;
+
+  bar.querySelectorAll('.cat-chip[data-cat]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const cat = btn.dataset.cat;
+      if (S.classFilters.has(cat)) {
+        if (S.classFilters.size > 1) S.classFilters.delete(cat); // keep at least one
+      } else {
+        S.classFilters.add(cat);
+      }
+      renderCategoryBar();
+      renderClassList();
+    });
+  });
+
+  const allBtn = bar.querySelector('#cat-all-btn');
+  if (allBtn) {
+    allBtn.addEventListener('click', () => {
+      for (const c of S.classes) S.classFilters.add(c._cat || classifyClass(c));
+      renderCategoryBar();
+      renderClassList();
+    });
+  }
 }
 
 function renderClassList() {
   const el = document.getElementById("class-list");
-  const f  = S.classFilter;
+  const f  = S.classFilter.toLowerCase();
 
-  const textFiltered = f
-    ? S.classes.filter(c => c.name.toLowerCase().includes(f))
-    : S.classes;
-
-  const relevant  = textFiltered.filter(isDispatchRelevant);
-  const hiddenCnt = textFiltered.length - relevant.length;
-  const visible   = S.showAllClasses ? textFiltered : relevant;
+  const visible = S.classes.filter(c => {
+    const cat = c._cat || classifyClass(c);
+    c._cat = cat;
+    if (!S.classFilters.has(cat)) return false;
+    if (f && !c.name.toLowerCase().includes(f)) return false;
+    return true;
+  });
 
   if (!visible.length) {
-    el.innerHTML = `<div class="empty-state"><span class="icon">🔍</span>${f ? "no matches" : "no classes"}</div>`;
+    const reason = f ? "no matches for filter" : "no classes in selected categories";
+    el.innerHTML = `<div class="empty-state"><span class="icon">🔍</span>${reason}</div>`;
     return;
   }
 
-  let countBar = `<div class="class-count-bar">${visible.length} class${visible.length !== 1 ? "es" : ""}`;
-  if (!S.showAllClasses && hiddenCnt > 0) {
-    countBar += ` · <span class="hidden-count">${hiddenCnt} hidden loaded-only</span>`;
-  }
-  countBar += `</div>`;
-
-  const scoped = S.userPrefixes.length > 0;
   const rows = visible.map(c => {
-    const isApp = scoped && S.userPrefixes.some(p => c.name.startsWith(p));
+    const cat   = c._cat;
+    const isApp = cat === 'app';
+    const scoped = S.userPrefixes.length > 0;
     const showSrc = scoped ? c.has_user_callsites_src : c.has_callsites_src;
     const showTgt = scoped ? c.has_user_callsites_tgt : c.has_callsites_tgt;
     const badges = [
-      isApp     ? `<span class="badge badge-app" title="matches user/app prefix">APP</span>` : "",
-      showSrc   ? `<span class="badge badge-src" title="source of captured callsite">SRC</span>` : "",
-      showTgt   ? `<span class="badge badge-tgt" title="appears as dispatch target or helper">TGT</span>` : "",
-      c.generated       ? `<span class="badge badge-gen" title="runtime-generated">GEN</span>` : "",
-      c.has_artifacts   ? `<span class="badge badge-art" title="has bytecode artifacts">ART</span>` : "",
+      isApp               ? `<span class="badge badge-app" title="matches user prefix">APP</span>` : "",
+      showSrc             ? `<span class="badge badge-src" title="source of callsites">SRC</span>` : "",
+      showTgt             ? `<span class="badge badge-tgt" title="dispatch target">TGT</span>` : "",
+      c.has_artifacts     ? `<span class="badge badge-art" title="has bytecode artifact">ART</span>` : "",
+      c.has_diagnostics   ? `<span class="badge badge-diag" title="has unresolved callsites">⚠</span>` : "",
     ].join("");
-    const sel = c.name === S.selectedClass ? " selected" : "";
-    return `<div class="class-item${sel}" data-class="${esc(c.name)}">
-      <span class="name">${esc(shortName(c.name))}</span>
-      <span class="badges">${badges}</span>
+
+    const short = shortName(c.name);
+    const pkg   = c.name.includes('/') ? c.name.slice(0, c.name.lastIndexOf('/')) : '';
+    const sel   = c.name === S.selectedClass ? " selected" : "";
+
+    return `<div class="class-item${sel}" data-class="${esc(c.name)}" title="${esc(c.name)}">
+      <div class="class-item-main">
+        <span class="name">${esc(short)}</span>
+        <span class="badges">${badges}</span>
+      </div>
+      ${pkg ? `<div class="pkg">${esc(pkg)}</div>` : ""}
     </div>`;
   }).join("");
 
-  el.innerHTML = countBar + rows;
+  el.innerHTML = rows;
+
+  // Scroll selected class into view without moving the panel
+  const selEl = el.querySelector('.class-item.selected');
+  if (selEl) selEl.scrollIntoView({ block: 'nearest' });
 
   el.querySelectorAll(".class-item").forEach(row =>
     row.addEventListener("click", () => onClassClick(row.dataset.class))
