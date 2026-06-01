@@ -401,12 +401,14 @@ function renderCallsiteList() {
 }
 
 function renderCallsiteRow(cs) {
-  const tag = csTypeTag(cs.record);
-  const sel = cs.idx === S.selectedIdx ? " selected" : "";
+  const tag     = csTypeTag(cs.record);
+  const sel     = cs.idx === S.selectedIdx ? " selected" : "";
   const summary = csOneliner(cs);
   const bciStr  = cs.source_bci >= 0 ? `${cs.source_bci}` : "?";
   const opcode  = cs.source_opcode || "";
+  const verdict = computeVerdict(cs);
   return `<div class="callsite-row${sel}" data-idx="${cs.idx}">
+    <span class="cs-verdict-dot v-${verdict.status}" title="${esc(verdict.status)}"></span>
     <span class="cs-bci">${esc(bciStr)}</span>
     <span class="cs-opcode">${esc(opcode)}</span>
     <span class="cs-summary">${esc(summary)}</span>
@@ -448,16 +450,19 @@ function renderCurrentTargets() {
 }
 
 function renderTargetsView(cs) {
-  let html = `<div class="target-section">
-    <h4>Callsite Info</h4>
-    <div class="kv-grid">
-      <span class="kv-key">Record</span>      <span class="kv-val">${esc(cs.record)}</span>
-      <span class="kv-key">Category</span>    <span class="kv-val">${esc(cs.category||"—")}</span>
-      <span class="kv-key">Source</span>       <span class="kv-val">${esc(cs.source_class)}.${esc(cs.source_method)}</span>
-      <span class="kv-key">BCI</span>          <span class="kv-val">${cs.source_bci}</span>
-      <span class="kv-key">Opcode</span>       <span class="kv-val">${esc(cs.source_opcode||"—")}</span>
+  let html = renderVerdictBanner(cs);
+
+  // Callsite metadata in a collapsible details element
+  html += `<details class="verdict-details-toggle">
+    <summary>Callsite metadata</summary>
+    <div class="kv-grid" style="margin-top:6px">
+      <span class="kv-key">Record</span>   <span class="kv-val">${esc(cs.record)}</span>
+      <span class="kv-key">Category</span> <span class="kv-val">${esc(cs.category||"—")}</span>
+      <span class="kv-key">Source</span>   <span class="kv-val">${esc(cs.source_class)}.${esc(cs.source_method)}</span>
+      <span class="kv-key">BCI</span>      <span class="kv-val">${cs.source_bci}</span>
+      <span class="kv-key">Opcode</span>   <span class="kv-val">${esc(cs.source_opcode||"—")}</span>
     </div>
-  </div>`;
+  </details>`;
 
   if (cs.record === "callsite_target") {
     if (cs.category === "invokedynamic") {
@@ -1226,6 +1231,78 @@ function shortDesc(desc) {
     .replace(/Ljava\/util\//g, "Lutil.")
     .replace(/;/g, "")
     .replace(/\[/g, "[]");
+}
+
+// ── Staticization verdict ─────────────────────────────────────────────────
+
+function computeVerdict(cs) {
+  const rec = cs.record;
+
+  if (rec === "diagnostic") {
+    return { status: "unknown", evidence: cs.reason || "could not resolve target", targets: 0, blockers: [] };
+  }
+
+  if (rec === "callsite_target") {
+    if (cs.staticizable === true) {
+      return { status: "staticizable", evidence: cs.evidence || "exact", targets: 1, blockers: [] };
+    }
+    if (cs.staticizable === false) {
+      const bl = Array.isArray(cs.staticization_blockers) ? cs.staticization_blockers : [];
+      return { status: "blocked", evidence: cs.evidence || "", targets: 1, blockers: bl.length ? bl : ["not staticizable"] };
+    }
+    // Non-indy path: infer from all_exact
+    if (cs.category !== "invokedynamic") {
+      if (cs.all_exact) return { status: "staticizable", evidence: cs.evidence || "exact", targets: 1, blockers: [] };
+      return { status: "blocked", evidence: cs.evidence || "", targets: 1, blockers: ["exact=false"] };
+    }
+    return { status: "unknown", evidence: cs.evidence || "", targets: 1, blockers: [] };
+  }
+
+  if (rec === "callsite_target_set") {
+    const n = (cs.targets || []).length;
+    if (n === 1) return { status: "staticizable", evidence: "single target", targets: 1, blockers: [] };
+    return { status: "blocked", evidence: "", targets: n, blockers: [`${n} dispatch targets — polymorphic`] };
+  }
+
+  if (rec === "callsite_adapter_graph") {
+    const userTargets = (cs.nodes || []).filter(n => n.classification === "user_target").length;
+    if (cs.staticizable === true) {
+      return { status: "staticizable", evidence: cs.adapter_kind || "adapter graph", targets: userTargets, blockers: [] };
+    }
+    if (cs.staticizable === false) {
+      const bl = Array.isArray(cs.staticization_blockers) ? cs.staticization_blockers : ["not staticizable"];
+      return { status: "blocked", evidence: cs.adapter_kind || "", targets: userTargets, blockers: bl };
+    }
+    if (cs.all_exact) return { status: "staticizable", evidence: "all_exact", targets: userTargets, blockers: [] };
+    return { status: "unknown", evidence: cs.adapter_kind || "", targets: userTargets, blockers: [] };
+  }
+
+  return { status: "unknown", evidence: "", targets: 0, blockers: [] };
+}
+
+function renderVerdictBanner(cs) {
+  const v = computeVerdict(cs);
+  const icons = { staticizable: "✓", blocked: "✗", unknown: "?" };
+  const labels = { staticizable: "STATICIZABLE", blocked: "BLOCKED", unknown: "UNKNOWN" };
+
+  const parts = [];
+  if (v.targets > 0) parts.push(`${v.targets} target${v.targets !== 1 ? "s" : ""}`);
+  if (v.evidence)    parts.push(`evidence: ${v.evidence}`);
+  const opMeta = cs.source_opcode ? `${cs.source_opcode} @ BCI ${cs.source_bci >= 0 ? cs.source_bci : "?"}` : "";
+  if (opMeta) parts.push(opMeta);
+
+  const blockersHtml = v.blockers.length
+    ? `<div class="verdict-blockers">${v.blockers.map(b => `<span class="verdict-blocker">${esc(b)}</span>`).join("")}</div>`
+    : "";
+
+  return `<div class="verdict-banner verdict-${v.status}">
+    <span class="verdict-icon">${icons[v.status]}</span>
+    <div class="verdict-body">
+      <div class="verdict-title">${labels[v.status]}</div>
+      <div class="verdict-meta">${esc(parts.join(" · "))}</div>
+      ${blockersHtml}
+    </div>
+  </div>`;
 }
 
 function csTypeTag(record) {
