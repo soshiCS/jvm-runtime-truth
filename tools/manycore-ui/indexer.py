@@ -83,6 +83,10 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
     # runtime_name (+0x...) -> {"artifact_crc": str, "loader_id": str}
     hidden_id_map: dict[str, dict] = {}
 
+    # artifact_path -> CRC of the last bytecode_artifact record that named this path.
+    # Hidden lambda instances share a filename; the last-written CRC is what's on disk.
+    path_to_last_crc: dict[str, str] = {}
+
     # method_identity: class -> {method -> [entry]}
     methods: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
 
@@ -136,6 +140,10 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
                     if crc:
                         crc_cls = f"{cls}_crc{crc}"
                         artifacts[(crc_cls, loader)][kind] = r
+                    # Track which CRC was written last to each export file.
+                    # Hidden lambda instances share a filename; later writes overwrite earlier ones.
+                    if crc and r.get("artifact_path"):
+                        path_to_last_crc[r["artifact_path"]] = crc
                 else:
                     e = cls_entry(cls)
                     e["record_types"].add("bytecode_artifact")
@@ -341,6 +349,35 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
             e["has_artifacts"] = True
             e["record_types"].add("bytecode_artifact")
 
+    # -- Build lambda family grouping entries ---------------------------------
+    # For each set of 2+ hidden class instances sharing the same base name,
+    # add a virtual "lambda_family" class entry so the UI can show a summary
+    # instead of presenting the base name as if it were a real class.
+    lambda_by_base: dict[str, list] = {}
+    for rname in hidden_id_map:
+        if rname in classes:
+            base = rname.split("+0x")[0]
+            lambda_by_base.setdefault(base, []).append(rname)
+
+    for base, instances in lambda_by_base.items():
+        if len(instances) < 2 or base in classes:
+            continue  # single instance needs no grouping; real entry already exists
+        instances_sorted = sorted(instances)
+        classes[base] = {
+            "name":                    base,
+            "record_types":            {"lambda_family"},
+            "generated":               True,
+            "has_artifacts":           False,
+            "has_callsites_src":       any(classes[i].get("has_callsites_src") for i in instances),
+            "has_callsites_tgt":       any(classes[i].get("has_callsites_tgt") for i in instances),
+            "has_user_callsites_src":  any(classes[i].get("has_user_callsites_src") for i in instances),
+            "has_user_callsites_tgt":  any(classes[i].get("has_user_callsites_tgt") for i in instances),
+            "has_diagnostics":         False,
+            "is_lambda_family":        True,
+            "lambda_instances":        instances_sorted,
+            "lambda_count":            len(instances),
+        }
+
     # -- Finalise classes ---------------------------------------------------
     for c in classes.values():
         c["record_types"] = sorted(c["record_types"])
@@ -385,17 +422,18 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
         artifact_by_class[cls][loader] = kinds
 
     return {
-        "classes":           sorted_classes,
-        "classes_by_name":   classes,
-        "methods_by_class":  methods_by_class,
-        "callsites_by":      dict(callsites_by),
-        "all_callsites":     all_callsites,
-        "artifact_by_class": dict(artifact_by_class),
-        "hidden_id_map":     hidden_id_map,
-        "diagnostics":       diagnostics,
-        "generated_classes": generated_cls,
-        "export_summary":    export_summary,
-        "total_records":     len(records),
+        "classes":            sorted_classes,
+        "classes_by_name":    classes,
+        "methods_by_class":   methods_by_class,
+        "callsites_by":       dict(callsites_by),
+        "all_callsites":      all_callsites,
+        "artifact_by_class":  dict(artifact_by_class),
+        "hidden_id_map":      hidden_id_map,
+        "path_to_last_crc":   path_to_last_crc,
+        "diagnostics":        diagnostics,
+        "generated_classes":  generated_cls,
+        "export_summary":     export_summary,
+        "total_records":      len(records),
     }
 
 
@@ -439,9 +477,15 @@ def find_best_artifact(index: dict, class_name: str, loader_id: str | None = Non
 
     artifact = entry.get("final") or entry.get("original")
     if artifact:
-        ap = artifact.get("artifact_path")
+        ap  = artifact.get("artifact_path")
         artifact = dict(artifact)
         artifact["_exists"] = bool(ap and os.path.isfile(ap))
+        # For hidden class artifacts: note whether the export file was overwritten
+        # by a later lambda instance (last-write-wins on a shared filename).
+        if ap and artifact.get("hidden"):
+            last_crc = index.get("path_to_last_crc", {}).get(ap)
+            if last_crc and last_crc != artifact.get("crc"):
+                artifact["_file_crc"] = last_crc   # what's actually in the file
     return artifact
 
 

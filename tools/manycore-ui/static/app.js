@@ -361,11 +361,12 @@ function renderClassList() {
     const showSrc = scoped ? c.has_user_callsites_src : c.has_callsites_src;
     const showTgt = scoped ? c.has_user_callsites_tgt : c.has_callsites_tgt;
     const badges = [
-      isApp             ? `<span class="badge badge-app"  title="matches user prefix">APP</span>` : "",
-      showSrc           ? `<span class="badge badge-src"  title="source of callsites">SRC</span>` : "",
-      showTgt           ? `<span class="badge badge-tgt"  title="dispatch target">TGT</span>` : "",
-      c.has_artifacts   ? `<span class="badge badge-art"  title="has bytecode artifact">ART</span>` : "",
-      c.has_diagnostics ? `<span class="badge badge-diag" title="has unresolved callsites">⚠</span>` : "",
+      c.is_lambda_family  ? `<span class="badge badge-family" title="lambda class family (${c.lambda_count} instances)">λ×${c.lambda_count}</span>` : "",
+      isApp               ? `<span class="badge badge-app"  title="matches user prefix">APP</span>` : "",
+      showSrc             ? `<span class="badge badge-src"  title="source of callsites">SRC</span>` : "",
+      showTgt             ? `<span class="badge badge-tgt"  title="dispatch target">TGT</span>` : "",
+      c.has_artifacts     ? `<span class="badge badge-art"  title="has bytecode artifact">ART</span>` : "",
+      c.has_diagnostics   ? `<span class="badge badge-diag" title="has unresolved callsites">⚠</span>` : "",
     ].join("");
 
     const short = shortName(c.name);
@@ -411,11 +412,21 @@ async function loadCallsites(className) {
 
   if (!S.callsites.length) {
     const cls = S.classes.find(c => c.name === className);
+    // Lambda family grouping node — show member list, not callsites
+    if (cls && cls.is_lambda_family) {
+      await showLambdaFamilyClass(cls);
+      return;
+    }
+    // Hidden class instance (+0x) — always use identity-resolved bytecode path
+    if (cls && /\+0x[0-9a-fA-F]+$/.test(cls.name)) {
+      await showLambdaInstanceClass(cls);
+      return;
+    }
     if (cls && cls.has_artifacts) {
       await showArtifactClass(cls);
       return;
     }
-    if (cls && !cls.has_artifacts && (cls.record_types || []).includes("runtime_target_ref")) {
+    if (cls && (cls.record_types || []).includes("runtime_target_ref")) {
       await showLambdaInstanceClass(cls);
       return;
     }
@@ -491,6 +502,50 @@ async function showLambdaInstanceClass(cls) {
     document.getElementById("bytecode-view").innerHTML =
       `<div class="empty-state"><span class="icon">—</span>No bytecode available</div>`;
   }
+}
+
+async function showLambdaFamilyClass(cls) {
+  setEl("middle-title", shortName(cls.name));
+  const el = document.getElementById("callsite-list");
+  const toggleWrap = document.getElementById("helper-toggle-wrap");
+  if (toggleWrap) toggleWrap.classList.add("hidden");
+
+  const instances = (cls.lambda_instances || []);
+  const rows = instances.map(name => {
+    const inst = S.classes.find(c => c.name === name) || { name, has_artifacts: false };
+    const addr = name.includes("+0x") ? name.slice(name.indexOf("+0x")) : name;
+    const artBadge = inst.has_artifacts
+      ? `<span class="badge badge-art" title="has bytecode artifact">ART</span>` : "";
+    const tgtBadge = (inst.has_callsites_tgt || inst.has_user_callsites_tgt)
+      ? `<span class="badge badge-tgt" title="dispatch target">TGT</span>` : "";
+    const srcBadge = (inst.has_callsites_src || inst.has_user_callsites_src)
+      ? `<span class="badge badge-src" title="source of callsites">SRC</span>` : "";
+    const crc = inst.artifact_crc ? `<span class="lambda-member-crc">${esc(inst.artifact_crc.slice(0,8))}</span>` : "";
+    return `<div class="lambda-member-row" data-class="${esc(name)}" title="${esc(name)}">
+      <span class="lambda-member-addr">${esc(addr)}</span>
+      <span class="badges">${artBadge}${tgtBadge}${srcBadge}</span>
+      ${crc}
+    </div>`;
+  }).join("");
+
+  el.innerHTML = `<div class="artifact-info-panel">
+    <div class="artifact-info-class">${esc(shortName(cls.name))}
+      <span class="badge badge-family" style="margin-left:6px">λ×${instances.length}</span>
+    </div>
+    <div class="artifact-info-note">Lambda class family — ${instances.length} generated lambda instances.<br>
+      Select an instance below to view its bytecode.</div>
+  </div>
+  <div class="lambda-member-list">${rows}</div>`;
+
+  document.getElementById("targets-view").innerHTML =
+    `<div class="empty-state"><span class="icon">λ</span>Lambda family — select an instance from the list</div>`;
+  document.getElementById("bytecode-view").innerHTML =
+    `<div class="empty-state"><span class="icon">📄</span>Select a lambda instance to view bytecode</div>`;
+  switchTab("targets");
+
+  el.querySelectorAll(".lambda-member-row").forEach(row =>
+    row.addEventListener("click", () => onClassClick(row.dataset.class))
+  );
 }
 
 function renderCallsiteList() {
@@ -1081,6 +1136,16 @@ async function loadBytecode(className, loaderId, targetMethod) {
     return;
   }
 
+  // Shared-file overwrite warning (hidden lambda instances sharing one export path)
+  const fileCrc = artifact._file_crc;
+  const overwriteWarning = fileCrc
+    ? `<div class="crc-overwrite-warning">
+        ⚠ <strong>Shared export file</strong> — multiple lambda instances wrote to this path.
+        This file contains the last-written instance (CRC <code>${esc(fileCrc)}</code>).
+        The bytecode shown is <strong>not</strong> specific to this instance (expected CRC <code>${esc(artifact.crc||"?")}</code>).
+       </div>`
+    : "";
+
   // Artifact metadata header
   let meta = `<div class="target-section">
     <h4>Artifact</h4>
@@ -1088,7 +1153,7 @@ async function loadBytecode(className, loaderId, targetMethod) {
       <span class="kv-key">Class</span>    <span class="kv-val">${esc(className)}</span>
       <span class="kv-key">Method</span>   <span class="kv-val" style="color:#3b82f6">${esc(targetMethod||"(all)")}</span>
       <span class="kv-key">Kind</span>     <span class="kv-val">${esc(artifact.kind||"—")}</span>
-      <span class="kv-key">CRC</span>      <span class="kv-val">${esc(artifact.crc||"—")}</span>
+      <span class="kv-key">CRC</span>      <span class="kv-val">${esc(artifact.crc||"—")}${fileCrc ? ` <span style="color:#dc2626;font-size:10px">(file: ${esc(fileCrc)})</span>` : ""}</span>
       <span class="kv-key">Size</span>     <span class="kv-val">${artifact.size||"?"} bytes</span>
       <span class="kv-key">Path</span>     <span class="kv-val" style="font-size:9px">${esc(artifact.artifact_path)}</span>
     </div>
@@ -1101,7 +1166,7 @@ async function loadBytecode(className, loaderId, targetMethod) {
   }
 
   const highlighted = highlightBytecode(result.output, targetMethod);
-  bv.innerHTML = meta + `<div id="bytecode-container">${highlighted}</div>`;
+  bv.innerHTML = overwriteWarning + meta + `<div id="bytecode-container">${highlighted}</div>`;
 
   // Scroll to target method
   if (targetMethod) {

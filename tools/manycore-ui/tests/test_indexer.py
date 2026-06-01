@@ -79,7 +79,7 @@ def test_hidden_artifact_marks_has_artifacts_on_runtime_instance():
 
 def test_five_distinct_hidden_instances_remain_distinct():
     """Five bytecode_artifact records sharing a base name must produce FIVE
-    independent +0x class entries — not one overwritten entry."""
+    independent +0x class entries plus ONE lambda family grouping entry."""
     crcs = ["aaa11111", "bbb22222", "ccc33333", "ddd44444", "eee55555"]
     addrs = ["0x0001", "0x0002", "0x0003", "0x0004", "0x0005"]
     records = []
@@ -101,8 +101,15 @@ def test_five_distinct_hidden_instances_remain_distinct():
 
     idx = _idx(records)
 
-    # No base-name phantom
-    assert _cls(idx, "com/example/App$$Lambda") is None
+    # Base name exists as a lambda family grouping entry (not a phantom real class)
+    fam = _cls(idx, "com/example/App$$Lambda")
+    assert fam is not None, "lambda family entry should exist for 5+ instances"
+    assert fam.get("is_lambda_family") is True
+    assert fam.get("lambda_count") == 5
+    assert fam.get("has_artifacts") is False  # family itself has no artifact
+    assert sorted(fam["lambda_instances"]) == sorted(
+        f"com/example/App$$Lambda+{a}" for a in addrs
+    )
 
     # All 5 instances are distinct and have artifacts
     for addr in addrs:
@@ -110,10 +117,10 @@ def test_five_distinct_hidden_instances_remain_distinct():
         assert e is not None, f"missing entry for +{addr}"
         assert e["has_artifacts"] is True, f"+{addr} should have has_artifacts"
 
-    # Total class count from this run: 5
+    # Total lambda entries: 5 instances + 1 family = 6
     names = [c["name"] for c in idx["classes"]]
     lambda_entries = [n for n in names if "Lambda" in n]
-    assert len(lambda_entries) == 5
+    assert len(lambda_entries) == 6  # 5 +0x instances + 1 family
 
 
 def test_non_hidden_artifact_creates_class_entry():

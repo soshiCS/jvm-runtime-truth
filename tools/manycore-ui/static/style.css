@@ -94,11 +94,12 @@ button { cursor: pointer; border: none; border-radius: 4px; font-size: 12px; fon
   font-size: 9px; font-weight: 700; padding: 1px 4px; border-radius: 3px;
   text-transform: uppercase; letter-spacing: .3px;
 }
-.badge-src  { background: #dbeafe; color: #1d4ed8; }  /* source of callsite */
-.badge-tgt  { background: #ffedd5; color: #c2410c; }  /* dispatch target/helper */
-.badge-art  { background: #dcfce7; color: #15803d; }  /* has artifacts */
-.badge-diag { background: #fee2e2; color: #dc2626; }  /* has diagnostics */
-.badge-gen  { background: #f3e8ff; color: #7c3aed; }  /* generated */
+.badge-src    { background: #dbeafe; color: #1d4ed8; }  /* source of callsite */
+.badge-tgt    { background: #ffedd5; color: #c2410c; }  /* dispatch target/helper */
+.badge-art    { background: #dcfce7; color: #15803d; }  /* has artifacts */
+.badge-diag   { background: #fee2e2; color: #dc2626; }  /* has diagnostics */
+.badge-gen    { background: #f3e8ff; color: #7c3aed; }  /* generated */
+.badge-family { background: #e0e7ff; color: #4338ca; }  /* lambda class family */
 
 /* ─── Callsite list (middle panel) ─────────────────────────────────────── */
 .method-group { border-bottom: 1px solid #e2e8f0; }
@@ -403,6 +404,37 @@ button { cursor: pointer; border: none; border-radius: 4px; font-size: 12px; fon
   text-decoration: underline;
 }
 .artifact-info-note .link-btn:hover { color: #2563eb; }
+
+/* ─── Lambda family member list ─────────────────────────────────────────── */
+.lambda-member-list {
+  overflow-y: auto; flex: 1;
+  border-top: 1px solid #e2e8f0;
+}
+.lambda-member-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px; cursor: pointer;
+  border-bottom: 1px solid #f1f5f9; font-size: 11px;
+}
+.lambda-member-row:hover { background: #f0f9ff; }
+.lambda-member-addr {
+  font-family: ui-monospace, monospace; font-size: 10px;
+  color: #475569; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lambda-member-crc {
+  font-family: ui-monospace, monospace; font-size: 9px;
+  color: #94a3b8; flex-shrink: 0;
+}
+
+/* ─── CRC overwrite warning (shared hidden class export file) ────────────── */
+.crc-overwrite-warning {
+  margin: 0 0 8px; padding: 7px 10px;
+  background: #fff1f2; border: 1px solid #fecdd3; border-radius: 4px;
+  font-size: 11px; color: #be123c; line-height: 1.5;
+}
+.crc-overwrite-warning code {
+  font-family: ui-monospace, monospace; font-size: 10px;
+  background: #fde7e7; padding: 1px 4px; border-radius: 2px;
+}
 
 /* ─── Class count bar ────────────────────────────────────────────────────── */
 .class-count-bar {
