@@ -25,6 +25,7 @@ const S = {
   userPrefixes:    [],
   showHelperNodes: true,
   classFilters:    new Set(['app', 'other', 'generated', 'hidden', 'proxy']),
+  scopeAll:        false,   // when true, skip dispatch-relevance scope gate
 };
 
 // ── API helpers ───────────────────────────────────────────────────────────
@@ -202,9 +203,8 @@ function showRunStats(run) {
 
 // ── Class list ────────────────────────────────────────────────────────────
 async function loadClasses() {
-  S.classes = await api(`/api/runs/${S.runId}/classes`).catch(() => []);
-  // Default: app + other (user code) + generated + hidden + proxy (direct dispatch targets).
-  // Only jdk and framework stay off — those are the real noise (thousands of internal classes).
+  S.classes  = await api(`/api/runs/${S.runId}/classes`).catch(() => []);
+  S.scopeAll = false;
   S.classFilters = new Set(['app', 'other', 'generated', 'hidden', 'proxy']);
   renderCategoryBar();
   renderClassList();
@@ -222,49 +222,105 @@ const CAT_META = [
   { key: 'other',     label: 'Other', title: 'Uncategorized (likely user code without a prefix set)' },
 ];
 
+// Fix: check jdk/framework BEFORE generated so that JDK-internal generated classes
+// (e.g. java/lang/invoke/LambdaForm$$Lambda$...) are classified as 'jdk', not 'generated'.
+// User-code-generated lambdas (e.g. manycorecases/Case01$$Lambda$...) don't start with
+// a JDK prefix so they still classify as 'generated'.
 function classifyClass(c) {
   const name = c.name;
   if (/\+0x[0-9a-fA-F]+$/.test(name)) return 'hidden';
-  if (c.generated) return 'generated';
-  if (S.userPrefixes.length > 0 && S.userPrefixes.some(p => name.startsWith(p))) return 'app';
   if (JDK_PREFIXES.some(p => name.startsWith(p))) return 'jdk';
   if (FRAMEWORK_PREFIXES.some(p => name.startsWith(p))) return 'framework';
+  if (c.generated) return 'generated';
+  if (S.userPrefixes.length > 0 && S.userPrefixes.some(p => name.startsWith(p))) return 'app';
   if (PROXY_RE.test(name)) return 'proxy';
   return 'other';
+}
+
+// A class is "in scope" for the current user prefix when:
+//   - it matches the user prefix (direct app code), OR
+//   - it is a source of a user-prefix callsite (has_user_callsites_src), OR
+//   - it appears as a target of a user-prefix callsite (has_user_callsites_tgt)
+// This uses the pre-computed per-class flags from the indexer, which are already
+// scoped to whatever prefix was passed at run time.
+// When scopeAll=true or no prefixes are set, every class is in scope.
+function classInScope(c) {
+  if (!S.userPrefixes.length || S.scopeAll) return true;
+  return S.userPrefixes.some(p => c.name.startsWith(p)) ||
+         c.has_user_callsites_src ||
+         c.has_user_callsites_tgt;
 }
 
 function renderCategoryBar() {
   const bar = document.getElementById('class-category-bar');
   if (!bar) return;
 
-  // Count per category across all classes (unfiltered by text)
+  const hasPfx = S.userPrefixes.length > 0;
+
+  // Count per category within the CURRENT SCOPE (not the whole run)
   const counts = {};
   for (const c of S.classes) {
+    if (!classInScope(c)) continue;
     const cat = classifyClass(c);
     c._cat = cat;
     counts[cat] = (counts[cat] || 0) + 1;
   }
 
-  let html = `<div class="class-filters">`;
+  let html = '';
+
+  // Scope indicator — only when user prefixes are set
+  if (hasPfx) {
+    const pfxShort = S.userPrefixes.map(p => {
+      const seg = p.split('/');
+      return seg[seg.length - 1] || p;
+    }).join(', ');
+    const totalRun = S.classes.length;
+    const scopedCount = S.classes.filter(classInScope).length;
+
+    if (!S.scopeAll) {
+      html += `<div class="scope-indicator">
+        <span class="scope-label" title="${esc(S.userPrefixes.join(', '))}">📍 ${esc(pfxShort)}</span>
+        <button class="scope-toggle" id="scope-toggle-btn" title="Show all ${totalRun} classes from this run">Show all (${totalRun})</button>
+      </div>`;
+    } else {
+      html += `<div class="scope-indicator scope-expanded">
+        <span class="scope-label">All ${totalRun} classes</span>
+        <button class="scope-toggle" id="scope-toggle-btn" title="Focus on classes related to ${esc(pfxShort)}">⬅ Focus (${scopedCount})</button>
+      </div>`;
+    }
+  }
+
+  // Category chips — counts within current scope
+  html += `<div class="class-filters">`;
   for (const { key, label, title } of CAT_META) {
     const n = counts[key] || 0;
     if (n === 0) continue;
     const active = S.classFilters.has(key) ? ' active' : '';
     html += `<button class="cat-chip cat-${key}${active}" data-cat="${key}" title="${esc(title)}">${esc(label)} <span class="cat-count">${n}</span></button>`;
   }
-  const totalVisible = S.classes.filter(c => S.classFilters.has(c._cat || classifyClass(c))).length;
-  const totalAll     = S.classes.length;
-  if (totalVisible < totalAll) {
-    html += `<button class="cat-chip cat-all" id="cat-all-btn" title="Show all ${totalAll} classes">All</button>`;
+  // "All cats" button appears when some categories in scope are hidden
+  const totalInScope   = Object.values(counts).reduce((a, b) => a + b, 0);
+  const visibleInScope = Object.entries(counts).filter(([k]) => S.classFilters.has(k)).reduce((a, [, v]) => a + v, 0);
+  if (visibleInScope < totalInScope) {
+    html += `<button class="cat-chip cat-all" id="cat-all-btn" title="Show all categories">All cats</button>`;
   }
   html += `</div>`;
+
   bar.innerHTML = html;
 
+  // Wire scope toggle
+  bar.querySelector('#scope-toggle-btn')?.addEventListener('click', () => {
+    S.scopeAll = !S.scopeAll;
+    renderCategoryBar();
+    renderClassList();
+  });
+
+  // Wire category chips
   bar.querySelectorAll('.cat-chip[data-cat]').forEach(btn => {
     btn.addEventListener('click', () => {
       const cat = btn.dataset.cat;
       if (S.classFilters.has(cat)) {
-        if (S.classFilters.size > 1) S.classFilters.delete(cat); // keep at least one
+        if (S.classFilters.size > 1) S.classFilters.delete(cat);
       } else {
         S.classFilters.add(cat);
       }
@@ -273,14 +329,11 @@ function renderCategoryBar() {
     });
   });
 
-  const allBtn = bar.querySelector('#cat-all-btn');
-  if (allBtn) {
-    allBtn.addEventListener('click', () => {
-      for (const c of S.classes) S.classFilters.add(c._cat || classifyClass(c));
-      renderCategoryBar();
-      renderClassList();
-    });
-  }
+  bar.querySelector('#cat-all-btn')?.addEventListener('click', () => {
+    for (const key of Object.keys(counts)) S.classFilters.add(key);
+    renderCategoryBar();
+    renderClassList();
+  });
 }
 
 function renderClassList() {
@@ -288,31 +341,31 @@ function renderClassList() {
   const f  = S.classFilter.toLowerCase();
 
   const visible = S.classes.filter(c => {
+    if (!classInScope(c)) return false;            // scope gate: related to user prefix
     const cat = c._cat || classifyClass(c);
     c._cat = cat;
-    if (!S.classFilters.has(cat)) return false;
-    if (f && !c.name.toLowerCase().includes(f)) return false;
+    if (!S.classFilters.has(cat)) return false;    // category filter
+    if (f && !c.name.toLowerCase().includes(f)) return false; // text search
     return true;
   });
 
   if (!visible.length) {
-    const reason = f ? "no matches for filter" : "no classes in selected categories";
+    const reason = f ? "no matches for search" : "no classes in selected categories";
     el.innerHTML = `<div class="empty-state"><span class="icon">🔍</span>${reason}</div>`;
     return;
   }
 
+  const scoped = S.userPrefixes.length > 0;
   const rows = visible.map(c => {
-    const cat   = c._cat;
-    const isApp = cat === 'app';
-    const scoped = S.userPrefixes.length > 0;
+    const isApp   = c._cat === 'app';
     const showSrc = scoped ? c.has_user_callsites_src : c.has_callsites_src;
     const showTgt = scoped ? c.has_user_callsites_tgt : c.has_callsites_tgt;
     const badges = [
-      isApp               ? `<span class="badge badge-app" title="matches user prefix">APP</span>` : "",
-      showSrc             ? `<span class="badge badge-src" title="source of callsites">SRC</span>` : "",
-      showTgt             ? `<span class="badge badge-tgt" title="dispatch target">TGT</span>` : "",
-      c.has_artifacts     ? `<span class="badge badge-art" title="has bytecode artifact">ART</span>` : "",
-      c.has_diagnostics   ? `<span class="badge badge-diag" title="has unresolved callsites">⚠</span>` : "",
+      isApp             ? `<span class="badge badge-app"  title="matches user prefix">APP</span>` : "",
+      showSrc           ? `<span class="badge badge-src"  title="source of callsites">SRC</span>` : "",
+      showTgt           ? `<span class="badge badge-tgt"  title="dispatch target">TGT</span>` : "",
+      c.has_artifacts   ? `<span class="badge badge-art"  title="has bytecode artifact">ART</span>` : "",
+      c.has_diagnostics ? `<span class="badge badge-diag" title="has unresolved callsites">⚠</span>` : "",
     ].join("");
 
     const short = shortName(c.name);
@@ -330,7 +383,6 @@ function renderClassList() {
 
   el.innerHTML = rows;
 
-  // Scroll selected class into view without moving the panel
   const selEl = el.querySelector('.class-item.selected');
   if (selEl) selEl.scrollIntoView({ block: 'nearest' });
 

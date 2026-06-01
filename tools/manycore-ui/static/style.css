@@ -360,6 +360,28 @@ button { cursor: pointer; border: none; border-radius: 4px; font-size: 12px; fon
 
 .cat-count { font-weight: 400; opacity: .8; }
 
+/* ─── Scope indicator (focused view label + toggle) ────────────────────── */
+.scope-indicator {
+  display: flex; align-items: center; gap: 5px;
+  margin-bottom: 4px;
+  font-size: 10px;
+}
+.scope-label {
+  color: #0f766e; background: #ccfbf1; border-radius: 4px;
+  padding: 1px 6px; font-weight: 600; max-width: 140px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  cursor: default;
+}
+.scope-indicator.scope-expanded .scope-label {
+  color: #475569; background: #f1f5f9;
+}
+.scope-toggle {
+  font-size: 10px; padding: 1px 7px; border-radius: 4px;
+  background: transparent; color: #64748b; border: 1px solid #cbd5e1;
+  cursor: pointer; white-space: nowrap; font-family: inherit;
+}
+.scope-toggle:hover { background: #1e293b; color: #fff; border-color: #1e293b; }
+
 /* ─── Artifact-only class panel (middle panel, no callsites) ────────────── */
 .artifact-info-panel {
   padding: 12px 10px;
