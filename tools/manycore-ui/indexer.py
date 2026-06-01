@@ -126,16 +126,21 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
             kind   = r.get("kind", "original")
             crc    = r.get("crc", "")
             if cls:
-                e = cls_entry(cls)
-                e["record_types"].add("bytecode_artifact")
-                e["has_artifacts"] = True
-                artifacts[(cls, loader)][kind] = r
-                # For hidden class artifacts, also register under a CRC-suffixed key.
-                # find_best_artifact() resolves hidden_id_map.artifact_crc → base_crcXXXX
-                # so the CRC-suffixed alias must exist in artifact_by_class.
-                if r.get("hidden") and crc:
-                    crc_cls = f"{cls}_crc{crc}"
-                    artifacts[(crc_cls, loader)][kind] = r
+                if r.get("hidden"):
+                    # Hidden-class artifacts use a base class name (no +0x) that is shared by
+                    # all runtime instances of that hidden class family.  Do NOT create a class
+                    # entry for the base name — it is not a stable unique identity.  The real
+                    # per-instance entries come from hidden_class_identity records (+0x names).
+                    # Store only the CRC-indexed artifact so find_best_artifact() can resolve it.
+                    artifacts[(cls, loader)][kind] = r   # kept for fallback non-+0x lookup
+                    if crc:
+                        crc_cls = f"{cls}_crc{crc}"
+                        artifacts[(crc_cls, loader)][kind] = r
+                else:
+                    e = cls_entry(cls)
+                    e["record_types"].add("bytecode_artifact")
+                    e["has_artifacts"] = True
+                    artifacts[(cls, loader)][kind] = r
             continue
 
         # ------------------------------------------------------------------ generated_class
@@ -318,6 +323,23 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
                         "method":     praw.get("target_method", ""),
                         "descriptor": praw.get("target_descriptor", ""),
                     }
+
+    # -- Back-fill has_artifacts on hidden class instances ------------------
+    # bytecode_artifact records for hidden classes use the base class name (no +0x),
+    # so cls_entry() was skipped for them.  Now that hidden_id_map is fully populated,
+    # walk each +0x class entry and check whether its CRC-indexed artifact was stored.
+    for rname, hid_info in hidden_id_map.items():
+        crc    = hid_info.get("artifact_crc", "")
+        loader = hid_info.get("loader_id", "")
+        if not crc or rname not in classes:
+            continue
+        # base name is the part before +0x
+        base   = rname.split("+0x")[0]
+        crc_cls = f"{base}_crc{crc}"
+        if (crc_cls, loader) in artifacts:
+            e = classes[rname]
+            e["has_artifacts"] = True
+            e["record_types"].add("bytecode_artifact")
 
     # -- Finalise classes ---------------------------------------------------
     for c in classes.values():
