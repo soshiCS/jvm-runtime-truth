@@ -24,7 +24,7 @@ const S = {
   activeTab:       "targets",
   userPrefixes:    [],
   showHelperNodes: true,
-  classFilters:    new Set(['app', 'other']), // active category filters
+  classFilters:    new Set(['app', 'other', 'generated', 'hidden', 'proxy']),
 };
 
 // ── API helpers ───────────────────────────────────────────────────────────
@@ -203,8 +203,9 @@ function showRunStats(run) {
 // ── Class list ────────────────────────────────────────────────────────────
 async function loadClasses() {
   S.classes = await api(`/api/runs/${S.runId}/classes`).catch(() => []);
-  // Reset to default view: app + other (catches user code whether or not prefixes are set)
-  S.classFilters = new Set(['app', 'other']);
+  // Default: app + other (user code) + generated + hidden + proxy (direct dispatch targets).
+  // Only jdk and framework stay off — those are the real noise (thousands of internal classes).
+  S.classFilters = new Set(['app', 'other', 'generated', 'hidden', 'proxy']);
   renderCategoryBar();
   renderClassList();
 }
@@ -1314,51 +1315,77 @@ function computeVerdict(cs) {
   const rec = cs.record;
 
   if (rec === "diagnostic") {
-    return { status: "unknown", evidence: cs.reason || "could not resolve target", targets: 0, blockers: [] };
+    return { status: "unknown", evidence: cs.reason || "could not resolve target", targets: 0, blockers: [], note: "" };
   }
 
   if (rec === "callsite_target") {
+    // Indy path has explicit staticizable flag from the JVM
     if (cs.staticizable === true) {
-      return { status: "staticizable", evidence: cs.evidence || "exact", targets: 1, blockers: [] };
+      return { status: "staticizable", evidence: cs.evidence || "exact", targets: 1, blockers: [], note: "" };
     }
     if (cs.staticizable === false) {
       const bl = Array.isArray(cs.staticization_blockers) ? cs.staticization_blockers : [];
-      return { status: "blocked", evidence: cs.evidence || "", targets: 1, blockers: bl.length ? bl : ["not staticizable"] };
+      return { status: "blocked", evidence: cs.evidence || "", targets: 1, blockers: bl.length ? bl : ["not staticizable"], note: "" };
     }
-    // Non-indy path: infer from all_exact
+    // Non-indy: use all_exact to distinguish guaranteed vs observed-only
     if (cs.category !== "invokedynamic") {
-      if (cs.all_exact) return { status: "staticizable", evidence: cs.evidence || "exact", targets: 1, blockers: [] };
-      return { status: "blocked", evidence: cs.evidence || "", targets: 1, blockers: ["exact=false"] };
+      if (cs.all_exact) {
+        return { status: "staticizable", evidence: cs.evidence || "exact", targets: 1, blockers: [], note: "" };
+      }
+      // exact=false on a single callsite_target record means one target was observed but
+      // resolution was not exact (profile-based / observed-only). This is not the same as
+      // blocked — it means the single-target assumption has not been formally proven.
+      return {
+        status:   "likely",
+        evidence: cs.evidence || "observed",
+        targets:  1,
+        blockers: [],
+        note:     "1 target observed; resolution not exact — may be polymorphic at other call sites",
+      };
     }
-    return { status: "unknown", evidence: cs.evidence || "", targets: 1, blockers: [] };
+    // Indy without explicit staticizable: unknown
+    return { status: "unknown", evidence: cs.evidence || "", targets: 1, blockers: [], note: "" };
   }
 
   if (rec === "callsite_target_set") {
     const n = (cs.targets || []).length;
-    if (n === 1) return { status: "staticizable", evidence: "single target", targets: 1, blockers: [] };
-    return { status: "blocked", evidence: "", targets: n, blockers: [`${n} dispatch targets — polymorphic`] };
+    if (n === 1) return { status: "staticizable", evidence: "single target", targets: 1, blockers: [], note: "" };
+    return { status: "blocked", evidence: "", targets: n, blockers: [`${n} observed targets — polymorphic dispatch`], note: "" };
   }
 
   if (rec === "callsite_adapter_graph") {
     const userTargets = (cs.nodes || []).filter(n => n.classification === "user_target").length;
     if (cs.staticizable === true) {
-      return { status: "staticizable", evidence: cs.adapter_kind || "adapter graph", targets: userTargets, blockers: [] };
+      return { status: "staticizable", evidence: cs.adapter_kind || "adapter graph", targets: userTargets, blockers: [], note: "" };
     }
     if (cs.staticizable === false) {
       const bl = Array.isArray(cs.staticization_blockers) ? cs.staticization_blockers : ["not staticizable"];
-      return { status: "blocked", evidence: cs.adapter_kind || "", targets: userTargets, blockers: bl };
+      return { status: "blocked", evidence: cs.adapter_kind || "", targets: userTargets, blockers: bl, note: "" };
     }
-    if (cs.all_exact) return { status: "staticizable", evidence: "all_exact", targets: userTargets, blockers: [] };
-    return { status: "unknown", evidence: cs.adapter_kind || "", targets: userTargets, blockers: [] };
+    if (cs.all_exact) {
+      return { status: "staticizable", evidence: "all_exact", targets: userTargets, blockers: [], note: "" };
+    }
+    return {
+      status:   "likely",
+      evidence: cs.adapter_kind || "adapter graph",
+      targets:  userTargets,
+      blockers: [],
+      note:     "adapter graph resolved but not all nodes exact",
+    };
   }
 
-  return { status: "unknown", evidence: "", targets: 0, blockers: [] };
+  return { status: "unknown", evidence: "", targets: 0, blockers: [], note: "" };
 }
 
 function renderVerdictBanner(cs) {
   const v = computeVerdict(cs);
-  const icons = { staticizable: "✓", blocked: "✗", unknown: "?" };
-  const labels = { staticizable: "STATICIZABLE", blocked: "BLOCKED", unknown: "UNKNOWN" };
+  const icons  = { staticizable: "✓", likely: "~", blocked: "✗", unknown: "?" };
+  const labels = {
+    staticizable: "STATICIZABLE",
+    likely:       "LIKELY STATICIZABLE",
+    blocked:      "BLOCKED",
+    unknown:      "UNKNOWN",
+  };
 
   const parts = [];
   if (v.targets > 0) parts.push(`${v.targets} target${v.targets !== 1 ? "s" : ""}`);
@@ -1370,11 +1397,16 @@ function renderVerdictBanner(cs) {
     ? `<div class="verdict-blockers">${v.blockers.map(b => `<span class="verdict-blocker">${esc(b)}</span>`).join("")}</div>`
     : "";
 
+  const noteHtml = v.note
+    ? `<div class="verdict-note">${esc(v.note)}</div>`
+    : "";
+
   return `<div class="verdict-banner verdict-${v.status}">
     <span class="verdict-icon">${icons[v.status]}</span>
     <div class="verdict-body">
       <div class="verdict-title">${labels[v.status]}</div>
       <div class="verdict-meta">${esc(parts.join(" · "))}</div>
+      ${noteHtml}
       ${blockersHtml}
     </div>
   </div>`;

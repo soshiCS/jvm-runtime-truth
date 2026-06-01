@@ -125,6 +125,7 @@ button { cursor: pointer; border: none; border-radius: 4px; font-size: 12px; fon
 
 .cs-verdict-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 .cs-verdict-dot.v-staticizable { background: #22c55e; }
+.cs-verdict-dot.v-likely       { background: #14b8a6; }
 .cs-verdict-dot.v-blocked      { background: #f97316; }
 .cs-verdict-dot.v-unknown      { background: #94a3b8; }
 
@@ -147,6 +148,7 @@ button { cursor: pointer; border: none; border-radius: 4px; font-size: 12px; fon
   font-size: 12px; line-height: 1.4;
 }
 .verdict-staticizable { background: #f0fdf4; border: 1px solid #86efac; }
+.verdict-likely       { background: #f0fdfa; border: 1px solid #5eead4; }
 .verdict-blocked      { background: #fff7ed; border: 1px solid #fdba74; }
 .verdict-unknown      { background: #f8fafc; border: 1px solid #cbd5e1; }
 .verdict-icon { font-size: 18px; flex-shrink: 0; margin-top: -2px; }
@@ -155,9 +157,11 @@ button { cursor: pointer; border: none; border-radius: 4px; font-size: 12px; fon
   font-weight: 800; font-size: 12px; letter-spacing: .4px; margin-bottom: 2px;
 }
 .verdict-staticizable .verdict-title { color: #15803d; }
+.verdict-likely .verdict-title       { color: #0f766e; }
 .verdict-blocked .verdict-title      { color: #c2410c; }
 .verdict-unknown .verdict-title      { color: #475569; }
-.verdict-meta { font-size: 11px; color: #64748b; }
+.verdict-meta  { font-size: 11px; color: #64748b; }
+.verdict-note  { font-size: 10px; color: #64748b; font-style: italic; margin-top: 3px; }
 .verdict-blockers { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 3px; }
 .verdict-blocker {
   background: #fef3c7; border: 1px solid #fcd34d; color: #92400e;
