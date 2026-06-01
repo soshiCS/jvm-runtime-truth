@@ -1,4 +1,4 @@
-# ManyCore UI
+# Runtime Truth UI
 
 Local web UI for exploring the runtime target export produced by the custom JVM fork.
 Runs entirely on localhost — no auth, no external services.
@@ -13,16 +13,16 @@ Runs entirely on localhost — no auth, no external services.
 
 ### Keeping libjvm.dylib in sync
 
-After every `make hotspot` in `jdk21u`, copy the dylib to `jdk21u-export` so the export
-build picks up the latest instrumentation:
+`jdk21u-export` is the only authoritative repo. After every `make hotspot` in `jdk21u-export`, copy the build output to the path the `java` binary loads from:
 
 ```bash
-SRC=~/custom-jvm/jdk21u/build/macosx-aarch64-server-fastdebug
-DST=~/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug
-cp $SRC/jdk/lib/server/libjvm.dylib            $DST/jdk/lib/server/libjvm.dylib
-cp $SRC/support/modules_libs/java.base/server/libjvm.dylib \
-   $DST/support/modules_libs/java.base/server/libjvm.dylib
+cd ~/custom-jvm/jdk21u-export
+make hotspot
+cp build/macosx-aarch64-server-fastdebug/support/modules_libs/java.base/server/libjvm.dylib \
+   build/macosx-aarch64-server-fastdebug/jdk/lib/server/libjvm.dylib
 ```
+
+Verify: `build/macosx-aarch64-server-fastdebug/jdk/bin/java -version` must show `jdk21u-export` in the VM line. Do **not** build or copy from `jdk21u` — that is a historical copy.
 
 ---
 
@@ -126,7 +126,7 @@ Click "View Bytecode" on any target node to run `javap` and see the disassembly.
 ## Per-run directory layout
 
 ```
-/tmp/manycore_ui_runs/<run_id>/
+/tmp/rt_ui_runs/<run_id>/
   app.jar                    copy of the uploaded JAR
   runtime_targets.jsonl      full export (all 9 record types)
   artifacts/                 .class files (SOROUSH_BYTECODE_DUMP_DIR)
@@ -175,7 +175,7 @@ The backend always injects:
 
 ## Known limitations
 
-- **In-memory run store:** Runs are kept in a Python dict; they are lost if the Flask process restarts. The per-run directories under `/tmp/manycore_ui_runs/` persist across restarts, but are not automatically re-indexed on startup.
+- **In-memory run store:** Runs are kept in a Python dict; they are lost if the Flask process restarts. The per-run directories under `/tmp/rt_ui_runs/` persist across restarts, but are not automatically re-indexed on startup.
 - **Index cache not invalidated:** If the JSONL for a completed run is somehow modified after the first load, the old index is served. Restart the server to clear.
 - **`-Xint` only:** All runs use interpreter mode. JIT-compiled frames do not fire `resolve_handle_call`, so no JIT-generated callsite records will appear.
 - **Single JAR upload:** Only one JAR per run. Multi-module projects need a fat JAR or use `extra_cp` to supply dependencies.

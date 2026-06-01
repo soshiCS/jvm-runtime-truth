@@ -945,6 +945,7 @@ capture_final_class_bytes(internal_class_name,
  load_kind);
 
 // Unified provenance graph: BytecodeArtifact node(s) (+ HAS_BYTECODE / REWRITTEN_FROM).
+uint32_t hidden_artifact_crc = 0;
 if (soroush_graph_enabled()) {
   uint64_t graph_loader_id = (uint64_t)(uintptr_t)loader_data;
   int graph_hidden = cl_info.is_hidden() ? 1 : 0;
@@ -953,8 +954,9 @@ if (soroush_graph_enabled()) {
                            soroush_crc32(stream->buffer(), stream->length()),
                            stream->length(), 0, load_kind, graph_loader_id, graph_hidden);
   }
+  hidden_artifact_crc = soroush_crc32(actual_stream->buffer(), actual_stream->length());
   soroush_graph_bytecode(internal_class_name,
-                         soroush_crc32(actual_stream->buffer(), actual_stream->length()),
+                         hidden_artifact_crc,
                          actual_stream->length(), transformed ? 1 : 0, load_kind,
                          graph_loader_id, graph_hidden);
 }
@@ -1008,6 +1010,16 @@ InstanceKlass* result = parser.create_instance_klass(old_stream != actual_stream
          CHECK_NULL);
 
 assert(result != nullptr, "result cannot be null with no pending exception");
+
+// Record the +0x<address> runtime name → artifact CRC mapping for hidden classes.
+// mangle_hidden_class_name() ran inside create_instance_klass(), so result->name()
+// now holds the full runtime name with the address suffix.
+if (cl_info.is_hidden() && soroush_graph_enabled() && hidden_artifact_crc != 0) {
+  ResourceMark rm_hidden(THREAD);
+  const char* runtime_name = result->name()->as_C_string();
+  soroush_graph_hidden_identity(runtime_name, hidden_artifact_crc,
+                                (uint64_t)(uintptr_t)loader_data);
+}
 
 if (cached_class_file != nullptr) {
 result->set_cached_class_file(cached_class_file);

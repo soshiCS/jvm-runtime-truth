@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 
 
-def load_and_index(jsonl_path: str) -> dict:
+def load_and_index(jsonl_path: str, user_prefixes: list | None = None) -> dict:
     records = []
     bad = 0
     with open(jsonl_path) as fh:
@@ -21,7 +21,7 @@ def load_and_index(jsonl_path: str) -> dict:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 bad += 1
-    idx = _build_index(records)
+    idx = _build_index(records, user_prefixes=user_prefixes or [])
     idx["parse_errors"] = bad
     return idx
 
@@ -42,7 +42,12 @@ def _src(r: dict) -> tuple[str, str]:
     return cls, meth
 
 
-def _build_index(records: list) -> dict:
+def _build_index(records: list, user_prefixes: list | None = None) -> dict:
+    pfx = user_prefixes or []
+
+    def _is_user_src(cls: str) -> bool:
+        return bool(pfx) and bool(cls) and any(cls.startswith(p) for p in pfx)
+
     # class_name -> class entry dict
     classes: dict[str, dict] = {}
 
@@ -52,13 +57,15 @@ def _build_index(records: list) -> dict:
             return {}
         if n not in classes:
             classes[n] = {
-                "name":               n,
-                "record_types":       set(),
-                "generated":          False,
-                "has_artifacts":      False,
-                "has_callsites_src":  False,
-                "has_callsites_tgt":  False,
-                "has_diagnostics":    False,
+                "name":                    n,
+                "record_types":            set(),
+                "generated":               False,
+                "has_artifacts":           False,
+                "has_callsites_src":       False,
+                "has_callsites_tgt":       False,
+                "has_user_callsites_src":  False,  # src matches user prefix
+                "has_user_callsites_tgt":  False,  # tgt of a user-prefix src callsite
+                "has_diagnostics":         False,
             }
         return classes[n]
 
@@ -72,6 +79,9 @@ def _build_index(records: list) -> dict:
     diagnostics:   list[dict] = []
     generated_cls: list[dict] = []
     export_summary: dict | None = None
+
+    # runtime_name (+0x...) -> {"artifact_crc": str, "loader_id": str}
+    hidden_id_map: dict[str, dict] = {}
 
     # method_identity: class -> {method -> [entry]}
     methods: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
@@ -114,11 +124,18 @@ def _build_index(records: list) -> dict:
             cls    = _norm(r.get("class", ""))
             loader = r.get("loader_id", "")
             kind   = r.get("kind", "original")
+            crc    = r.get("crc", "")
             if cls:
                 e = cls_entry(cls)
                 e["record_types"].add("bytecode_artifact")
                 e["has_artifacts"] = True
                 artifacts[(cls, loader)][kind] = r
+                # For hidden class artifacts, also register under a CRC-suffixed key.
+                # find_best_artifact() resolves hidden_id_map.artifact_crc → base_crcXXXX
+                # so the CRC-suffixed alias must exist in artifact_by_class.
+                if r.get("hidden") and crc:
+                    crc_cls = f"{cls}_crc{crc}"
+                    artifacts[(crc_cls, loader)][kind] = r
             continue
 
         # ------------------------------------------------------------------ generated_class
@@ -135,13 +152,18 @@ def _build_index(records: list) -> dict:
         if rtype == "callsite_target":
             src_cls, src_meth = _src(r)
             tgt_cls = _norm(r.get("target_class", ""))
+            is_user = _is_user_src(src_cls)
             if src_cls:
                 e = cls_entry(src_cls)
                 e["record_types"].add("callsite_target")
                 e["has_callsites_src"] = True
+                if is_user:
+                    e["has_user_callsites_src"] = True
             if tgt_cls:
                 e = cls_entry(tgt_cls)
                 e["has_callsites_tgt"] = True
+                if is_user:
+                    e["has_user_callsites_tgt"] = True
             cs = {
                 "record":            rtype,
                 "source_class":      src_cls,
@@ -149,6 +171,7 @@ def _build_index(records: list) -> dict:
                 "source_descriptor": r.get("source_descriptor") or r.get("src_desc", ""),
                 "source_bci":        r.get("source_bci", -1),
                 "source_opcode":     r.get("source_opcode", ""),
+                "source_cp_index":   r.get("source_cp_index", -1),
                 "category":          r.get("category", ""),
                 "evidence":          r.get("evidence", ""),
                 "exact":             bool(r.get("exact", False)),
@@ -161,14 +184,20 @@ def _build_index(records: list) -> dict:
         # ------------------------------------------------------------------ callsite_target_set
         if rtype == "callsite_target_set":
             src_cls, src_meth = _src(r)
+            is_user = _is_user_src(src_cls)
             if src_cls:
                 e = cls_entry(src_cls)
                 e["record_types"].add("callsite_target_set")
                 e["has_callsites_src"] = True
+                if is_user:
+                    e["has_user_callsites_src"] = True
                 for t in r.get("targets", []):
                     tc = _norm(t.get("class", ""))
                     if tc:
-                        cls_entry(tc)["has_callsites_tgt"] = True
+                        te = cls_entry(tc)
+                        te["has_callsites_tgt"] = True
+                        if is_user:
+                            te["has_user_callsites_tgt"] = True
             cs = {
                 "record":            rtype,
                 "source_class":      src_cls,
@@ -187,14 +216,20 @@ def _build_index(records: list) -> dict:
         # ------------------------------------------------------------------ callsite_adapter_graph
         if rtype == "callsite_adapter_graph":
             src_cls, src_meth = _src(r)
+            is_user = _is_user_src(src_cls)
             if src_cls:
                 e = cls_entry(src_cls)
                 e["record_types"].add("callsite_adapter_graph")
                 e["has_callsites_src"] = True
+                if is_user:
+                    e["has_user_callsites_src"] = True
                 for n in r.get("nodes", []):
                     nc = _norm(n.get("class", ""))
                     if nc:
-                        cls_entry(nc)["has_callsites_tgt"] = True
+                        ne = cls_entry(nc)
+                        ne["has_callsites_tgt"] = True
+                        if is_user:
+                            ne["has_user_callsites_tgt"] = True
             cs = {
                 "record":            rtype,
                 "source_class":      src_cls,
@@ -209,6 +244,19 @@ def _build_index(records: list) -> dict:
                 "raw":               r,
             }
             push_callsite(cs)
+            continue
+
+        # ------------------------------------------------------------------ hidden_class_identity
+        if rtype == "hidden_class_identity":
+            rname = r.get("runtime_name", "")
+            crc   = r.get("artifact_crc", "")
+            lid   = r.get("loader_id", "")
+            if rname and crc:
+                hidden_id_map[rname] = {"artifact_crc": crc, "loader_id": lid}
+                e = cls_entry(rname)
+                e["record_types"].add("hidden_class_identity")
+                e["artifact_crc"]   = crc
+                e["artifact_loader"] = lid
             continue
 
         # ------------------------------------------------------------------ runtime_target
@@ -233,9 +281,10 @@ def _build_index(records: list) -> dict:
                 "record":            rtype,
                 "source_class":      src_cls,
                 "source_method":     src_meth,
-                "source_descriptor": r.get("source_descriptor") or r.get("src_desc", ""),
-                "source_bci":        r.get("source_bci", -1),
-                "source_opcode":     r.get("source_opcode", ""),
+                "source_descriptor": r.get("source_descriptor") or r.get("src_descriptor") or r.get("src_desc", ""),
+                "source_bci":        r.get("source_bci") if r.get("source_bci") is not None else r.get("src_bci", -1),
+                "source_cp_index":   r.get("source_cp_index") if r.get("source_cp_index") is not None else r.get("src_cp_index", -1),
+                "source_opcode":     r.get("source_opcode") or r.get("src_opcode", ""),
                 "category":          r.get("category", ""),
                 "reason":            r.get("reason", ""),
                 "all_exact":         False,
@@ -244,6 +293,31 @@ def _build_index(records: list) -> dict:
             push_callsite(cs)
             diagnostics.append(cs)
             continue
+
+    # -- Link diagnostic sibling BCIs to their primary resolved callsite ----
+    # Build (src_class, src_method, cp_index) -> first exact callsite_target
+    cp_to_primary: dict = {}
+    for cs in all_callsites:
+        if cs["record"] == "callsite_target":
+            cp_idx = cs.get("source_cp_index", -1)
+            if cp_idx >= 0:
+                key = (cs["source_class"], cs["source_method"], cp_idx)
+                if key not in cp_to_primary:
+                    cp_to_primary[key] = cs
+    for cs in diagnostics:
+        cp_idx = cs.get("source_cp_index", -1)
+        if cp_idx >= 0:
+            key = (cs["source_class"], cs["source_method"], cp_idx)
+            if key in cp_to_primary:
+                primary = cp_to_primary[key]
+                cs["linked_primary_bci"] = primary.get("source_bci", -1)
+                praw = primary.get("raw", {})
+                if praw.get("target_class"):
+                    cs["linked_primary_target"] = {
+                        "class":      _norm(praw.get("target_class", "")),
+                        "method":     praw.get("target_method", ""),
+                        "descriptor": praw.get("target_descriptor", ""),
+                    }
 
     # -- Finalise classes ---------------------------------------------------
     for c in classes.values():
@@ -295,6 +369,7 @@ def _build_index(records: list) -> dict:
         "callsites_by":      dict(callsites_by),
         "all_callsites":     all_callsites,
         "artifact_by_class": dict(artifact_by_class),
+        "hidden_id_map":     hidden_id_map,
         "diagnostics":       diagnostics,
         "generated_classes": generated_cls,
         "export_summary":    export_summary,
@@ -307,9 +382,27 @@ def _build_index(records: list) -> dict:
 # ---------------------------------------------------------------------------
 
 def find_best_artifact(index: dict, class_name: str, loader_id: str | None = None) -> dict | None:
-    """Return the best artifact record for a class (prefer final, then original)."""
+    """Return the best artifact record for a class (prefer final, then original).
+
+    For hidden lambda classes (containing '+0x'), resolves the exact artifact via
+    the hidden_class_identity mapping to get the CRC-suffixed artifact name.
+    No fallback guessing — if the mapping is absent, returns None.
+    """
     by_class = index.get("artifact_by_class", {})
     cls = _norm(class_name)
+
+    # For hidden class runtime names (contain +0x), use hidden_id_map for exact resolution
+    if "+0x" in cls:
+        hid = index.get("hidden_id_map", {}).get(cls)
+        if hid is None:
+            return None  # no identity record — capture/export bug
+        crc = hid["artifact_crc"]
+        # Derive the base name (strip +0x... suffix) and form the CRC-suffixed artifact name
+        base = cls.split("+0x")[0]
+        crc_cls = f"{base}_crc{crc}"
+        cls = crc_cls
+        loader_id = loader_id or hid.get("loader_id")
+
     if cls not in by_class:
         return None
 
@@ -428,6 +521,7 @@ def callsite_summary(cs: dict) -> dict:
         "source_descriptor": cs.get("source_descriptor", ""),
         "source_bci":        cs.get("source_bci", -1),
         "source_opcode":     cs.get("source_opcode", ""),
+        "source_cp_index":   cs.get("source_cp_index", r.get("source_cp_index", r.get("src_cp_index", -1))),
         "category":          cs.get("category", ""),
         "all_exact":         cs.get("all_exact", False),
     }
@@ -478,6 +572,13 @@ def callsite_summary(cs: dict) -> dict:
         s["edges"]         = r.get("edges", [])
         s["adapter_kind"]  = r.get("adapter_kind", "")
         s["adapter_class"] = r.get("adapter_class", "")
+        s["staticizable"]  = r.get("staticizable", False)
+        if r.get("staticization_blockers"):
+            s["staticization_blockers"] = r.get("staticization_blockers")
     elif rec == "diagnostic":
         s["reason"] = cs.get("reason", "")
+        if cs.get("linked_primary_bci") is not None:
+            s["linked_primary_bci"] = cs["linked_primary_bci"]
+        if cs.get("linked_primary_target"):
+            s["linked_primary_target"] = cs["linked_primary_target"]
     return s

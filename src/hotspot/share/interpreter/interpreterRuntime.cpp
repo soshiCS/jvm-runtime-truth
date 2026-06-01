@@ -75,6 +75,8 @@
 #include "utilities/align.hpp"
 #include "utilities/copy.hpp"
 #include "utilities/events.hpp"
+#include "classfile/soroushProvenanceGraph.hpp"
+#include "runtime/vframe.inline.hpp"
 #ifdef COMPILER2
 #include "opto/runtime.hpp"
 #endif
@@ -995,6 +997,175 @@ JRT_ENTRY(void, InterpreterRuntime::resolve_from_cache(JavaThread* current, Byte
     break;
   }
 }
+JRT_END
+
+//------------------------------------------------------------------------------------------------------------------------
+// Soroush warm-path MH dispatch trace
+
+// JRT_ENTRY wrapper: handles thread-state transition.
+// Real work is in sg_trace_mh_impl (linkResolver.cpp), which has access to
+// the sg_walk_mh / sg_u2at helpers defined there.
+JRT_ENTRY(void, InterpreterRuntime::sg_trace_mh_dispatch(JavaThread* current, oopDesc* recv))
+  InterpreterRuntime::sg_trace_mh_impl(current, recv);
+JRT_END
+
+// Warm-path invokevirtual dispatch trace.
+// Fires on every non-final vtable dispatch in the interpreter.
+// concrete_method is the concrete Method* resolved by vtable lookup.
+JRT_ENTRY(void, InterpreterRuntime::soroush_trace_iv_dispatch(JavaThread* current, Method* concrete_method, oopDesc* recv_oop))
+  if (!soroush_graph_enabled()) return;
+  if (!Universe::is_fully_initialized()) return;
+  if (concrete_method == nullptr) return;
+
+  ResourceMark rm(current);
+
+  const char* iv_src_class  = nullptr;
+  const char* iv_src_method = nullptr;
+  const char* iv_src_desc   = nullptr;
+  int         iv_src_bci    = -1;
+  int         iv_src_opcode = 0xb6;
+  int         iv_src_cp     = -1;
+  uint64_t    iv_src_loader = 0;
+
+  for (vframeStream vfst(current); !vfst.at_end(); vfst.next()) {
+    Method* fm = vfst.method();
+    if (fm == nullptr) continue;
+    const char* fh = fm->method_holder()->name()->as_C_string();
+    if (strncmp(fh, "java/",    5) == 0 ||
+        strncmp(fh, "jdk/",     4) == 0 ||
+        strncmp(fh, "sun/",     4) == 0 ||
+        strncmp(fh, "com/sun/", 8) == 0) {
+      continue;
+    }
+    int bci = vfst.bci();
+    if (bci < 0 || bci >= fm->code_size()) break;
+    address bcp = fm->bcp_from(bci);
+    int op = (int)(uint8_t)Bytecodes::java_code_at(fm, bcp);
+    // Only record invokevirtual; skip invokeinterface forced-virtual cases
+    if (op != Bytecodes::_invokevirtual) break;
+    if (bci + 2 < fm->code_size()) {
+      int cc_idx = (((int)(uint8_t)fm->code_base()[bci + 1]) << 8)
+                 |  ((int)(uint8_t)fm->code_base()[bci + 2]);
+      ConstantPool* cpool = fm->constants();
+      if (cpool != nullptr && cpool->cache() != nullptr
+          && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+        iv_src_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+      }
+    }
+    iv_src_class  = fh;
+    iv_src_method = fm->name()->as_C_string();
+    iv_src_desc   = fm->signature()->as_C_string();
+    iv_src_bci    = bci;
+    iv_src_opcode = op;
+    iv_src_loader = (uint64_t)(uintptr_t)fm->method_holder()->class_loader_data();
+    break;
+  }
+
+  if (iv_src_class == nullptr || iv_src_bci < 0) return;
+
+  const char* tgt_class  = concrete_method->method_holder()->name()->as_C_string();
+  const char* tgt_method = concrete_method->name()->as_C_string();
+  const char* tgt_desc   = concrete_method->signature()->as_C_string();
+  uint64_t    tgt_loader = (uint64_t)(uintptr_t)concrete_method->method_holder()->class_loader_data();
+
+  soroush_graph_poly_callsite("invokevirtual",
+      iv_src_class, iv_src_loader, iv_src_method, iv_src_desc,
+      iv_src_bci, iv_src_opcode, iv_src_cp,
+      tgt_class, tgt_loader, tgt_method, tgt_desc);
+
+  // Phase 2E: when the dispatched target is java/lang/reflect/Method.invoke,
+  // recv_oop (r2 at the call site) is the java.lang.reflect.Method object.
+  // Decode its clazz/slot fields to find the actual reflected target and emit
+  // a reflection_method_invoke record.  Fires on every warm-path invocation of
+  // Method.invoke, deduped per (caller BCI, reflected target) pair by poly_callsite.
+  if (concrete_method->method_holder()->name()->equals("java/lang/reflect/Method") &&
+      concrete_method->name()->equals("invoke") &&
+      recv_oop != nullptr) {
+    oop method_obj = recv_oop;
+    if (oopDesc::is_oop_or_null(method_obj) &&
+        method_obj->klass() != nullptr &&
+        method_obj->klass()->name()->equals("java/lang/reflect/Method")) {
+      oop clazz_mirror = java_lang_reflect_Method::clazz(method_obj);
+      int mslot = java_lang_reflect_Method::slot(method_obj);
+      if (clazz_mirror != nullptr && mslot >= 0) {
+        Klass* dk = java_lang_Class::as_Klass(clazz_mirror);
+        if (dk != nullptr && dk->is_instance_klass()) {
+          InstanceKlass* dik = InstanceKlass::cast(dk);
+          Method* rmet = dik->method_with_idnum(mslot);
+          if (rmet != nullptr) {
+            soroush_graph_poly_callsite("reflection_method_invoke",
+                iv_src_class, iv_src_loader, iv_src_method, iv_src_desc,
+                iv_src_bci, iv_src_opcode, iv_src_cp,
+                dik->name()->as_C_string(),
+                (uint64_t)(uintptr_t)dik->class_loader_data(),
+                rmet->name()->as_C_string(),
+                rmet->signature()->as_C_string());
+          }
+        }
+      }
+    }
+  }
+JRT_END
+
+JRT_ENTRY(void, InterpreterRuntime::soroush_trace_ii_dispatch(JavaThread* current, Method* concrete_method))
+  if (!soroush_graph_enabled()) return;
+  if (!Universe::is_fully_initialized()) return;
+  if (concrete_method == nullptr) return;
+
+  ResourceMark rm(current);
+
+  const char* ii_src_class  = nullptr;
+  const char* ii_src_method = nullptr;
+  const char* ii_src_desc   = nullptr;
+  int         ii_src_bci    = -1;
+  int         ii_src_opcode = 0xb9; // invokeinterface
+  int         ii_src_cp     = -1;
+  uint64_t    ii_src_loader = 0;
+
+  for (vframeStream vfst(current); !vfst.at_end(); vfst.next()) {
+    Method* fm = vfst.method();
+    if (fm == nullptr) continue;
+    const char* fh = fm->method_holder()->name()->as_C_string();
+    if (strncmp(fh, "java/",    5) == 0 ||
+        strncmp(fh, "jdk/",     4) == 0 ||
+        strncmp(fh, "sun/",     4) == 0 ||
+        strncmp(fh, "com/sun/", 8) == 0) {
+      continue;
+    }
+    int bci = vfst.bci();
+    if (bci < 0 || bci >= fm->code_size()) break;
+    address bcp = fm->bcp_from(bci);
+    int op = (int)(uint8_t)Bytecodes::java_code_at(fm, bcp);
+    if (op != Bytecodes::_invokeinterface) break;
+    if (bci + 2 < fm->code_size()) {
+      int cc_idx = (((int)(uint8_t)fm->code_base()[bci + 1]) << 8)
+                 |  ((int)(uint8_t)fm->code_base()[bci + 2]);
+      ConstantPool* cpool = fm->constants();
+      if (cpool != nullptr && cpool->cache() != nullptr
+          && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+        ii_src_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+      }
+    }
+    ii_src_class  = fh;
+    ii_src_method = fm->name()->as_C_string();
+    ii_src_desc   = fm->signature()->as_C_string();
+    ii_src_bci    = bci;
+    ii_src_opcode = op;
+    ii_src_loader = (uint64_t)(uintptr_t)fm->method_holder()->class_loader_data();
+    break;
+  }
+
+  if (ii_src_class == nullptr || ii_src_bci < 0) return;
+
+  const char* tgt_class  = concrete_method->method_holder()->name()->as_C_string();
+  const char* tgt_method = concrete_method->name()->as_C_string();
+  const char* tgt_desc   = concrete_method->signature()->as_C_string();
+  uint64_t    tgt_loader = (uint64_t)(uintptr_t)concrete_method->method_holder()->class_loader_data();
+
+  soroush_graph_poly_callsite("invokeinterface",
+      ii_src_class, ii_src_loader, ii_src_method, ii_src_desc,
+      ii_src_bci, ii_src_opcode, ii_src_cp,
+      tgt_class, tgt_loader, tgt_method, tgt_desc);
 JRT_END
 
 //------------------------------------------------------------------------------------------------------------------------

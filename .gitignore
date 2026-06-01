@@ -2,3 +2,7 @@ build/
 capture.log
 *.log
 hs_err_pid*
+.claude/
+.vscode/
+__pycache__/
+*.pyc

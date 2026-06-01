@@ -91,6 +91,21 @@ class InterpreterRuntime: AllStatic {
   static void    throw_pending_exception(JavaThread* current);
 
   static void resolve_from_cache(JavaThread* current, Bytecodes::Code bytecode);
+
+  // Warm-path MH dispatch trace — called from TemplateTable::invokehandle on
+  // EVERY invokehandle dispatch (both cold first-resolution and warm cached).
+  // recv is the live receiver MethodHandle oop at the call site.
+  // Declared here; JRT_ENTRY wrapper in interpreterRuntime.cpp;
+  // implementation (sg_trace_mh_impl) in linkResolver.cpp alongside sg_walk_mh.
+  static void sg_trace_mh_dispatch(JavaThread* thread, oopDesc* recv);
+  static void sg_trace_mh_impl(JavaThread* thread, oopDesc* recv);
+  // Warm-path invokevirtual dispatch trace — called from TemplateTable::invokevirtual_helper
+  // on every non-final vtable dispatch. concrete_method is the resolved concrete Method*.
+  static void soroush_trace_iv_dispatch(JavaThread* thread, Method* concrete_method, oopDesc* recv_oop);
+  // Warm-path invokeinterface dispatch trace — called from TemplateTable::invokeinterface
+  // on every normal itable dispatch. concrete_method is the resolved concrete Method*.
+  static void soroush_trace_ii_dispatch(JavaThread* thread, Method* concrete_method);
+
  private:
   // Statics & fields
   static void resolve_get_put(JavaThread* current, Bytecodes::Code bytecode);

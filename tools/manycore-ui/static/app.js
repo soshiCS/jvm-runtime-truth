@@ -1,4 +1,4 @@
-/* ManyCore UI — frontend logic */
+/* Runtime Truth UI — frontend logic */
 "use strict";
 
 // ── State ─────────────────────────────────────────────────────────────────
@@ -13,7 +13,8 @@ const S = {
   selectedIdx:     null,      // callsite idx
   activeTab:       "targets", // "targets" | "bytecode"
   userPrefixes:    [],        // from run config, used for APP badge + diag classification
-  showHelperNodes: false,     // toggle: show nodes with no bytecode artifact
+  showHelperNodes: true,      // toggle: show all nodes including runtime-structure nodes
+  showAllClasses:  false,     // toggle: show all loaded classes, not just dispatch-relevant ones
 };
 
 // ── API helpers ───────────────────────────────────────────────────────────
@@ -76,6 +77,12 @@ function wireButtons() {
   document.getElementById("show-helper-nodes").addEventListener("change", e => {
     S.showHelperNodes = e.target.checked;
     renderCurrentTargets();
+  });
+
+  // Show-all-classes toggle
+  document.getElementById("show-all-classes").addEventListener("change", e => {
+    S.showAllClasses = e.target.checked;
+    renderClassList();
   });
 
   // Close modals on overlay click
@@ -182,8 +189,11 @@ function showRunStats(run) {
   if (!st) return;
   const es = st.export_summary;
   const complete = es ? (es.complete === false ? "⚠ INCOMPLETE" : "✓ complete") : "";
+  const csLabel = st.user_callsite_count != null
+    ? `${st.user_callsite_count} user callsites (${st.callsite_count} total)`
+    : `${st.callsite_count} callsites`;
   setEl("run-stats-label",
-    `${st.class_count} classes · ${st.callsite_count} callsites · ${st.diagnostic_count} diags · ${st.total_records} records ${complete}`);
+    `${st.class_count} classes · ${csLabel} · ${st.diagnostic_count} diags · ${st.total_records} records ${complete}`);
 }
 
 // ── Class list ────────────────────────────────────────────────────────────
@@ -192,27 +202,52 @@ async function loadClasses() {
   renderClassList();
 }
 
+function isDispatchRelevant(c) {
+  const isApp = S.userPrefixes.length > 0 && S.userPrefixes.some(p => c.name.startsWith(p));
+  if (S.userPrefixes.length > 0) {
+    // Prefix set: only APP classes + their specific dispatch targets.
+    // Generated classes are only shown if they match the APP prefix or are
+    // direct targets of user-prefix callsites — not just because they exist.
+    return isApp || c.has_user_callsites_src || c.has_user_callsites_tgt;
+  }
+  // No prefix: show everything dispatch-related including all generated.
+  return c.has_callsites_src || c.has_callsites_tgt || c.generated;
+}
+
 function renderClassList() {
   const el = document.getElementById("class-list");
   const f  = S.classFilter;
 
-  const filtered = f
+  const textFiltered = f
     ? S.classes.filter(c => c.name.toLowerCase().includes(f))
     : S.classes;
 
-  if (!filtered.length) {
+  const relevant  = textFiltered.filter(isDispatchRelevant);
+  const hiddenCnt = textFiltered.length - relevant.length;
+  const visible   = S.showAllClasses ? textFiltered : relevant;
+
+  if (!visible.length) {
     el.innerHTML = `<div class="empty-state"><span class="icon">🔍</span>${f ? "no matches" : "no classes"}</div>`;
     return;
   }
 
-  el.innerHTML = filtered.map(c => {
-    const isApp = S.userPrefixes.length > 0 && S.userPrefixes.some(p => c.name.startsWith(p));
+  let countBar = `<div class="class-count-bar">${visible.length} class${visible.length !== 1 ? "es" : ""}`;
+  if (!S.showAllClasses && hiddenCnt > 0) {
+    countBar += ` · <span class="hidden-count">${hiddenCnt} hidden loaded-only</span>`;
+  }
+  countBar += `</div>`;
+
+  const scoped = S.userPrefixes.length > 0;
+  const rows = visible.map(c => {
+    const isApp = scoped && S.userPrefixes.some(p => c.name.startsWith(p));
+    const showSrc = scoped ? c.has_user_callsites_src : c.has_callsites_src;
+    const showTgt = scoped ? c.has_user_callsites_tgt : c.has_callsites_tgt;
     const badges = [
-      isApp                ? `<span class="badge badge-app" title="matches user/app prefix">APP</span>` : "",
-      c.has_callsites_src  ? `<span class="badge badge-cs" title="has callsites (source)">CS</span>` : "",
-      c.has_artifacts      ? `<span class="badge badge-art" title="has bytecode artifacts">ART</span>` : "",
-      c.has_diagnostics    ? `<span class="badge badge-diag" title="has diagnostics">⚠</span>` : "",
-      c.generated          ? `<span class="badge badge-gen" title="runtime-generated">GEN</span>` : "",
+      isApp     ? `<span class="badge badge-app" title="matches user/app prefix">APP</span>` : "",
+      showSrc   ? `<span class="badge badge-src" title="source of captured callsite">SRC</span>` : "",
+      showTgt   ? `<span class="badge badge-tgt" title="appears as dispatch target or helper">TGT</span>` : "",
+      c.generated       ? `<span class="badge badge-gen" title="runtime-generated">GEN</span>` : "",
+      c.has_artifacts   ? `<span class="badge badge-art" title="has bytecode artifacts">ART</span>` : "",
     ].join("");
     const sel = c.name === S.selectedClass ? " selected" : "";
     return `<div class="class-item${sel}" data-class="${esc(c.name)}">
@@ -220,6 +255,8 @@ function renderClassList() {
       <span class="badges">${badges}</span>
     </div>`;
   }).join("");
+
+  el.innerHTML = countBar + rows;
 
   el.querySelectorAll(".class-item").forEach(row =>
     row.addEventListener("click", () => onClassClick(row.dataset.class))
@@ -243,7 +280,89 @@ async function loadCallsites(className) {
 
   S.callsites = await api(`/api/runs/${S.runId}/classes/${encodeURIComponent(className)}/callsites`)
     .catch(() => []);
+
+  if (!S.callsites.length) {
+    const cls = S.classes.find(c => c.name === className);
+    if (cls && cls.has_artifacts) {
+      await showArtifactClass(cls);
+      return;
+    }
+    if (cls && !cls.has_artifacts && (cls.record_types || []).includes("runtime_target_ref")) {
+      await showLambdaInstanceClass(cls);
+      return;
+    }
+  }
   renderCallsiteList();
+}
+
+async function showArtifactClass(cls) {
+  const el = document.getElementById("callsite-list");
+
+  const kindBadges = [
+    cls.generated       ? `<span class="badge badge-gen" title="runtime-generated">GEN</span>` : "",
+    cls.has_callsites_tgt || cls.has_user_callsites_tgt
+      ? `<span class="badge badge-tgt" title="appears as dispatch target">TGT</span>` : "",
+    `<span class="badge badge-art" title="has bytecode artifact">ART</span>`,
+  ].join("");
+
+  el.innerHTML = `<div class="artifact-info-panel">
+    <div class="artifact-info-class">${esc(cls.name)}<span class="badges" style="margin-left:6px">${kindBadges}</span></div>
+    <div class="artifact-info-note">No source callsites — runtime-generated artifact.<br>Loading bytecode…</div>
+  </div>`;
+
+  // Right panel: set title, clear targets placeholder, auto-load bytecode
+  setEl("right-title", shortName(cls.name));
+  document.getElementById("targets-view").innerHTML =
+    `<div class="empty-state"><span class="icon">🔧</span>Runtime-generated class — no source callsites</div>`;
+  document.getElementById("bytecode-view").innerHTML =
+    `<div class="loading"><span class="spinner"></span> loading artifact…</div>`;
+  const toggleWrap = document.getElementById("helper-toggle-wrap");
+  if (toggleWrap) toggleWrap.classList.add("hidden");
+  switchTab("bytecode");
+
+  await loadBytecode(cls.name, "", null);
+}
+
+async function showLambdaInstanceClass(cls) {
+  const isInstance = /\+0x[0-9a-fA-F]+$/.test(cls.name);
+
+  const el = document.getElementById("callsite-list");
+  const tgtBadge = cls.has_callsites_tgt || cls.has_user_callsites_tgt
+    ? `<span class="badge badge-tgt" title="appears as dispatch target">TGT</span>` : "";
+
+  if (isInstance) {
+    el.innerHTML = `<div class="artifact-info-panel">
+      <div class="artifact-info-class">${esc(cls.name)}<span class="badges" style="margin-left:6px">${tgtBadge}</span></div>
+      <div class="artifact-info-note">
+        Hidden lambda instance — loading exact bytecode via identity record…
+      </div>
+    </div>`;
+  } else {
+    el.innerHTML = `<div class="artifact-info-panel">
+      <div class="artifact-info-class">${esc(cls.name)}<span class="badges" style="margin-left:6px">${tgtBadge}</span></div>
+      <div class="artifact-info-note">Runtime-only target — no source callsites and no artifact.</div>
+    </div>`;
+  }
+
+  setEl("right-title", shortName(cls.name));
+  const toggleWrap = document.getElementById("helper-toggle-wrap");
+  if (toggleWrap) toggleWrap.classList.add("hidden");
+
+  if (isInstance) {
+    document.getElementById("targets-view").innerHTML =
+      `<div class="empty-state"><span class="icon">λ</span>Hidden lambda instance — exact artifact resolved via identity record</div>`;
+    document.getElementById("bytecode-view").innerHTML =
+      `<div class="loading"><span class="spinner"></span> loading artifact…</div>`;
+    switchTab("bytecode");
+    // Use cls.name (+0x... form) directly — backend resolves to the exact CRC-suffixed artifact
+    // via the hidden_class_identity JSONL record. No fallback guessing.
+    await loadBytecode(cls.name, "", null);
+  } else {
+    document.getElementById("targets-view").innerHTML =
+      `<div class="empty-state"><span class="icon">—</span>Runtime-only target — no artifact</div>`;
+    document.getElementById("bytecode-view").innerHTML =
+      `<div class="empty-state"><span class="icon">—</span>No bytecode available</div>`;
+  }
 }
 
 function renderCallsiteList() {
@@ -313,7 +432,7 @@ async function onCallsiteClick(idx) {
 
   document.getElementById("targets-view").innerHTML = renderTargetsView(cs);
   document.getElementById("bytecode-view").innerHTML =
-    `<div class="empty-state"><span class="icon">📄</span>Click "View Bytecode" on a target</div>`;
+    `<div class="empty-state"><span class="icon">📄</span>Click "View bytecode" or "View details" on a node</div>`;
 
   switchTab("targets");
   wireTargetViewButtons(cs);
@@ -498,20 +617,36 @@ function renderTargetSet(cs) {
   return html;
 }
 
-function nodeIsHideable(n) {
-  if ((n.classification || "") === "user_target") return false;
-  // keep nodes that have both class+method (can open bytecode) or an artifact_path
+// A node is "structural-only" if it has no bytecode artifact (no class+method).
+// These nodes represent runtime MH chain slots: bound values, nested adapters, etc.
+function nodeIsStructural(n) {
   if (n.class && n.method) return false;
   if (n.artifact_path)     return false;
   return true;
 }
 
-function renderAdapterGraph(cs) {
-  const allNodes = cs.nodes || [];
-  const kind     = cs.adapter_kind || "";
-  const allEx    = cs.all_exact;
+// nodeIsHideable: kept for backward compat with toggle; hides structural nodes when
+// S.showHelperNodes is false.
+function nodeIsHideable(n) {
+  if ((n.classification || "") === "user_target") return false;
+  return nodeIsStructural(n);
+}
 
-  const nodes      = S.showHelperNodes ? allNodes : allNodes.filter(n => !nodeIsHideable(n));
+const NODE_BADGE_MAP = {
+  user_target:      "node-badge-user",
+  internal_jdk:     "node-badge-jdk",
+  helper_boxing:    "node-badge-boxing",
+  helper_adapter:   "node-badge-adapter",
+  helper_invoker:   "node-badge-adapter",
+  helper_reflection:"node-badge-helper",
+  bound_data:       "node-badge-data",
+};
+
+function renderAdapterGraph(cs) {
+  const allNodes    = cs.nodes || [];
+  const kind        = cs.adapter_kind || "";
+  const allEx       = cs.all_exact;
+  const nodes       = S.showHelperNodes ? allNodes : allNodes.filter(n => !nodeIsHideable(n));
   const hiddenCount = allNodes.length - nodes.length;
 
   let html = `<div class="target-section">
@@ -519,53 +654,114 @@ function renderAdapterGraph(cs) {
     <div class="node-list">`;
 
   if (nodes.length === 0 && hiddenCount > 0) {
-    html += `<div class="empty-state" style="margin:8px 0"><span class="icon">🔒</span>All ${hiddenCount} node(s) are helper/no-bytecode nodes (toggle "show helpers" to reveal)</div>`;
+    const structCls = [...new Set(allNodes.filter(nodeIsStructural).map(n => n.classification||"unknown"))];
+    html += `<div class="empty-state" style="margin:8px 0">
+      <span class="icon">📦</span>
+      ${hiddenCount} structural node(s) hidden (${structCls.join(", ")}) — enable "Show all" to view runtime-structure details
+    </div>`;
   } else {
     for (const n of nodes) {
-      const cls = n.classification || "unknown";
-      const badgeClass = { user_target:"node-badge-user", internal_jdk:"node-badge-jdk", helper_boxing:"node-badge-boxing", helper_adapter:"node-badge-adapter", helper_invoker:"node-badge-adapter" }[cls] || "node-badge-adapter";
-      const exactStr   = n.exact === false ? `<span style="color:#b45309;font-size:10px"> exact=false${n.exact_false_reason ? " ("+n.exact_false_reason+")" : ""}</span>` : "";
-      const semanticOp = n.semantic_op ? `<span class="node-semantic-op">${esc(n.semantic_op)}</span>` : "";
-
-      html += `<div class="node-card ${cls}">
-        <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
-          <span class="node-badge ${badgeClass}">${esc(cls)}</span>
-          <span style="color:#64748b;font-size:10px">node ${n.id}</span>
-          ${semanticOp}
-          ${exactStr}
-        </div>
-        <div class="kv-grid">
-          <span class="kv-key">Class</span>      <span class="kv-val node-class">${esc(n.class||n.node_adapter_class||"—")}</span>
-          <span class="kv-key">Method</span>     <span class="kv-val node-method">${esc(n.method||"—")}</span>
-          <span class="kv-key">Descriptor</span><span class="kv-val">${esc(shortDesc(n.descriptor||""))}</span>
-        </div>`;
-
-      if (n.class && n.method && n.exact !== false) {
-        html += `<div style="margin-top:6px">
-          <button class="btn-code btn-sm" data-bc-class="${esc(n.class)}" data-bc-loader="${esc(n.loader_id||"")}" data-bc-method="${esc(n.method||"")}">View bytecode</button>
-        </div>`;
-      }
-      html += `</div>`;
+      html += renderNodeCard(n, cs);
     }
   }
 
   if (hiddenCount > 0 && !S.showHelperNodes) {
-    html += `<div class="hidden-nodes-bar">Hidden: ${hiddenCount} helper/no-bytecode node(s)</div>`;
+    const structCls = [...new Set(allNodes.filter(nodeIsStructural).map(n => n.classification||"unknown"))];
+    html += `<div class="hidden-nodes-bar">Collapsed: ${hiddenCount} structural node(s) — ${structCls.join(", ")} (enable "Show all" to view)</div>`;
   }
 
   html += `</div></div>`;
   return html;
 }
 
+function renderNodeCard(n, cs) {
+  const cls        = n.classification || "unknown";
+  const isStruct   = nodeIsStructural(n);
+  const badgeClass = NODE_BADGE_MAP[cls] || "node-badge-helper";
+  // helper_adapter nodes are BMH containers with no standalone bytecode; their
+  // node-level exact=false is structural and does not indicate graph inexactness.
+  const exactStr = (cls === "helper_adapter")
+    ? `<span style="color:#64748b;font-size:10px"> · container</span>`
+    : (n.exact === false
+      ? `<span style="color:#b45309;font-size:10px"> ✗ exact=false${n.exact_false_reason ? " ("+n.exact_false_reason+")" : ""}</span>`
+      : "");
+  const semOp  = n.semantic_op
+    ? `<span class="node-semantic-op">${esc(n.semantic_op)}</span>` : "";
+  const typeOp = (n.from_type && n.to_type)
+    ? `<span class="node-type-cast">${esc(n.from_type)} → ${esc(n.to_type)}</span>` : "";
+
+  // ── kv rows depend on node type ──────────────────────────────────────────
+  let kvRows = "";
+  if (!isStruct) {
+    // Has bytecode — standard class/method/descriptor
+    kvRows = `
+      <span class="kv-key">Class</span>      <span class="kv-val node-class">${esc(n.class||"—")}</span>
+      <span class="kv-key">Method</span>     <span class="kv-val node-method">${esc(n.method||"—")}</span>
+      <span class="kv-key">Descriptor</span><span class="kv-val">${esc(shortDesc(n.descriptor||""))}</span>`;
+    if (n.to_descriptor)
+      kvRows += `<span class="kv-key">Outer type</span><span class="kv-val" style="color:#64748b">${esc(n.to_descriptor)}</span>`;
+  } else if (cls === "bound_data") {
+    const species = shortCls(n.adapter_class || n.node_adapter_class || cs.adapter_class || "");
+    kvRows = `
+      <span class="kv-key">Type</span>       <span class="kv-val">bound non-MH argument</span>
+      ${species ? `<span class="kv-key">BMH species</span><span class="kv-val node-class">${esc(species)}</span>` : ""}
+      ${n.exact_false_reason ? `<span class="kv-key">Reason</span><span class="kv-val" style="color:#b45309">${esc(n.exact_false_reason)}</span>` : ""}`;
+  } else if (cls === "helper_adapter") {
+    const species = shortCls(n.adapter_class || n.node_adapter_class || "");
+    kvRows = `
+      <span class="kv-key">Type</span><span class="kv-val" style="color:#64748b">Container node: no standalone bytecode; behavior lives in child nodes.</span>
+      ${species ? `<span class="kv-key">BMH species</span><span class="kv-val node-class">${esc(species)}</span>` : ""}
+      ${n.to_descriptor ? `<span class="kv-key">Inner type</span><span class="kv-val" style="font-family:ui-monospace,monospace;font-size:10px">${esc(n.to_descriptor)}</span>` : ""}`;
+  } else {
+    kvRows = `
+      <span class="kv-key">Role</span>  <span class="kv-val">${esc(n.role||"—")}</span>
+      ${n.exact_false_reason ? `<span class="kv-key">Reason</span><span class="kv-val" style="color:#b45309">${esc(n.exact_false_reason)}</span>` : ""}`;
+  }
+
+  // ── action buttons ────────────────────────────────────────────────────────
+  let btns = "";
+  if (!isStruct && n.exact !== false) {
+    btns = `<button class="btn-code btn-sm" data-bc-class="${esc(n.class)}" data-bc-loader="${esc(n.loader_id||"")}" data-bc-method="${esc(n.method||"")}">View bytecode</button>`;
+  }
+  if (isStruct) {
+    btns = `<button class="btn-details btn-sm" data-detail-nodeid="${n.id}" data-callsite-idx="${cs.idx}">View details</button>`;
+  }
+
+  return `<div class="node-card ${cls}${isStruct ? " structural" : ""}">
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;flex-wrap:wrap">
+      <span class="node-badge ${badgeClass}">${esc(cls)}</span>
+      <span style="color:#64748b;font-size:10px">node ${n.id} · ${esc(n.role||"—")}</span>
+      ${semOp}${typeOp}${exactStr}
+    </div>
+    <div class="kv-grid">${kvRows}</div>
+    ${btns ? `<div style="margin-top:6px">${btns}</div>` : ""}
+  </div>`;
+}
+
 function renderDiagDetail(cs) {
+  let primaryHtml = "";
+  if (cs.linked_primary_bci != null && cs.linked_primary_bci >= 0) {
+    const t = cs.linked_primary_target;
+    const tStr = t
+      ? `${esc(t.class)}.${esc(t.method)}${esc(t.descriptor)}`
+      : "(unknown)";
+    primaryHtml = `
+      <div style="margin-top:10px;padding:8px;background:#f0fdf4;border:1px solid #86efac;border-radius:4px;font-size:11px">
+        <strong>Sibling callsite</strong> — shares CP entry #${cs.source_cp_index >= 0 ? cs.source_cp_index : "?"} with BCI ${cs.linked_primary_bci}.<br>
+        Target previously resolved as: <code>${tStr}</code><br>
+        <span style="color:#64748b">This BCI executed after the CP cache entry was already populated; exact receiver not re-captured.</span>
+      </div>`;
+  }
   return `<div class="target-section">
     <h4>Diagnostic</h4>
     <div class="kv-grid">
-      <span class="kv-key">Reason</span>  <span class="kv-val" style="color:#dc2626">${esc(cs.reason||"—")}</span>
-      <span class="kv-key">Category</span><span class="kv-val">${esc(cs.category||"—")}</span>
-      <span class="kv-key">BCI</span>     <span class="kv-val">${cs.source_bci >= 0 ? cs.source_bci : "—"}</span>
-      <span class="kv-key">Opcode</span>  <span class="kv-val">${esc(cs.source_opcode||"—")}</span>
+      <span class="kv-key">Reason</span>   <span class="kv-val" style="color:#dc2626">${esc(cs.reason||"—")}</span>
+      <span class="kv-key">Category</span> <span class="kv-val">${esc(cs.category||"—")}</span>
+      <span class="kv-key">BCI</span>      <span class="kv-val">${cs.source_bci >= 0 ? cs.source_bci : "—"}</span>
+      <span class="kv-key">Opcode</span>   <span class="kv-val">${esc(cs.source_opcode||"—")}</span>
+      <span class="kv-key">CP index</span> <span class="kv-val">${cs.source_cp_index >= 0 ? cs.source_cp_index : "—"}</span>
     </div>
+    ${primaryHtml}
     <p style="margin-top:10px;font-size:11px;color:#64748b">This callsite could not be fully resolved. No exact target was recorded for this site.</p>
   </div>`;
 }
@@ -573,12 +769,157 @@ function renderDiagDetail(cs) {
 function wireTargetViewButtons(cs) {
   document.querySelectorAll("[data-bc-class]").forEach(btn => {
     btn.addEventListener("click", async () => {
-      const cls    = btn.dataset.bcClass;
-      const loader = btn.dataset.bcLoader;
-      const method = btn.dataset.bcMethod;
-      await loadBytecode(cls, loader, method);
+      await loadBytecode(btn.dataset.bcClass, btn.dataset.bcLoader, btn.dataset.bcMethod);
     });
   });
+  document.querySelectorAll("[data-detail-nodeid]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      loadNodeDetails(parseInt(btn.dataset.detailNodeid, 10), parseInt(btn.dataset.callsiteIdx, 10));
+    });
+  });
+}
+
+// ── Node details (structural/runtime-structure nodes) ─────────────────────
+function loadNodeDetails(nodeId, csIdx) {
+  switchTab("bytecode");
+  const bv = document.getElementById("bytecode-view");
+  const cs = S.callsites.find(c => c.idx === csIdx);
+  if (!cs) { bv.innerHTML = `<div style="padding:12px;color:#dc2626">Callsite ${csIdx} not found</div>`; return; }
+  const n = (cs.nodes || []).find(nd => nd.id === nodeId);
+  if (!n) { bv.innerHTML = `<div style="padding:12px;color:#dc2626">Node ${nodeId} not found</div>`; return; }
+  bv.innerHTML = renderNodeDetailsPanel(n, cs);
+}
+
+function renderNodeDetailsPanel(n, cs) {
+  const cls = n.classification || "unknown";
+  const badgeClass = NODE_BADGE_MAP[cls] || "node-badge-helper";
+
+  const CLS_EXPLAIN = {
+    bound_data:
+      "A bound non-MethodHandle argument captured in a BoundMethodHandle slot. " +
+      "This node holds a concrete value (primitive or object) fixed at linkage time — it has no bytecode.",
+    helper_adapter:
+      "Container node: a BoundMethodHandle Species wrapper with no standalone bytecode. " +
+      "Its node-level exact=false is structural — it means this wrapper has no direct DMH target, " +
+      "not that the graph is inexact. Behavior lives in child nodes reachable via the edges from this container.",
+    helper_invoker:
+      "A JVM-internal MH invoker trampoline. Dispatches calls through the MH chain but is " +
+      "internal JDK infrastructure with no user-visible bytecode.",
+    helper_boxing:
+      "A boxing/unboxing helper inserted by the MH framework to convert between primitive and " +
+      "reference types in the adapter chain.",
+    helper_reflection:
+      "A reflective dispatch helper (e.g. java.lang.reflect.Method or MethodHandle.invoke internals).",
+    internal_jdk:
+      "A JDK-internal helper method. Bytecode exists but the class was classified as JDK infrastructure.",
+  };
+  const explain = CLS_EXPLAIN[cls] || `Runtime-structure node (${cls}). No bytecode artifact.`;
+
+  // Runtime payload rows
+  let payloadRows = "";
+  const addP = (k, v) => { payloadRows += `<span class="kv-key">${k}</span><span class="kv-val">${v}</span>`; };
+  addP("Node ID",        esc(String(n.id)));
+  addP("Role",           esc(n.role || "—"));
+  if (cls === "helper_adapter") {
+    addP("Node type", `<span style="color:#64748b">Container node: no standalone bytecode; behavior lives in child nodes.</span>`);
+  } else {
+    addP("Exact",
+      n.exact === false
+        ? `<span style="color:#b45309">✗ false${n.exact_false_reason ? " — " + esc(n.exact_false_reason) : ""}</span>`
+        : `<span style="color:#15803d">✓ true</span>`);
+  }
+  if (n.semantic_op)
+    addP("Semantic op", `<span class="node-semantic-op">${esc(n.semantic_op)}</span>`);
+  if (n.from_type && n.to_type)
+    addP("Type cast", `<span class="node-type-cast">${esc(n.from_type)} → ${esc(n.to_type)}</span>`);
+  const species = n.adapter_class || n.node_adapter_class || (cls === "bound_data" ? cs.adapter_class : "") || "";
+  if (species)
+    addP("BMH species", `<span class="node-class">${esc(shortCls(species))}</span>`);
+  if (n.to_descriptor)
+    addP("Inner type", `<code style="font-family:ui-monospace,monospace;font-size:10px">${esc(n.to_descriptor)}</code>`);
+
+  // Graph context
+  let graphRows = "";
+  const addG = (k, v) => { graphRows += `<span class="kv-key">${k}</span><span class="kv-val">${v}</span>`; };
+  addG("Kind",             esc(cs.adapter_kind || "—"));
+  if (cs.adapter_class) addG("Top-level species", esc(shortCls(cs.adapter_class)));
+  addG("Graph all_exact",      cs.all_exact    ? `<span style="color:#15803d">✓ yes</span>` : `<span style="color:#b45309">✗ no</span>`);
+  addG("Graph staticizable",   cs.staticizable ? `<span style="color:#15803d">✓ yes</span>` : `<span style="color:#b45309">✗ no</span>`);
+
+  // Edges involving this node
+  const edges = cs.edges || [];
+  const myEdges = edges.filter(e => {
+    const f = e.from_node_id ?? e.from;
+    const t = e.to_node_id   ?? e.to;
+    return f === n.id || t === n.id;
+  });
+  let edgeHtml;
+  if (myEdges.length > 0) {
+    edgeHtml = `<table style="width:100%;border-collapse:collapse;font-size:10px;font-family:ui-monospace,monospace">
+      <thead><tr>
+        <th style="text-align:left;padding:3px 6px;color:#64748b;border-bottom:1px solid #e2e8f0">From</th>
+        <th style="text-align:left;padding:3px 6px;color:#64748b;border-bottom:1px solid #e2e8f0">To</th>
+        <th style="text-align:left;padding:3px 6px;color:#64748b;border-bottom:1px solid #e2e8f0">Label</th>
+      </tr></thead><tbody>`;
+    for (const e of myEdges) {
+      const f  = e.from_node_id ?? e.from;
+      const t  = e.to_node_id   ?? e.to;
+      const lb = e.label || e.edge_label || "—";
+      const fN = (cs.nodes || []).find(nd => nd.id === f);
+      const tN = (cs.nodes || []).find(nd => nd.id === t);
+      const fStr = f === n.id ? `<strong>node ${f}</strong>` : `node ${f}${fN ? " (" + esc(fN.role||"") + ")" : ""}`;
+      const tStr = t === n.id ? `<strong>node ${t}</strong>` : `node ${t}${tN ? " (" + esc(tN.role||"") + ")" : ""}`;
+      edgeHtml += `<tr style="border-bottom:1px solid #f1f5f9">
+        <td style="padding:3px 6px">${fStr}</td>
+        <td style="padding:3px 6px">${tStr}</td>
+        <td style="padding:3px 6px;color:#64748b">${esc(lb)}</td>
+      </tr>`;
+    }
+    edgeHtml += `</tbody></table>`;
+  } else {
+    edgeHtml = `<p style="font-size:11px;color:#94a3b8;font-style:italic">No edge data recorded for this node.</p>`;
+  }
+
+  // Sibling nodes list
+  const allNodes = cs.nodes || [];
+  let siblingsHtml = `<div style="display:flex;flex-direction:column;gap:3px">`;
+  for (const sib of allNodes) {
+    const sibCls   = sib.classification || "unknown";
+    const sibBadge = NODE_BADGE_MAP[sibCls] || "node-badge-helper";
+    const isCur    = sib.id === n.id;
+    const sibStyle = isCur
+      ? "background:#dbeafe;border:1px solid #93c5fd"
+      : "background:#f8fafc;border:1px solid #e2e8f0";
+    siblingsHtml += `<div style="${sibStyle};border-radius:4px;padding:4px 8px;font-size:10px;font-family:ui-monospace,monospace">
+      <span class="node-badge ${sibBadge}" style="font-size:8px;padding:1px 4px;border-radius:2px">${esc(sibCls)}</span>
+      <span style="color:#64748b;margin-left:4px">node ${sib.id}</span>
+      <span style="color:#334155;margin-left:4px">${esc(sib.role || sib.method || "—")}</span>
+      ${isCur ? `<span style="color:#1d4ed8;margin-left:6px;font-weight:700">← this node</span>` : ""}
+    </div>`;
+  }
+  siblingsHtml += `</div>`;
+
+  return `
+    <div class="target-section">
+      <h4><span class="node-badge ${badgeClass}" style="font-size:9px;padding:1px 5px;border-radius:3px;vertical-align:middle">${esc(cls)}</span>&nbsp; Node Details</h4>
+      <p style="margin-bottom:8px;font-size:11px;color:#64748b;font-style:italic;line-height:1.5">${explain}</p>
+    </div>
+    <div class="target-section">
+      <h4>Runtime Payload</h4>
+      <div class="kv-grid">${payloadRows}</div>
+    </div>
+    <div class="target-section">
+      <h4>Graph Context</h4>
+      <div class="kv-grid">${graphRows}</div>
+    </div>
+    <div class="target-section">
+      <h4>Graph Edges (this node)</h4>
+      ${edgeHtml}
+    </div>
+    <div class="target-section">
+      <h4>All Nodes in Graph</h4>
+      ${siblingsHtml}
+    </div>`;
 }
 
 // ── Bytecode ──────────────────────────────────────────────────────────────
@@ -638,6 +979,17 @@ async function loadBytecode(className, loaderId, targetMethod) {
 
 function artifactMissingView(className, artifact) {
   if (!artifact) {
+    const isHidden = /\+0x[0-9a-fA-F]+$/.test(className);
+    if (isHidden) {
+      return `<div style="padding:12px">
+        <div style="color:#dc2626;font-weight:600;margin-bottom:8px">Capture/export bug — no identity record</div>
+        <p style="font-size:11px;color:#64748b">
+          No <code>hidden_class_identity</code> record was emitted for <code>${esc(className)}</code>.<br>
+          The JVM did not record the CRC mapping for this hidden class instance.<br>
+          Check that the provenance export ran after class load and that <code>soroush_graph_hidden_class_id()</code> was called.
+        </p>
+      </div>`;
+    }
     return `<div style="padding:12px">
       <div style="color:#dc2626;font-weight:600;margin-bottom:8px">No artifact record found</div>
       <p style="font-size:11px;color:#64748b">No bytecode_artifact record exists for class <code>${esc(className)}</code>.</p>
@@ -850,7 +1202,7 @@ function clearMiddle() {
 
 function clearRight() {
   setEl("targets-view",  `<div class="empty-state"><span class="icon">🎯</span>Select a callsite to see its targets</div>`);
-  setEl("bytecode-view", `<div class="empty-state"><span class="icon">📄</span>Click "View Bytecode" on a target</div>`);
+  setEl("bytecode-view", `<div class="empty-state"><span class="icon">📄</span>Click "View bytecode" or "View details" on a node</div>`);
   setEl("right-title", "Select a callsite");
   switchTab("targets");
 }
@@ -859,6 +1211,12 @@ function shortName(s) {
   // java/lang/String -> String (keep last segment)
   const parts = (s||"").split("/");
   return parts[parts.length - 1] || s;
+}
+
+function shortCls(s) {
+  if (!s) return "—";
+  const p = s.lastIndexOf("/");
+  return p >= 0 ? s.slice(p + 1) : s;
 }
 
 function shortDesc(desc) {
@@ -909,7 +1267,6 @@ function wireJarBrowser() {
   });
   document.getElementById("jar-select-all").addEventListener("click", jarSelectAllVisible);
   document.getElementById("jar-clear-all").addEventListener("click",   jarClearAllVisible);
-  document.getElementById("jar-apply").addEventListener("click",       applyJarPrefixes);
 
   const treeEl = document.getElementById("jar-class-tree");
   // Toggle package expand/collapse on header click (but not on the checkbox)
@@ -989,6 +1346,7 @@ function resetJarBrowser() {
   if (t) t.innerHTML = "";
   const p = document.getElementById("jar-prefix-preview");
   if (p) p.textContent = "";
+  syncPrefixesToTextarea();
   hide("jar-classes-section");
 }
 
@@ -1104,24 +1462,25 @@ function jarClearAllVisible() {
   updateJarPreview();
 }
 
-function applyJarPrefixes() {
-  const prefixes = computeMinimalPrefixes();
-  document.getElementById("user-prefixes-input").value = prefixes.join("\n");
-  // Briefly flash the textarea so the user sees it updated
+function syncPrefixesToTextarea() {
   const ta = document.getElementById("user-prefixes-input");
-  ta.style.background = "#dbeafe";
-  setTimeout(() => { ta.style.background = ""; }, 600);
+  if (!ta) return;
+  ta.value = computeMinimalPrefixes().join("\n");
 }
 
 function updateJarPreview() {
   const el = document.getElementById("jar-prefix-preview");
   if (!el) return;
   const n = Jar.selected.size;
-  if (n === 0) { el.textContent = "0 classes selected."; return; }
   const prefixes = computeMinimalPrefixes();
-  const preview  = prefixes.slice(0, 4).join(", ");
-  const more     = prefixes.length > 4 ? ` +${prefixes.length - 4} more` : "";
-  el.textContent = `${n} selected → ${preview}${more}`;
+  if (n === 0) {
+    el.textContent = "0 classes selected.";
+  } else {
+    const preview = prefixes.slice(0, 4).join(", ");
+    const more    = prefixes.length > 4 ? ` +${prefixes.length - 4} more` : "";
+    el.textContent = `${n} selected → ${preview}${more}`;
+  }
+  syncPrefixesToTextarea();
 }
 
 // Compute the minimal set of slash-notation prefixes that cover all selected classes.

@@ -41,6 +41,7 @@
 #include "logging/log.hpp"
 #include "logging/logStream.hpp"
 #include "memory/resourceArea.hpp"
+#include "memory/universe.hpp"
 #include "oops/constantPool.hpp"
 #include "oops/cpCache.inline.hpp"
 #include "oops/instanceKlass.inline.hpp"
@@ -133,6 +134,23 @@ static bool soroush_trace_mh_exec_enabled() {
     enabled = (value != nullptr && strcmp(value, "1") == 0) ? 1 : 0;
   }
   return enabled == 1;
+}
+
+// Read SOROUSH_MH_WALK_DEPTH (default 6, clamped to [1, 24]).
+// Controls both the top-level sg_walk_mh depth and the nested BMH recursion
+// depth inside sg_walk_generic_bmh.
+static int sg_mh_walk_depth() {
+  static int depth = -1;
+  if (depth == -1) {
+    const char* v = ::getenv("SOROUSH_MH_WALK_DEPTH");
+    if (v != nullptr && v[0] != '\0') {
+      int d = atoi(v);
+      depth = (d < 1) ? 1 : (d > 24) ? 24 : d;
+    } else {
+      depth = 6;
+    }
+  }
+  return depth;
 }
 
 // Compact MethodType descriptor "(<nparams> args)-><rtype>" for a MethodHandle.
@@ -1654,6 +1672,93 @@ void LinkResolver::runtime_resolve_virtual_method(CallInfo& result,
                                  resolved_method,
                                  selected_method,
                                  THREAD);
+  if (soroush_graph_enabled() && !recv.is_null() && !selected_method.is_null()) {
+    ResourceMark rm_iv(THREAD);
+    const char* iv_src_class  = nullptr;
+    const char* iv_src_method = nullptr;
+    const char* iv_src_desc   = nullptr;
+    int         iv_src_bci    = -1;
+    int         iv_src_opcode = 0xb6; // invokevirtual
+    int         iv_src_cp     = -1;
+    uint64_t    iv_src_loader = 0;
+
+    for (vframeStream vfst(THREAD); !vfst.at_end(); vfst.next()) {
+      Method* fm = vfst.method();
+      if (fm == nullptr) continue;
+      const char* fh = fm->method_holder()->name()->as_C_string();
+      if (strncmp(fh, "java/",    5) == 0 ||
+          strncmp(fh, "jdk/",     4) == 0 ||
+          strncmp(fh, "sun/",     4) == 0 ||
+          strncmp(fh, "com/sun/", 8) == 0) {
+        continue;
+      }
+      int bci = vfst.bci();
+      if (bci < 0 || bci >= fm->code_size()) break;
+      address bcp = fm->bcp_from(bci);
+      int op = (int)(uint8_t)Bytecodes::java_code_at(fm, bcp);
+      if (op != Bytecodes::_invokevirtual) break;
+      if (bci + 2 < fm->code_size()) {
+        int cc_idx = (((int)(uint8_t)fm->code_base()[bci + 1]) << 8)
+                   |  ((int)(uint8_t)fm->code_base()[bci + 2]);
+        ConstantPool* cpool = fm->constants();
+        if (cpool != nullptr && cpool->cache() != nullptr
+            && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+          iv_src_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+        }
+      }
+      iv_src_class  = fh;
+      iv_src_method = fm->name()->as_C_string();
+      iv_src_desc   = fm->signature()->as_C_string();
+      iv_src_bci    = bci;
+      iv_src_opcode = op;
+      iv_src_loader = (uint64_t)(uintptr_t)fm->method_holder()->class_loader_data();
+      break;
+    }
+
+    if (iv_src_class != nullptr && iv_src_bci >= 0) {
+      const char* tgt_class  = selected_method->method_holder()->name()->as_C_string();
+      const char* tgt_method = selected_method->name()->as_C_string();
+      const char* tgt_desc   = selected_method->signature()->as_C_string();
+      uint64_t    tgt_loader = (uint64_t)(uintptr_t)selected_method->method_holder()->class_loader_data();
+      soroush_graph_poly_callsite("invokevirtual",
+          iv_src_class, iv_src_loader, iv_src_method, iv_src_desc,
+          iv_src_bci, iv_src_opcode, iv_src_cp,
+          tgt_class, tgt_loader, tgt_method, tgt_desc);
+
+      // Phase 2E: if this callsite resolved to Method.invoke, also emit the
+      // underlying reflected target.  recv is the java.lang.reflect.Method
+      // object; we decode its clazz/slot fields to find the real target Method.
+      // This fires at cold-path (first resolution per callsite), which is exactly
+      // when the first HTTP dispatch through InvocableHandlerMethod.doInvoke
+      // encounters Method.invoke — giving us the reflected target without heuristics.
+      if (selected_method->method_holder()->name()->equals("java/lang/reflect/Method") &&
+          selected_method->name()->equals("invoke")) {
+        oop method_obj = recv();
+        if (method_obj != nullptr && oopDesc::is_oop_or_null(method_obj) &&
+            method_obj->klass() != nullptr &&
+            method_obj->klass()->name()->equals("java/lang/reflect/Method")) {
+          oop clazz_mirror = java_lang_reflect_Method::clazz(method_obj);
+          int mslot = java_lang_reflect_Method::slot(method_obj);
+          if (clazz_mirror != nullptr && mslot >= 0) {
+            Klass* dk = java_lang_Class::as_Klass(clazz_mirror);
+            if (dk != nullptr && dk->is_instance_klass()) {
+              InstanceKlass* dik = InstanceKlass::cast(dk);
+              Method* rmet = dik->method_with_idnum(mslot);
+              if (rmet != nullptr) {
+                soroush_graph_poly_callsite("reflection_method_invoke",
+                    iv_src_class, iv_src_loader, iv_src_method, iv_src_desc,
+                    iv_src_bci, iv_src_opcode, iv_src_cp,
+                    dik->name()->as_C_string(),
+                    (uint64_t)(uintptr_t)dik->class_loader_data(),
+                    rmet->name()->as_C_string(),
+                    rmet->signature()->as_C_string());
+              }
+            }
+          }
+        }
+      }
+    }
+  }
   // setup result
   result.set_virtual(resolved_klass, resolved_method, selected_method, vtable_index, CHECK);
   JFR_ONLY(Jfr::on_resolution(result, CHECK);)
@@ -1752,6 +1857,69 @@ void LinkResolver::runtime_resolve_interface_method(CallInfo& result,
                                  resolved_method,
                                  selected_method,
                                  THREAD);
+
+  // Provenance graph: capture invokeinterface dispatches from user frames.
+  // Uses soroush_graph_poly_callsite so every distinct (BCI, target) pair is
+  // recorded, even when the cold-path fires multiple times for different
+  // receiver classes at the same BCI.
+  if (soroush_graph_enabled() && !recv.is_null() && !selected_method.is_null()) {
+    ResourceMark rm_ii(THREAD);
+    const char* ii_src_class  = nullptr;
+    const char* ii_src_method = nullptr;
+    const char* ii_src_desc   = nullptr;
+    int         ii_src_bci    = -1;
+    int         ii_src_opcode = 0xb9; // invokeinterface
+    int         ii_src_cp     = -1;
+    uint64_t    ii_src_loader = 0;
+
+    for (vframeStream vfst(THREAD); !vfst.at_end(); vfst.next()) {
+      Method* fm = vfst.method();
+      if (fm == nullptr) continue;
+      const char* fh = fm->method_holder()->name()->as_C_string();
+      // Skip JDK/JVM internal frames; stop at first user frame.
+      if (strncmp(fh, "java/",    5) == 0 ||
+          strncmp(fh, "jdk/",     4) == 0 ||
+          strncmp(fh, "sun/",     4) == 0 ||
+          strncmp(fh, "com/sun/", 8) == 0) {
+        continue;
+      }
+      int bci = vfst.bci();
+      if (bci < 0 || bci >= fm->code_size()) break;
+      // Verify the caller bytecode is invokeinterface.
+      address bcp = fm->bcp_from(bci);
+      int op = (int)(uint8_t)Bytecodes::java_code_at(fm, bcp);
+      if (op != Bytecodes::_invokeinterface) break;
+      // Read constant pool index from the operand.
+      if (bci + 2 < fm->code_size()) {
+        int cc_idx = (((int)(uint8_t)fm->code_base()[bci + 1]) << 8)
+                   |  ((int)(uint8_t)fm->code_base()[bci + 2]);
+        ConstantPool* cpool = fm->constants();
+        if (cpool != nullptr && cpool->cache() != nullptr
+            && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+          ii_src_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+        }
+      }
+      ii_src_class  = fh;
+      ii_src_method = fm->name()->as_C_string();
+      ii_src_desc   = fm->signature()->as_C_string();
+      ii_src_bci    = bci;
+      ii_src_opcode = op;
+      ii_src_loader = (uint64_t)(uintptr_t)fm->method_holder()->class_loader_data();
+      break;
+    }
+
+    if (ii_src_class != nullptr && ii_src_bci >= 0) {
+      const char* tgt_class  = selected_method->method_holder()->name()->as_C_string();
+      const char* tgt_method = selected_method->name()->as_C_string();
+      const char* tgt_desc   = selected_method->signature()->as_C_string();
+      uint64_t    tgt_loader = (uint64_t)(uintptr_t)selected_method->method_holder()->class_loader_data();
+      soroush_graph_poly_callsite("invokeinterface",
+          ii_src_class, ii_src_loader, ii_src_method, ii_src_desc,
+          ii_src_bci, ii_src_opcode, ii_src_cp,
+          tgt_class, tgt_loader, tgt_method, tgt_desc);
+    }
+  }
+
   // setup result
   if (resolved_method->has_vtable_index()) {
     int vtable_index = resolved_method->vtable_index();
@@ -2714,7 +2882,7 @@ static void sg_emit_sibling_bcis(
     if (is_inv && scan_bci != primary_bci) {
       int scan_cp = -1;
       if (scan_bci + 2 < code_size) {
-        int cc_idx = sg_u2at(scan_bcp + 1);
+        int cc_idx = sg_u2at(scan_bcp);
         if (cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
           scan_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
         }
@@ -2745,7 +2913,7 @@ static void sg_emit_sibling_bcis(
           snprintf(reason, sizeof(reason),
                    "sibling_bci_arg_slots_unknown cp_index=%d", src_cp);
         }
-        int scan_opcode = (int)(uint8_t)bc;
+        int scan_opcode = (int)(uint8_t)Bytecodes::java_code_at(user_method, scan_bcp);
         soroush_graph_generic_callsite(cat,
             src_class, src_loader, src_method_name, src_desc,
             scan_bci, scan_opcode, scan_cp,
@@ -3363,13 +3531,17 @@ static void sg_recurse_into_bmh(
       child.has_target        = true;
       child.node_classification = sg_classify_exact(child.target.klass);
     } else if (java_lang_invoke_MethodHandle::is_instance(unwrapped)) {
-      // Non-DMH MH: record species class, recurse.
+      // Nested container node (helper_adapter / BMH Species). Its own class is
+      // not a direct executable target — only its children affect exactness.
       child.has_target           = false;
       child.node_adapter_class   = unwrapped->klass()->name()->as_C_string();
       child.node_classification  = sg_classify_nonexact(child.node_adapter_class);
       child.exact_false_reason   = child.node_classification;  // role as reason
-      if (!sg_is_invoke_internal(child.node_adapter_class) && all_user_exact)
+      if ((child.node_classification == nullptr ||
+           strcmp(child.node_classification, "helper_adapter") != 0) &&
+          !sg_is_invoke_internal(child.node_adapter_class) && all_user_exact) {
         *all_user_exact = false;
+      }
       sg_recurse_into_bmh(unwrapped, child_id, r, visited, n_visited,
                           depth - 1, all_user_exact);
     } else {
@@ -3437,7 +3609,7 @@ static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
   // may remain non-exact without clearing this flag.
   bool all_exact = true;
 
-  for (int i = 0; i < n_l; i++) {
+  for (int i = 0; i < n_l && r.n_graph_nodes < 16; i++) {
     oop f = sg_bmh_arg_at(mh_oop, i);
     // Use current array position as ID — must be captured BEFORE the increment
     // so that IDs remain unique even after sg_recurse_into_bmh adds children.
@@ -3494,15 +3666,21 @@ static SgMhWalkResult sg_walk_generic_bmh(oop mh_oop, int depth) {
         node.has_target          = true;
         node.node_classification = sg_classify_exact(node.target.klass);
       } else if (java_lang_invoke_MethodHandle::is_instance(unwrapped)) {
-        // Nested BMH: record species class, recurse to find children.
+        // Nested BMH container node (helper_adapter / BMH Species wrapper).
+        // The container has no standalone bytecode; only its children affect
+        // exactness.  Do NOT pre-clear all_exact based on the container class —
+        // let the recursion clear it only if the children are inexact.
         node.has_target           = false;
         node.node_adapter_class   = unwrapped->klass()->name()->as_C_string();
         node.node_classification  = sg_classify_nonexact(node.node_adapter_class);
         node.exact_false_reason   = node.node_classification;
-        // Only block all_exact if this is not a known JDK-internal adapter.
-        if (!sg_is_invoke_internal(node.node_adapter_class)) all_exact = false;
+        if (node.node_classification != nullptr &&
+            strcmp(node.node_classification, "helper_adapter") != 0 &&
+            !sg_is_invoke_internal(node.node_adapter_class)) {
+          all_exact = false;
+        }
         sg_recurse_into_bmh(unwrapped, my_id, &r, visited_buf, &n_visited,
-                            3, &all_exact);
+                            depth, &all_exact);
       } else {
         // Non-BMH, non-DMH MH: unknown.
         node.has_target           = false;
@@ -3920,11 +4098,22 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
             // vframeStream handles compiled/deopt/stub frames transparently.
             is_lf_dispatch_case = true;
             bool found_user_frame = false;
+            bool saw_dmha = false;
             for (vframeStream vfst(THREAD); !vfst.at_end(); vfst.next()) {
               Method* sm = vfst.method();
               if (sm == nullptr) continue;
               const char* sh = sm->method_holder()->name()->as_C_string();
               if (strncmp(sh, "java/lang/invoke/", 17) == 0) continue;
+              // Also skip reflection internals so we walk past DMHA to the user callsite.
+              if (strncmp(sh, "jdk/internal/reflect/", 21) == 0 ||
+                  strncmp(sh, "java/lang/reflect/",    18) == 0 ||
+                  strncmp(sh, "sun/reflect/",          12) == 0) {
+                if (strncmp(sh, "jdk/internal/reflect/DirectMethodHandleAccessor",     47) == 0 ||
+                    strncmp(sh, "jdk/internal/reflect/DirectConstructorHandleAccessor", 51) == 0) {
+                  saw_dmha = true;
+                }
+                continue;
+              }
               int u_bci = vfst.bci();
               if (u_bci < 0) break;
               src_class  = sh;
@@ -3936,7 +4125,7 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 address bcp = sm->bcp_from(u_bci);
                 src_opcode = (int)(uint8_t)Bytecodes::java_code_at(sm, bcp);
                 if (u_bci + 2 < sm->code_size()) {
-                  int cc_idx = sg_u2at(bcp + 1);
+                  int cc_idx = sg_u2at(bcp);
                   ConstantPool* cpool = sm->constants();
                   if (cpool != nullptr && cpool->cache() != nullptr
                       && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
@@ -3986,7 +4175,7 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                   address bcp = cm->bcp_from(src_bci);
                   src_opcode = (int)(uint8_t)Bytecodes::java_code_at(cm, bcp);
                   if (src_bci + 2 < cm->code_size()) {
-                    int cc_idx = sg_u2at(bcp + 1);
+                    int cc_idx = sg_u2at(bcp);
                     ConstantPool* cpool = cm->constants();
                     if (cpool != nullptr && cpool->cache() != nullptr
                         && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
@@ -4001,6 +4190,9 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
               }
             }
             (void)found_user_frame;
+            if (saw_dmha && src_ok) {
+              cat = "reflection_method_invoke";
+            }
 
           } else {
             // ---- Case A: normal user MH callsite (top frame IS the user frame) ----
@@ -4014,8 +4206,7 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 address bcp = cm->bcp_from(src_bci);
                 src_opcode = (int)(uint8_t)Bytecodes::java_code_at(cm, bcp);
                 if (src_bci + 2 < cm->code_size()) {
-                  int cc_idx = (((int)(uint8_t)cm->code_base()[src_bci + 1]) << 8)
-                             |  ((int)(uint8_t)cm->code_base()[src_bci + 2]);
+                  int cc_idx = sg_u2at(bcp);
                   ConstantPool* cpool = cm->constants();
                   if (cpool != nullptr && cpool->cache() != nullptr
                       && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
@@ -4117,7 +4308,7 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
           }
           // Step 3: walk whichever MH oop we obtained.
           if (mh_recv != nullptr) {
-            SgMhWalkResult walk = sg_walk_mh(mh_recv, 6);
+            SgMhWalkResult walk = sg_walk_mh(mh_recv, sg_mh_walk_depth());
             if (walk.shape == SgMhWalkResult::DIRECT && walk.all_exact) {
               // Single exact target → existing callsite_target path.
               tgt_class  = walk.targets[0].klass;
@@ -4169,8 +4360,10 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 node_entries[i].node_classification= walk.graph_nodes[i].node_classification;
                 node_entries[i].exact_false_reason = walk.graph_nodes[i].exact_false_reason;
                 node_entries[i].semantic_op        = walk.graph_nodes[i].semantic_op;
-                node_entries[i].from_type          = walk.graph_nodes[i].from_type;
-                node_entries[i].to_type            = walk.graph_nodes[i].to_type;
+                node_entries[i].from_type          = (walk.graph_nodes[i].from_type != nullptr)
+                                                     ? walk.graph_nodes[i].from_type_buf : nullptr;
+                node_entries[i].to_type            = (walk.graph_nodes[i].to_type != nullptr)
+                                                     ? walk.graph_nodes[i].to_type_buf : nullptr;
                 if (walk.graph_nodes[i].has_target) {
                   node_entries[i].klass      = walk.graph_nodes[i].target.klass;
                   node_entries[i].loader_id  = walk.graph_nodes[i].target.loader_id;
@@ -4198,6 +4391,22 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 node_entries, ne, edge_entries, nee, walk.graph_all_exact,
                 walk.staticizable, sblk, walk.n_staticization_blockers)) {
                 multi_target_emitted = true;
+                // For reflection cases the adapter graph wraps the actual reflected
+                // method. Emit a callsite_target record so the reflected target is
+                // visible in the reflection view alongside the adapter graph.
+                if (cat != nullptr && strcmp(cat, "reflection_method_invoke") == 0) {
+                  for (int ni = 0; ni < ne; ni++) {
+                    if (node_entries[ni].exact && node_entries[ni].klass != nullptr) {
+                      soroush_graph_generic_callsite(cat,
+                          src_class, src_loader, src_method, src_desc,
+                          src_bci, src_opcode, src_cp,
+                          node_entries[ni].klass, node_entries[ni].loader_id,
+                          node_entries[ni].method, node_entries[ni].descriptor,
+                          src_ok, true, nullptr);
+                      break;
+                    }
+                  }
+                }
               } else {
                 snprintf(adapter_diag, sizeof(adapter_diag), "record_storage_oom");
               }
@@ -4255,7 +4464,7 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
                 oop target_mh = accessor_obj->obj_field(fd.offset());
                 if (target_mh != nullptr && sg_oop_valid(target_mh) &&
                     java_lang_invoke_MethodHandle::is_instance(target_mh)) {
-                  SgMhWalkResult walk = sg_walk_mh(target_mh, 6);
+                  SgMhWalkResult walk = sg_walk_mh(target_mh, sg_mh_walk_depth());
                   if (walk.shape == SgMhWalkResult::DIRECT &&
                       walk.n_targets > 0 && walk.targets[0].valid) {
                     // Fast path: target is already a DMH (0-param, trivial asType).
@@ -4327,18 +4536,11 @@ void LinkResolver::resolve_handle_call(CallInfo& result,
     }
 
     // ---- Part B: sibling BCI scan ----
-    // Emit diagnostics for all sibling BCIs in the user method that share the
-    // same CP constant pool index but will never trigger resolve_handle_call.
-    // Only for non-reflection, non-jli-internal attributions where we have the
-    // user method available.
-    if (src_ok && src_cp >= 0 && !is_reflection_accessor && !(src_is_mh_factory_a2 && adapter_diag[0])) {
-      Method* sibling_method = recv_frame_valid  ? recv_frame_method
-                             : (top_frame_valid  ? top.interpreter_frame_method()
-                                                 : nullptr);
-      sg_emit_sibling_bcis(cat, sibling_method, src_bci, primary_recv_local,
-                           src_cp, src_class, src_loader, src_method, src_desc,
-                           primary_arg_slots);
-    }
+    // Removed: sg_emit_sibling_bcis no longer needed.
+    // The warm-path hook in TemplateTable::invokehandle (sg_trace_mh_impl via
+    // sg_trace_mh_dispatch) captures exact callsite_target records for every
+    // invokehandle execution, including sibling BCIs that share a CP cache entry.
+    // Emitting diagnostic records here would block those exact records via dedup.
   }
 
   JFR_ONLY(Jfr::on_resolution(result, CHECK);)
@@ -4476,7 +4678,7 @@ void soroush_emit_indy_cag_at_bootstrap(oop target_mh,
     int src_bci, int src_cp) {
   if (!soroush_graph_enabled() || !sg_oop_valid(target_mh)) return;
 
-  SgMhWalkResult walk = sg_walk_mh(target_mh, 6);
+  SgMhWalkResult walk = sg_walk_mh(target_mh, sg_mh_walk_depth());
 
   const char* cat    = "invokedynamic";
   const int   opcode = 186;  // invokedynamic bytecode
@@ -4494,8 +4696,10 @@ void soroush_emit_indy_cag_at_bootstrap(oop target_mh,
       node_entries[i].node_classification = walk.graph_nodes[i].node_classification;
       node_entries[i].exact_false_reason  = walk.graph_nodes[i].exact_false_reason;
       node_entries[i].semantic_op         = walk.graph_nodes[i].semantic_op;
-      node_entries[i].from_type           = walk.graph_nodes[i].from_type;
-      node_entries[i].to_type             = walk.graph_nodes[i].to_type;
+      node_entries[i].from_type           = (walk.graph_nodes[i].from_type != nullptr)
+                                            ? walk.graph_nodes[i].from_type_buf : nullptr;
+      node_entries[i].to_type             = (walk.graph_nodes[i].to_type != nullptr)
+                                            ? walk.graph_nodes[i].to_type_buf : nullptr;
       if (walk.graph_nodes[i].has_target) {
         node_entries[i].klass      = walk.graph_nodes[i].target.klass;
         node_entries[i].loader_id  = walk.graph_nodes[i].target.loader_id;
@@ -4550,4 +4754,83 @@ void soroush_emit_indy_cag_at_bootstrap(oop target_mh,
         entries, walk.n_targets);
   }
   // DIRECT shapes already covered by the callsite_target record — no-op here.
+}
+
+// ---------------------------------------------------------------------------
+// InterpreterRuntime::sg_trace_mh_impl
+//
+// Warm-path MH dispatch trace — fires on EVERY invokehandle dispatch
+// (warm cached path AND cold first-resolution path) from TemplateTable.
+// Defined here to have access to sg_walk_mh, sg_u2at, and related helpers.
+//
+// At the call site (TemplateTable::invokehandle), prepare_invoke has run:
+//   rmethod (r12) = resolved adapter method
+//   r2           = receiver MethodHandle oop  ← passed to us as recv_oop
+// The caller frame (thread->last_frame()) is the user interpreter frame
+// executing the invokehandle bytecode.
+// ---------------------------------------------------------------------------
+void InterpreterRuntime::sg_trace_mh_impl(JavaThread* thread, oopDesc* recv_oop) {
+  if (!Universe::is_fully_initialized()) return;
+  if (!soroush_graph_enabled()) return;
+  if (recv_oop == nullptr) return;
+  if (!oopDesc::is_oop_or_null(recv_oop)) return;
+  if (!java_lang_invoke_MethodHandle::is_instance(recv_oop)) return;
+
+  Handle recv(thread, recv_oop);
+
+  if (!thread->has_last_Java_frame()) return;
+  frame fr = thread->last_frame();
+  if (!fr.is_interpreted_frame()) return;
+
+  Method* cm = fr.interpreter_frame_method();
+  if (cm == nullptr) return;
+  int bci = fr.interpreter_frame_bci();
+  if (bci < 0 || bci >= cm->code_size()) return;
+
+  ResourceMark rm(thread);
+  const char* holder = cm->method_holder()->name()->as_C_string();
+
+  // Filter JDK-internal callsites — they are either already handled by the
+  // cold path or not user-observable.
+  if (strncmp(holder, "java/",    5) == 0 ||
+      strncmp(holder, "jdk/",     4) == 0 ||
+      strncmp(holder, "sun/",     4) == 0 ||
+      strncmp(holder, "com/sun/", 8) == 0) {
+    return;
+  }
+
+  address bcp      = cm->bcp_from(bci);
+  int src_opcode   = (int)(uint8_t)Bytecodes::java_code_at(cm, bcp);
+  int src_cp       = -1;
+  if (bci + 2 < cm->code_size()) {
+    int cc_idx = sg_u2at(bcp);
+    ConstantPool* cpool = cm->constants();
+    if (cpool != nullptr && cpool->cache() != nullptr
+        && cc_idx >= 0 && cc_idx < cpool->cache()->length()) {
+      src_cp = cpool->cache()->entry_at(cc_idx)->constant_pool_index();
+    }
+  }
+
+  uint64_t src_loader = (uint64_t)(uintptr_t)cm->method_holder()->class_loader_data();
+
+  // Walk the live receiver MH to extract the final dispatch target.
+  // Only emit for DIRECT (exact) shapes; GWT/GWC/adapter graphs are emitted
+  // by the cold path (resolve_handle_call) with full context.
+  SgMhWalkResult walk = sg_walk_mh(recv(), sg_mh_walk_depth());
+  if (walk.shape != SgMhWalkResult::DIRECT || !walk.all_exact) return;
+
+  // soroush_graph_generic_callsite deduplicates by
+  // (category, src_class, src_method, src_desc, src_bci) — first invocation
+  // wins.  For BCIs already captured by the cold path (e.g. BCI 31 in Case04)
+  // this call is a no-op.  For sibling BCIs (51/67/95/121) whose CP cache
+  // entry was warm at first execution, this is the ONLY emitter.
+  soroush_graph_generic_callsite(
+      "methodhandle_invoke",
+      holder, src_loader,
+      cm->name()->as_C_string(), cm->signature()->as_C_string(),
+      bci, src_opcode, src_cp,
+      walk.targets[0].klass, walk.targets[0].loader_id,
+      walk.targets[0].method, walk.targets[0].descriptor,
+      /*source_exact=*/true, /*target_exact=*/true,
+      /*reason=*/nullptr);
 }

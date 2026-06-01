@@ -31,6 +31,7 @@
 #include "gc/shared/collectedHeap.hpp"
 #include "gc/shared/tlab_globals.hpp"
 #include "interpreter/interpreter.hpp"
+#include "classfile/soroushProvenanceGraph.hpp"
 #include "interpreter/interpreterRuntime.hpp"
 #include "interpreter/interp_masm.hpp"
 #include "interpreter/templateTable.hpp"
@@ -3317,6 +3318,27 @@ void TemplateTable::invokevirtual_helper(Register index,
   // get target Method & entry point
   __ lookup_virtual_method(r0, index, method);
   __ profile_arguments_type(r3, method, r4, true);
+
+  // Soroush warm-path invokevirtual trace: fires on every non-final vtable dispatch.
+  // method (=rmethod) = concrete Method* after vtable lookup.
+  // recv (r2) = receiver object.
+  // prepare_invoke loaded lr with invoke return-entry address; call_VM's blr
+  // overwrites lr — save and restore it exactly as the invokehandle hook does.
+  // call_VM_leaf_base saves/restores rmethod (r12) automatically.
+  {
+    Label L_sg_iv_skip;
+    __ lea(rscratch1, ExternalAddress((address)soroush_graph_enabled_addr()));
+    __ ldrb(rscratch1, Address(rscratch1));
+    __ cbz(rscratch1, L_sg_iv_skip);
+    __ stp(lr, zr, __ pre(sp, -2 * wordSize));   // save lr
+    __ call_VM(noreg,
+               CAST_FROM_FN_PTR(address, InterpreterRuntime::soroush_trace_iv_dispatch),
+               rmethod,                            // arg1 = concrete Method*
+               recv);                              // arg2 = receiver oop (for Phase 2E reflection attribution)
+    __ ldp(lr, zr, __ post(sp, 2 * wordSize));   // restore lr
+    __ bind(L_sg_iv_skip);
+  }
+
   // FIXME -- this looks completely redundant. is it?
   // __ ldr(r3, Address(method, Method::interpreter_entry_offset()));
   __ jump_from_interpreted(method, r3);
@@ -3457,6 +3479,21 @@ void TemplateTable::invokeinterface(int byte_no) {
 
   __ profile_arguments_type(r3, rmethod, r13, true);
 
+  // Soroush warm-path invokeinterface trace: fires on every normal itable dispatch.
+  // rmethod = concrete Method* after itable lookup; lr set by prepare_invoke — save/restore.
+  {
+    Label L_sg_ii_skip;
+    __ lea(rscratch1, ExternalAddress((address)soroush_graph_enabled_addr()));
+    __ ldrb(rscratch1, Address(rscratch1));
+    __ cbz(rscratch1, L_sg_ii_skip);
+    __ stp(lr, zr, __ pre(sp, -2 * wordSize));
+    __ call_VM(noreg,
+               CAST_FROM_FN_PTR(address, InterpreterRuntime::soroush_trace_ii_dispatch),
+               rmethod);
+    __ ldp(lr, zr, __ post(sp, 2 * wordSize));
+    __ bind(L_sg_ii_skip);
+  }
+
   // do the call
   // r2: receiver
   // rmethod,: Method
@@ -3496,6 +3533,24 @@ void TemplateTable::invokehandle(int byte_no) {
   __ verify_method_ptr(r2);
   __ verify_oop(r2);
   __ null_check(r2);
+
+  // Soroush warm-path MH dispatch trace: fires on every invokehandle execution.
+  // r2 = live receiver MH oop.  call_VM_leaf_base saves/restores rmethod (r12)
+  // automatically via stp/ldp.  BUT prepare_invoke loaded lr with the invoke
+  // return-entry address; call_VM's internal blr overwrites lr.  Save lr on
+  // the native stack (16-byte aligned) and restore it afterward.
+  {
+    Label L_sg_skip;
+    __ lea(rscratch1, ExternalAddress((address)soroush_graph_enabled_addr()));
+    __ ldrb(rscratch1, Address(rscratch1));
+    __ cbz(rscratch1, L_sg_skip);
+    __ stp(lr, zr, __ pre(sp, -2 * wordSize));   // push lr (+ pad)
+    __ call_VM(noreg,
+               CAST_FROM_FN_PTR(address, InterpreterRuntime::sg_trace_mh_dispatch),
+               r2);
+    __ ldp(lr, zr, __ post(sp, 2 * wordSize));   // pop lr
+    __ bind(L_sg_skip);
+  }
 
   // FIXME: profile the LambdaForm also
 

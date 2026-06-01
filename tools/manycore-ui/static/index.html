@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ManyCore UI — Runtime Target Explorer</title>
+  <title>Runtime Truth UI — Runtime Target Explorer</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
 <!-- ── Navbar ──────────────────────────────────────────────────────────── -->
 <nav id="navbar">
-  <span class="logo">🔬 ManyCore</span>
+  <span class="logo">🔬 Runtime Truth</span>
   <div class="run-controls">
     <select id="run-selector"><option value="">— select run —</option></select>
     <span id="run-status-badge"></span>
@@ -40,6 +40,12 @@
       <span class="title">Classes</span>
       <input id="class-filter" type="text" placeholder="filter…">
     </div>
+    <div class="panel-subheader">
+      <label class="sidebar-toggle" title="Show all loaded/artifact classes, not just dispatch-relevant ones">
+        <input type="checkbox" id="show-all-classes">
+        Show all loaded classes
+      </label>
+    </div>
     <div class="panel-body" id="class-list">
       <div class="empty-state"><span class="icon">📂</span>Start a run to see classes</div>
     </div>
@@ -60,15 +66,20 @@
     <div class="panel-header">
       <span class="title" id="right-title">Select a callsite</span>
       <div class="right-tabs">
+        <label class="helper-toggle hidden" id="helper-toggle-wrap"
+               title="Show helper/placeholder nodes that have no bytecode artifact">
+          <input type="checkbox" id="show-helper-nodes" checked>
+          Show all
+        </label>
         <button class="tab-btn active" data-tab="targets">Targets</button>
-        <button class="tab-btn" data-tab="bytecode">Bytecode</button>
+        <button class="tab-btn" data-tab="bytecode">Details</button>
       </div>
     </div>
     <div id="targets-view"  class="tab-content active">
       <div class="empty-state"><span class="icon">🎯</span>Select a callsite to see its targets</div>
     </div>
     <div id="bytecode-view" class="tab-content">
-      <div class="empty-state"><span class="icon">📄</span>Click "View Bytecode" on a target</div>
+      <div class="empty-state"><span class="icon">📄</span>Click "View bytecode" or "View details" on a node</div>
     </div>
   </div>
 </div>
@@ -81,6 +92,18 @@
     <div class="form-row">
       <label>JAR file *</label>
       <input type="file" id="jar-input" accept=".jar">
+    </div>
+
+    <!-- ── JAR class browser (appears after file is selected) ───────────── -->
+    <div id="jar-classes-section" class="hidden">
+      <div class="jar-browser-header">
+        <span class="jar-browser-title" id="jar-browser-title">Browse classes</span>
+        <input type="text" id="jar-class-filter" placeholder="filter classes…">
+        <button type="button" class="btn-ghost btn-xs" id="jar-select-all">Select all</button>
+        <button type="button" class="btn-ghost btn-xs" id="jar-clear-all">Clear</button>
+      </div>
+      <div id="jar-class-tree"></div>
+      <div id="jar-prefix-preview" class="jar-prefix-preview"></div>
     </div>
 
     <div class="form-row">
@@ -126,7 +149,7 @@
     <div class="form-row">
       <label>User/App prefixes <span style="font-weight:400;color:#94a3b8">(optional)</span></label>
       <textarea id="user-prefixes-input" placeholder="com/example&#10;org/myapp" style="min-height:70px"></textarea>
-      <div class="hint">One prefix per line (or comma-separated, slash-notation). Sets rewriter scope, APP badge in class list, and export filtering. Leave blank to instrument all classes.</div>
+      <div class="hint">One prefix per line (slash-notation: <code>com/example</code>). Updated automatically when you select classes in the JAR browser above. Sets rewriter scope, APP badge, and export filtering.</div>
     </div>
 
     <div class="form-row">

@@ -60,6 +60,7 @@
 #include "runtime/safepointVerifiers.hpp"
 #include "runtime/signature.hpp"
 #include "runtime/stubRoutines.hpp"
+#include "runtime/vframe.inline.hpp"
 #include "sanitizers/leak.hpp"
 #include "utilities/exceptions.hpp"
 #include <stdlib.h>
@@ -104,20 +105,58 @@ static void soroush_trace_membername_resolution(const char* source, Method* meth
 
   ResourceMark rm(THREAD);
   const char* holder = method->method_holder()->name()->as_C_string();
-  const char* mname = method->name()->as_C_string();
-  const char* sig = method->signature()->as_C_string();
+  const char* mname  = method->name()->as_C_string();
+  const char* sig    = method->signature()->as_C_string();
   if (trace) {
     fprintf(stderr, "[JVM REFLECT] membername_source=%s\n", source);
     fprintf(stderr, "[JVM REFLECT] membername_target=%s.%s%s\n", holder, mname, sig);
   }
-  if (graph) {
-    // reflect.Method/Constructor -> ReflectionInvoke; MemberName.resolve -> MH linkage.
-    int node_type = (source != nullptr && strncmp(source, "java.lang.reflect", 17) == 0)
-        ? SG_NODE_REFLECTION_INVOKE : SG_NODE_METHODHANDLE_LINKAGE;
-    // Loader-precise target class identity: use the target method holder's CLD.
-    uint64_t loader_id = (uint64_t)(uintptr_t)method->method_holder()->class_loader_data();
-    soroush_graph_linkage(node_type, source, holder, mname, sig, loader_id);
+  if (!graph) return;
+
+  // Loader-precise target class identity.
+  uint64_t tgt_loader = (uint64_t)(uintptr_t)method->method_holder()->class_loader_data();
+
+  // reflect.Method/Constructor -> ReflectionInvoke; MemberName.resolve -> MH linkage.
+  int node_type = (source != nullptr && strncmp(source, "java.lang.reflect", 17) == 0)
+      ? SG_NODE_REFLECTION_INVOKE : SG_NODE_METHODHANDLE_LINKAGE;
+
+  // Walk the Java call stack to find the first non-MH-internal caller frame.
+  // Skip: java/lang/invoke/, java/lang/reflect/, jdk/internal/reflect/, sun/reflect/
+  // — same skip-list used by Case B in linkResolver.cpp (lines 3970-4001).
+  const char* src_class  = nullptr;
+  const char* src_method = nullptr;
+  const char* src_desc   = nullptr;
+  int         src_bci    = -1;
+  uint64_t    src_loader = 0;
+  bool        src_ok     = false;
+
+  if (THREAD->has_last_Java_frame()) {
+    for (vframeStream vfst(THREAD); !vfst.at_end(); vfst.next()) {
+      Method* m = vfst.method();
+      if (m == nullptr) continue;
+      const char* h = m->method_holder()->name()->as_C_string();
+      if (strncmp(h, "java/lang/invoke/",    17) == 0 ||
+          strncmp(h, "java/lang/reflect/",   18) == 0 ||
+          strncmp(h, "jdk/internal/reflect/",21) == 0 ||
+          strncmp(h, "sun/reflect/",         12) == 0) {
+        continue;
+      }
+      int bci = vfst.bci();
+      if (bci < 0) break;
+      src_class  = h;
+      src_loader = (uint64_t)(uintptr_t)m->method_holder()->class_loader_data();
+      src_method = m->name()->as_C_string();
+      src_desc   = m->signature()->as_C_string();
+      src_bci    = bci;
+      src_ok     = true;
+      break;
+    }
   }
+
+  const char* missing_reason = src_ok ? nullptr : "no_user_frame_on_stack";
+  soroush_graph_linkage(node_type, source, holder, mname, sig, tgt_loader,
+                        src_class, src_method, src_desc, src_bci, src_loader,
+                        src_ok, missing_reason);
 }
 
 /**

@@ -165,6 +165,23 @@ static pthread_mutex_t       g_gen_lock   = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t              g_gen_count  = 0;
 
 // ---------------------------------------------------------------------------
+// Polymorphic callsite side table: invokevirtual and future polymorphic sites.
+// Keyed by (src_class + src_loader_id + src_method + src_desc + src_bci +
+//           target_class + target_loader_id + target_method + target_desc) —
+// one entry per unique (callsite, target) pair, where target identity includes
+// the classloader.  Two classes with the same binary name but different loaders
+// are distinct targets and each get their own entry.
+// Multiple targets for the same source BCI each get their own entry.
+// Exported as separate callsite_target records; the graph builder upgrades
+// callsite nodes with >1 CALLSITE_TARGET edges to SR_MULTI_TARGET.
+// Reuses SgGenCallsite struct (exact=true always; diag_reason=null always).
+// ---------------------------------------------------------------------------
+#define SG_POLY_BUCKETS 512u
+static struct SgGenCallsite* g_poly_buckets[SG_POLY_BUCKETS];
+static pthread_mutex_t       g_poly_lock   = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t              g_poly_count  = 0;
+
+// ---------------------------------------------------------------------------
 // Multi-target callsite side table: guardWithTest / catchException MH sites.
 // Keyed by (category + src_class + src_method + src_desc + src_bci).
 // Stores all semantic targets with their roles. Fail-safe on OOM.
@@ -267,6 +284,20 @@ struct SgAgCallsite {
 static struct SgAgCallsite* g_ag_buckets[SG_AG_BUCKETS];
 static pthread_mutex_t      g_ag_lock  = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t             g_ag_count = 0;
+
+// ---- Hidden class identity side table ----
+// Maps a hidden class's runtime name (+0x<address> suffix) to its artifact CRC.
+// Populated by soroush_graph_hidden_identity() from KlassFactory after
+// mangle_hidden_class_name() runs. Emitted as hidden_class_identity records.
+struct SgHiddenId {
+  char*    runtime_name;
+  uint32_t artifact_crc;
+  uint64_t loader_id;
+};
+static SgHiddenId*     g_hidden_ids      = nullptr;
+static uint32_t        g_hidden_id_count = 0;
+static uint32_t        g_hidden_id_cap   = 0;
+static pthread_mutex_t g_hidden_id_lock  = PTHREAD_MUTEX_INITIALIZER;
 
 uint32_t soroush_method_token_register(const char* dotted_class, const char* method,
                                        const char* descriptor, uint64_t loader_id,
@@ -570,6 +601,90 @@ bool soroush_graph_generic_callsite(
   return exact;
 }
 
+bool soroush_graph_poly_callsite(
+    const char* category,
+    const char* src_class, uint64_t src_loader_id,
+    const char* src_method, const char* src_desc,
+    int src_bci, int opcode_byte, int cp_index,
+    const char* target_class, uint64_t target_loader_id,
+    const char* target_method, const char* target_desc) {
+  if (!soroush_graph_enabled()) return false;
+  if (!src_class || !src_method || !target_class || !target_method) return false;
+
+  // Dedup key: source identity (class+loader+method+desc+bci) + target identity
+  // (class+loader+method+desc).  loader IDs are included so that two classes
+  // with the same binary name but different classloaders are treated as
+  // distinct targets (Gap #17 fix, 2026-05-30).
+  uint32_t h = sg_hash_str(src_class)
+             ^ (uint32_t)(src_loader_id ^ (src_loader_id >> 32))
+             ^ sg_hash_str(src_method) ^ sg_hash_str(src_desc)
+             ^ (uint32_t)(unsigned)src_bci
+             ^ sg_hash_str(target_class)
+             ^ (uint32_t)(target_loader_id ^ (target_loader_id >> 32))
+             ^ sg_hash_str(target_method)
+             ^ sg_hash_str(target_desc);
+  uint32_t bucket = h & (SG_POLY_BUCKETS - 1u);
+
+  pthread_mutex_lock(&g_poly_lock);
+
+  for (SgGenCallsite* c = g_poly_buckets[bucket]; c != nullptr; c = c->next) {
+    if (c->hash == h
+        && src_bci == c->src_bci
+        && src_loader_id    == c->src_loader_id
+        && target_loader_id == c->target_loader_id
+        && strcmp(src_class,    c->src_class)    == 0
+        && strcmp(src_method,   c->src_method)   == 0
+        && (src_desc    == c->src_desc    ||
+            (src_desc    && c->src_desc    && strcmp(src_desc,    c->src_desc)    == 0))
+        && strcmp(target_class,  c->target_class)  == 0
+        && strcmp(target_method, c->target_method) == 0
+        && (target_desc == c->target_desc ||
+            (target_desc && c->target_desc && strcmp(target_desc, c->target_desc) == 0))) {
+      pthread_mutex_unlock(&g_poly_lock);
+      return false; // already recorded this (callsite, loader-qualified target) pair
+    }
+  }
+
+  SgGenCallsite* n = (SgGenCallsite*)malloc(sizeof(SgGenCallsite));
+  if (n == nullptr) {
+    pthread_mutex_unlock(&g_poly_lock);
+    return false;
+  }
+  memset(n, 0, sizeof(*n));
+  n->category        = sg_strdup(category);
+  n->src_class       = sg_strdup(src_class);
+  n->src_loader_id   = src_loader_id;
+  n->src_method      = sg_strdup(src_method);
+  n->src_desc        = sg_strdup(src_desc);
+  n->src_bci         = src_bci;
+  n->opcode_byte     = opcode_byte;
+  n->cp_index        = cp_index;
+  n->target_class    = sg_strdup(target_class);
+  n->target_loader_id = target_loader_id;
+  n->target_method   = sg_strdup(target_method);
+  n->target_desc     = sg_strdup(target_desc);
+  n->exact           = true;
+  n->diag_reason     = nullptr;
+  n->hash            = h;
+  n->next            = g_poly_buckets[bucket];
+  g_poly_buckets[bucket] = n;
+  g_poly_count++;
+  pthread_mutex_unlock(&g_poly_lock);
+
+  fprintf(stderr,
+          "[JVM POLY CALLSITE] cat=%s src=%s.%s%s bci=%d op=0x%02x"
+          " tgt=%s.%s%s\n",
+          category      ? category      : "?",
+          src_class     ? src_class     : "?",
+          src_method    ? src_method    : "?",
+          src_desc      ? src_desc      : "",
+          src_bci, (unsigned)opcode_byte,
+          target_class  ? target_class  : "?",
+          target_method ? target_method : "?",
+          target_desc   ? target_desc   : "");
+  return true;
+}
+
 bool soroush_graph_target_set_callsite(
     const char* category, const char* adapter_shape,
     const char* adapter_class, const char* lf_kind,
@@ -781,13 +896,27 @@ bool soroush_graph_adapter_graph_callsite(
   return true;
 }
 
+// File-scope flag: 0=disabled (default), 1=enabled.
+// Checked directly from TemplateTable::invokehandle assembly via ldrb for
+// performance (avoids call_VM overhead on every warm invokehandle dispatch
+// when tracing is off). Initialized on first call to soroush_graph_enabled().
+volatile int g_sg_enabled = 0;
+
 bool soroush_graph_enabled() {
-  static int enabled = -1;
-  if (enabled == -1) {
+  static bool init = false;
+  if (!init) {
     const char* v = ::getenv("SOROUSH_PROVENANCE_GRAPH");
-    enabled = (v != nullptr && strcmp(v, "1") == 0) ? 1 : 0;
+    if (v != nullptr && strcmp(v, "1") == 0) g_sg_enabled = 1;
+    init = true;
   }
-  return enabled == 1;
+  return g_sg_enabled == 1;
+}
+
+// Returns the address of g_sg_enabled for direct assembly reads.
+// The byte at this address is 0x01 when enabled, 0x00 when disabled.
+void* soroush_graph_enabled_addr() {
+  soroush_graph_enabled(); // ensure initialized from env var
+  return (void*)&g_sg_enabled;
 }
 
 static const char* sg_node_type_name(int t) {
@@ -1153,7 +1282,11 @@ void soroush_graph_indy(int trace_id, const char* caller, const char* descriptor
 
 void soroush_graph_linkage(int node_type, const char* source,
                            const char* internal_class, const char* method,
-                           const char* descriptor, uint64_t loader_id) {
+                           const char* descriptor, uint64_t loader_id,
+                           const char* src_class, const char* src_method,
+                           const char* src_desc, int src_bci,
+                           uint64_t src_loader_id,
+                           bool src_ok, const char* src_missing_reason) {
   if (!soroush_graph_enabled()) return;
   if (node_type != SG_NODE_REFLECTION_INVOKE && node_type != SG_NODE_METHODHANDLE_LINKAGE) {
     node_type = SG_NODE_METHODHANDLE_LINKAGE;
@@ -1165,9 +1298,29 @@ void soroush_graph_linkage(int node_type, const char* source,
   char lkey[1300];
   snprintf(lkey, sizeof(lkey), "%c|%s.%s%s", node_type == SG_NODE_REFLECTION_INVOKE ? 'R' : 'H',
            norm, method ? method : "?", descriptor ? descriptor : "");
-  char llabel[1400];
-  snprintf(llabel, sizeof(llabel), "src=%s %s.%s%s", source ? source : "?", norm,
-           method ? method : "?", descriptor ? descriptor : "");
+
+  // Label encodes source attribution fields for export (space-delimited key=value pairs).
+  // scp=exact  : source frame was recovered via vframeStream
+  // scp=missing: no user frame found; smr= carries the reason
+  // sc=/sm=/sd=/sb=/sl= carry the source class/method/descriptor/bci/loader when exact.
+  // Buffer sized to fit all fields; snprintf truncates safely — key (dedup) is separate.
+  char llabel[2048];
+  if (src_ok && src_class != nullptr && src_method != nullptr && src_desc != nullptr
+      && src_bci >= 0) {
+    snprintf(llabel, sizeof(llabel),
+             "src=%s scp=exact sc=%s sm=%s sd=%s sb=%d sl=0x%016llx %s.%s%s",
+             source ? source : "?",
+             src_class, src_method, src_desc, src_bci,
+             (unsigned long long)src_loader_id,
+             norm, method ? method : "?", descriptor ? descriptor : "");
+  } else {
+    snprintf(llabel, sizeof(llabel),
+             "src=%s scp=missing smr=%s %s.%s%s",
+             source ? source : "?",
+             src_missing_reason ? src_missing_reason : "unknown",
+             norm, method ? method : "?", descriptor ? descriptor : "");
+  }
+
   bool l_new = false;
   uint64_t lnode = sg_intern_locked(node_type, lkey, llabel, 0, 0, 0, &l_new);
 
@@ -1235,6 +1388,29 @@ void soroush_graph_bytecode(const char* internal_class, uint32_t crc, int size,
     }
   }
   pthread_mutex_unlock(&g_lock);
+}
+
+// Record the runtime name (+0x<address> suffix) → artifact CRC mapping for a
+// hidden class. Called from KlassFactory after create_instance_klass() assigns
+// the mangled name. Emitted as hidden_class_identity records at export time.
+void soroush_graph_hidden_identity(const char* runtime_name, uint32_t artifact_crc,
+                                   uint64_t loader_id) {
+  if (!soroush_graph_enabled() || runtime_name == nullptr) return;
+  if (strchr(runtime_name, '+') == nullptr) return; // not a hidden class instance
+
+  pthread_mutex_lock(&g_hidden_id_lock);
+  if (g_hidden_id_count >= g_hidden_id_cap) {
+    uint32_t new_cap = g_hidden_id_cap == 0 ? 256 : g_hidden_id_cap * 2;
+    SgHiddenId* nm = (SgHiddenId*)realloc(g_hidden_ids, new_cap * sizeof(SgHiddenId));
+    if (nm == nullptr) { pthread_mutex_unlock(&g_hidden_id_lock); return; }
+    g_hidden_ids    = nm;
+    g_hidden_id_cap = new_cap;
+  }
+  SgHiddenId* e   = &g_hidden_ids[g_hidden_id_count++];
+  e->runtime_name = sg_strdup(runtime_name);
+  e->artifact_crc = artifact_crc;
+  e->loader_id    = loader_id;
+  pthread_mutex_unlock(&g_hidden_id_lock);
 }
 
 // ---------------------------------------------------------------------------
@@ -1638,7 +1814,7 @@ void soroush_graph_export_runtime_targets(const char* path) {
   }
   fprintf(stderr, "[JVM EXPORT] writing runtime targets to %s\n", path);
 
-  long mi_count = 0, ct_count = 0, rt_count = 0, gc_count = 0, ba_count = 0, diag_count = 0;
+  long mi_count = 0, ct_count = 0, rt_count = 0, gc_count = 0, ba_count = 0, diag_count = 0, hid_count = 0;
   bool write_ok = true; // set false if any fprintf write fails (ferror)
 
   // -------------------------------------------------------------------------
@@ -1854,6 +2030,11 @@ void soroush_graph_export_runtime_targets(const char* path) {
     for (uint32_t b = 0; b < SG_TS_BUCKETS; b++)
       for (SgTsCallsite* c = g_ts_buckets[b]; c; c = c->next)
         sg_ded_add(c->src_class, c->src_method, c->src_bci);
+    // Populate from poly callsite records (g_poly_buckets); each entry is
+    // exact, so its source BCI suppresses any diagnostic for the same BCI.
+    for (uint32_t b = 0; b < SG_POLY_BUCKETS; b++)
+      for (SgGenCallsite* c = g_poly_buckets[b]; c; c = c->next)
+        sg_ded_add(c->src_class, c->src_method, c->src_bci);
 
     // Snapshot count under lock; walk buckets lock-free at shutdown.
     pthread_mutex_lock(&g_gen_lock);
@@ -1975,6 +2156,64 @@ void soroush_graph_export_runtime_targets(const char* path) {
       }
     }
 #undef SG_DEDUP_BKTS
+  }
+
+  if (ferror(f)) write_ok = false;
+
+  // -------------------------------------------------------------------------
+  // Phase 3.1: poly callsite_target records from g_poly_buckets.
+  // Each entry is an exact (source BCI, target) pair for a polymorphic
+  // invokevirtual site.  Multiple entries may share the same source BCI when
+  // different receiver types were dispatched at that BCI.  The graph builder
+  // recognises multiple callsite_target records for the same BCI as a
+  // polymorphic site and assigns static_label=blocked_multi_target.
+  // -------------------------------------------------------------------------
+  {
+    pthread_mutex_lock(&g_poly_lock);
+    uint32_t poly_snap = g_poly_count;
+    pthread_mutex_unlock(&g_poly_lock);
+
+    if (poly_snap > 0) {
+      for (uint32_t b = 0; b < SG_POLY_BUCKETS; b++) {
+        for (SgGenCallsite* c = g_poly_buckets[b]; c != nullptr; c = c->next) {
+          const char* op_name = "invokevirtual";
+          switch (c->opcode_byte) {
+            case 0xb6: op_name = "invokevirtual";  break;
+            case 0xb7: op_name = "invokespecial";  break;
+            case 0xb8: op_name = "invokestatic";   break;
+            case 0xb9: op_name = "invokeinterface"; break;
+            case 0xba: op_name = "invokedynamic";  break;
+          }
+          fprintf(f, "{\"record\":\"callsite_target\",\"category\":");
+          sg_json_str(f, c->category);
+          fprintf(f, ",\"evidence\":\"OBSERVED_ONLY\","
+                  "\"source_class\":");
+          sg_json_str(f, c->src_class);
+          fprintf(f, ",\"source_loader_id\":\"0x%016llx\","
+                  "\"source_capture\":\"exact\","
+                  "\"source_method\":",
+                  (unsigned long long)c->src_loader_id);
+          sg_json_str(f, c->src_method);
+          fprintf(f, ",\"source_descriptor\":");
+          sg_json_str(f, c->src_desc);
+          fprintf(f, ",\"source_bci\":%d", c->src_bci);
+          fprintf(f, ",\"source_opcode\":");
+          sg_json_str(f, op_name);
+          if (c->cp_index >= 0)
+            fprintf(f, ",\"source_cp_index\":%d", c->cp_index);
+          fprintf(f, ",\"target_class\":");
+          sg_json_str(f, c->target_class);
+          fprintf(f, ",\"target_loader_id\":\"0x%016llx\","
+                  "\"target_method\":",
+                  (unsigned long long)c->target_loader_id);
+          sg_json_str(f, c->target_method);
+          fprintf(f, ",\"target_descriptor\":");
+          sg_json_str(f, c->target_desc);
+          fprintf(f, "}\n");
+          ct_count++;
+        }
+      }
+    }
   }
 
   if (ferror(f)) write_ok = false;
@@ -2299,6 +2538,8 @@ void soroush_graph_export_runtime_targets(const char* path) {
 
         // -- LINKS_TO from ReflectionInvoke/MHLinkage -> Method ---------------
         // Evidence: LINKAGE_GUARANTEED (source node type encodes the signal).
+        // Source attribution fields (sc=/sm=/sd=/sb=/sl=/scp=/smr=) are encoded
+        // in the node label by soroush_graph_linkage() at capture time.
         if (e->type == SG_EDGE_LINKS_TO &&
             (src->type == SG_NODE_REFLECTION_INVOKE ||
              src->type == SG_NODE_METHODHANDLE_LINKAGE) &&
@@ -2321,11 +2562,46 @@ void soroush_graph_export_runtime_targets(const char* path) {
           sg_export_label_field(src->label, "src=", caller_ctx, sizeof(caller_ctx));
           const char* dk = (src->type == SG_NODE_REFLECTION_INVOKE)
                             ? "reflection" : "methodhandle_linkage";
+
+          // Parse source attribution from label.
+          char scp_buf[16] = "";
+          sg_export_label_field(src->label, "scp=", scp_buf, sizeof(scp_buf));
+          bool have_src = (strcmp(scp_buf, "exact") == 0);
+
           fprintf(f, "{\"record\":\"runtime_target\","
                   "\"evidence\":\"LINKAGE_GUARANTEED\","
                   "\"dispatch_kind\":\"%s\","
                   "\"caller_context\":", dk);
           sg_json_str(f, caller_ctx);
+
+          if (have_src) {
+            char sc[512] = "", sm[256] = "", sd[512] = "", sb_str[16] = "", sl_str[20] = "";
+            sg_export_label_field(src->label, "sc=", sc, sizeof(sc));
+            sg_export_label_field(src->label, "sm=", sm, sizeof(sm));
+            sg_export_label_field(src->label, "sd=", sd, sizeof(sd));
+            sg_export_label_field(src->label, "sb=", sb_str, sizeof(sb_str));
+            sg_export_label_field(src->label, "sl=", sl_str, sizeof(sl_str));
+            int sbci = (sb_str[0] != '\0') ? atoi(sb_str) : -1;
+            fprintf(f, ",\"source_class\":");
+            sg_json_str(f, sc);
+            fprintf(f, ",\"source_method\":");
+            sg_json_str(f, sm);
+            fprintf(f, ",\"source_descriptor\":");
+            sg_json_str(f, sd);
+            fprintf(f, ",\"source_bci\":%d", sbci);
+            fprintf(f, ",\"source_loader_id\":");
+            sg_json_str(f, sl_str);
+            fprintf(f, ",\"source_capture\":\"exact\"");
+          } else {
+            char smr[128] = "";
+            sg_export_label_field(src->label, "smr=", smr, sizeof(smr));
+            fprintf(f, ",\"source_capture\":\"missing\"");
+            if (smr[0] != '\0') {
+              fprintf(f, ",\"source_missing_reason\":");
+              sg_json_str(f, smr);
+            }
+          }
+
           fprintf(f, ",\"target_class\":");
           sg_json_str(f, t_class);
           fprintf(f, ",\"target_method\":");
@@ -2561,6 +2837,27 @@ void soroush_graph_export_runtime_targets(const char* path) {
     } // end node_snap > 0 branch
   } // end graph_enabled branch
 
+  // -------------------------------------------------------------------------
+  // Phase N: hidden_class_identity records.
+  // Maps each hidden class's runtime name (+0x<address>) to its artifact CRC
+  // so the UI can resolve the exact bytecode artifact.
+  // -------------------------------------------------------------------------
+  {
+    pthread_mutex_lock(&g_hidden_id_lock);
+    uint32_t hid_snap = g_hidden_id_count;
+    pthread_mutex_unlock(&g_hidden_id_lock);
+
+    for (uint32_t i = 0; i < hid_snap; i++) {
+      SgHiddenId* e = &g_hidden_ids[i];
+      if (e->runtime_name == nullptr) continue;
+      fprintf(f, "{\"record\":\"hidden_class_identity\",\"runtime_name\":");
+      sg_json_str(f, e->runtime_name);
+      fprintf(f, ",\"artifact_crc\":\"%08x\",\"loader_id\":\"0x%016llx\"}\n",
+              e->artifact_crc, (unsigned long long)e->loader_id);
+      hid_count++;
+    }
+  }
+
 sg_export_summary:
   if (ferror(f)) write_ok = false;
   fprintf(f, "{\"record\":\"export_summary\","
@@ -2569,9 +2866,10 @@ sg_export_summary:
           "\"runtime_target_count\":%ld,"
           "\"generated_class_count\":%ld,"
           "\"bytecode_artifact_count\":%ld,"
+          "\"hidden_class_identity_count\":%ld,"
           "\"diagnostic_count\":%ld,"
           "\"complete\":%s}\n",
-          mi_count, ct_count, rt_count, gc_count, ba_count, diag_count,
+          mi_count, ct_count, rt_count, gc_count, ba_count, hid_count, diag_count,
           write_ok ? "true" : "false");
   fclose(f);
   if (!write_ok) {
@@ -2582,7 +2880,7 @@ sg_export_summary:
   fprintf(stderr,
           "[JVM EXPORT] %s: %s"
           " (method_identity=%ld callsite_target=%ld runtime_target=%ld"
-          " generated_class=%ld bytecode_artifact=%ld diagnostic=%ld)\n",
+          " generated_class=%ld bytecode_artifact=%ld hidden_class_identity=%ld diagnostic=%ld)\n",
           write_ok ? "done" : "INCOMPLETE",
-          path, mi_count, ct_count, rt_count, gc_count, ba_count, diag_count);
+          path, mi_count, ct_count, rt_count, gc_count, ba_count, hid_count, diag_count);
 }

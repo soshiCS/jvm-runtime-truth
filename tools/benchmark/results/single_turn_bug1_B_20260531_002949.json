@@ -1,0 +1,42 @@
+{
+  "trace": {
+    "agent": "B",
+    "bug": "bug1",
+    "model": "claude-sonnet-4-6",
+    "mode": "single_turn",
+    "start_ts": "2026-05-31T04:29:49.579304+00:00",
+    "end_ts": "2026-05-31T04:29:55.403983+00:00",
+    "elapsed_s": 5.8,
+    "input_tokens": 2,
+    "output_tokens": 205,
+    "cost_usd": 0.05019559999999999,
+    "num_turns": 1,
+    "tool_calls": [],
+    "diagnosis": {
+      "root_cause_file": "bug1/NotificationService.java",
+      "root_cause_line": 34,
+      "root_cause_explanation": "The handler registry maps 'DELIVERY' to AuditHandler.class instead of DeliveryHandler.class. When a DELIVERY event is dispatched, reflection invokes AuditHandler.handle(), which writes an audit log entry and silently drops the delivery. The runtime causality data confirms this: the reflection callsite in NotificationService.dispatch resolves to AuditHandler.handle at runtime.",
+      "patch_code": "Before: registry.put(\"DELIVERY\", AuditHandler.class);\nAfter:  registry.put(\"DELIVERY\", DeliveryHandler.class);",
+      "confidence": "high",
+      "wrong_hypotheses": []
+    },
+    "raw_output": "```json\n{\n  \"root_cause_file\": \"bug1/NotificationService.java\",\n  \"root_cause_line\": 34,\n  \"root_cause_explanation\": \"The handler registry maps 'DELIVERY' to AuditHandler.class instead of DeliveryHandler.class. When a DELIVERY event is dispatched, reflection invokes AuditHandler.handle(), which writes an audit log entry and silently drops the delivery. The runtime causality data confirms this: the reflection callsite in NotificationService.dispatch resolves to AuditHandler.handle at runtime.\",\n  \"patch_code\": \"Before: registry.put(\\\"DELIVERY\\\", AuditHandler.class);\\nAfter:  registry.put(\\\"DELIVERY\\\", DeliveryHandler.class);\",\n  \"confidence\": \"high\",\n  \"wrong_hypotheses\": []\n}\n```",
+    "completed": true
+  },
+  "score": {
+    "file_score": 3,
+    "line_score": 2,
+    "patch_score": 5,
+    "explain_score": 5,
+    "total": 15,
+    "max_score": 16,
+    "pct": 93.8,
+    "total_turns": 0,
+    "files_read": 0,
+    "unique_files_read": 0,
+    "causality_calls": 0,
+    "wrong_hypotheses": 0,
+    "confidence": "high",
+    "submitted": true
+  }
+}

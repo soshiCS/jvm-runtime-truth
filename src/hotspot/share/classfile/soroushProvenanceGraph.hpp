@@ -67,6 +67,12 @@ enum SoroushGraphEdgeType {
 
 bool soroush_graph_enabled();
 
+// Returns the address of the internal enabled flag byte for direct assembly
+// reads (TemplateTable warm-path guard).  The byte is 0x01 when enabled, 0x00
+// when disabled.  Calling this also ensures the flag is initialized from the
+// SOROUSH_PROVENANCE_GRAPH env var before the address is used in generated code.
+void* soroush_graph_enabled_addr();
+
 // EXACT ENTER event from the runtime execution graph — the SOLE execution-node
 // creation path (method-token trace ABI; the legacy best-effort string path was
 // removed). Creates an Execution node (+ Method/Class), an EXECUTES edge, and a
@@ -187,13 +193,42 @@ bool soroush_graph_generic_callsite(
     bool source_exact, bool target_exact,
     const char* diagnostic_reason);
 
+// Polymorphic callsite record for invokevirtual (and future polymorphic bytecodes).
+//
+// Unlike soroush_graph_generic_callsite(), this function deduplicates by
+// (src_class, src_method, src_desc, src_bci, target_class, target_method,
+// target_desc) — one record per unique (callsite, target) pair. Multiple
+// calls for the same source BCI with different runtime targets each produce
+// a separate callsite_target record in the export.  This allows the graph
+// to represent polymorphic dispatch sites with all observed targets.
+//
+// All exact records (source_exact && target_exact). Emitted as
+// callsite_target with evidence=OBSERVED_ONLY. Returns true if stored as a
+// new record, false if already present or dropped (OOM / graph off).
+// Fail-safe on OOM. All strings are sg_strdup'd immediately.
+// No-op when SOROUSH_PROVENANCE_GRAPH=1 is absent.
+bool soroush_graph_poly_callsite(
+    const char* category,
+    const char* src_class, uint64_t src_loader_id,
+    const char* src_method, const char* src_desc,
+    int src_bci, int opcode_byte, int cp_index,
+    const char* target_class, uint64_t target_loader_id,
+    const char* target_method, const char* target_desc);
+
 // reflection / MethodHandle linkage (methodHandles membername resolution).
 // node_type is SG_NODE_REFLECTION_INVOKE or SG_NODE_METHODHANDLE_LINKAGE.
-// loader_id is the ClassLoaderData pointer of the target method's holder (0 if
-// unknown) so the target Class/Method nodes are loader-precise.
+// loader_id is the ClassLoaderData pointer of the target method's holder.
+// src_* fields carry the caller frame found by vframeStream walk; src_ok=true
+// when attribution was recovered, false when no user frame was on the stack.
+// src_missing_reason is emitted as source_missing_reason in the JSONL export
+// when src_ok=false (pass nullptr when src_ok=true).
 void soroush_graph_linkage(int node_type, const char* source,
                            const char* internal_class, const char* method,
-                           const char* descriptor, uint64_t loader_id);
+                           const char* descriptor, uint64_t loader_id,
+                           const char* src_class, const char* src_method,
+                           const char* src_desc, int src_bci,
+                           uint64_t src_loader_id,
+                           bool src_ok, const char* src_missing_reason);
 
 // Final executable bytecode capture (klassFactory). Creates a BytecodeArtifact
 // node, HAS_BYTECODE from its (loader-specific) Class, and (when transformed)
@@ -203,6 +238,12 @@ void soroush_graph_linkage(int node_type, const char* source,
 void soroush_graph_bytecode(const char* internal_class, uint32_t crc, int size,
                             int transformed, const char* load_kind, uint64_t loader_id,
                             int hidden);
+
+// Record the runtime name → artifact CRC mapping for a hidden class. Called
+// from KlassFactory after create_instance_klass() assigns the +0x mangled name.
+// Emitted as hidden_class_identity records at export time.
+void soroush_graph_hidden_identity(const char* runtime_name, uint32_t artifact_crc,
+                                   uint64_t loader_id);
 
 // ---------------------------------------------------------------------------
 // Async / cross-thread causality (v1 async extension)

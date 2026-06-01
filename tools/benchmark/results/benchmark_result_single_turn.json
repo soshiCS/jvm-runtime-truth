@@ -1,0 +1,291 @@
+{
+  "bug1": {
+    "A": {
+      "trace": {
+        "agent": "A",
+        "bug": "bug1",
+        "model": "claude-sonnet-4-6",
+        "mode": "single_turn",
+        "start_ts": "2026-05-31T04:29:44.015112+00:00",
+        "end_ts": "2026-05-31T04:29:49.577496+00:00",
+        "elapsed_s": 5.6,
+        "input_tokens": 2,
+        "output_tokens": 192,
+        "cost_usd": 0.0480671,
+        "num_turns": 1,
+        "tool_calls": [],
+        "diagnosis": {
+          "root_cause_file": "bug1/NotificationService.java",
+          "root_cause_line": 33,
+          "root_cause_explanation": "The handler registry maps 'DELIVERY' to AuditHandler.class instead of DeliveryHandler.class. When a DELIVERY event is dispatched, reflection instantiates and invokes AuditHandler.handle(), which logs an audit record and returns silently \u2014 no delivery confirmation is ever sent. No exception is thrown because AuditHandler is a valid EventHandler implementation.",
+          "patch_code": "registry.put(\"DELIVERY\", AuditHandler.class); \u2192 registry.put(\"DELIVERY\", DeliveryHandler.class);",
+          "confidence": "high",
+          "wrong_hypotheses": []
+        },
+        "raw_output": "```json\n{\n  \"root_cause_file\": \"bug1/NotificationService.java\",\n  \"root_cause_line\": 33,\n  \"root_cause_explanation\": \"The handler registry maps 'DELIVERY' to AuditHandler.class instead of DeliveryHandler.class. When a DELIVERY event is dispatched, reflection instantiates and invokes AuditHandler.handle(), which logs an audit record and returns silently \u2014 no delivery confirmation is ever sent. No exception is thrown because AuditHandler is a valid EventHandler implementation.\",\n  \"patch_code\": \"registry.put(\\\"DELIVERY\\\", AuditHandler.class); \u2192 registry.put(\\\"DELIVERY\\\", DeliveryHandler.class);\",\n  \"confidence\": \"high\",\n  \"wrong_hypotheses\": []\n}\n```",
+        "completed": true
+      },
+      "score": {
+        "file_score": 3,
+        "line_score": 2,
+        "patch_score": 5,
+        "explain_score": 5,
+        "total": 15,
+        "max_score": 16,
+        "pct": 93.8,
+        "total_turns": 0,
+        "files_read": 0,
+        "unique_files_read": 0,
+        "causality_calls": 0,
+        "wrong_hypotheses": 0,
+        "confidence": "high",
+        "submitted": true
+      }
+    },
+    "B": {
+      "trace": {
+        "agent": "B",
+        "bug": "bug1",
+        "model": "claude-sonnet-4-6",
+        "mode": "single_turn",
+        "start_ts": "2026-05-31T04:29:49.579304+00:00",
+        "end_ts": "2026-05-31T04:29:55.403983+00:00",
+        "elapsed_s": 5.8,
+        "input_tokens": 2,
+        "output_tokens": 205,
+        "cost_usd": 0.05019559999999999,
+        "num_turns": 1,
+        "tool_calls": [],
+        "diagnosis": {
+          "root_cause_file": "bug1/NotificationService.java",
+          "root_cause_line": 34,
+          "root_cause_explanation": "The handler registry maps 'DELIVERY' to AuditHandler.class instead of DeliveryHandler.class. When a DELIVERY event is dispatched, reflection invokes AuditHandler.handle(), which writes an audit log entry and silently drops the delivery. The runtime causality data confirms this: the reflection callsite in NotificationService.dispatch resolves to AuditHandler.handle at runtime.",
+          "patch_code": "Before: registry.put(\"DELIVERY\", AuditHandler.class);\nAfter:  registry.put(\"DELIVERY\", DeliveryHandler.class);",
+          "confidence": "high",
+          "wrong_hypotheses": []
+        },
+        "raw_output": "```json\n{\n  \"root_cause_file\": \"bug1/NotificationService.java\",\n  \"root_cause_line\": 34,\n  \"root_cause_explanation\": \"The handler registry maps 'DELIVERY' to AuditHandler.class instead of DeliveryHandler.class. When a DELIVERY event is dispatched, reflection invokes AuditHandler.handle(), which writes an audit log entry and silently drops the delivery. The runtime causality data confirms this: the reflection callsite in NotificationService.dispatch resolves to AuditHandler.handle at runtime.\",\n  \"patch_code\": \"Before: registry.put(\\\"DELIVERY\\\", AuditHandler.class);\\nAfter:  registry.put(\\\"DELIVERY\\\", DeliveryHandler.class);\",\n  \"confidence\": \"high\",\n  \"wrong_hypotheses\": []\n}\n```",
+        "completed": true
+      },
+      "score": {
+        "file_score": 3,
+        "line_score": 2,
+        "patch_score": 5,
+        "explain_score": 5,
+        "total": 15,
+        "max_score": 16,
+        "pct": 93.8,
+        "total_turns": 0,
+        "files_read": 0,
+        "unique_files_read": 0,
+        "causality_calls": 0,
+        "wrong_hypotheses": 0,
+        "confidence": "high",
+        "submitted": true
+      }
+    },
+    "comparison": {
+      "winner": "TIE",
+      "score_delta": 0,
+      "turns_saved": 0,
+      "files_saved": 0,
+      "causality_calls_b": 0,
+      "explanation": "Tied score (15/16). Turn difference: 0 (positive = B was faster)."
+    }
+  },
+  "bug2": {
+    "A": {
+      "trace": {
+        "agent": "A",
+        "bug": "bug2",
+        "model": "claude-sonnet-4-6",
+        "mode": "single_turn",
+        "start_ts": "2026-05-31T04:29:55.406088+00:00",
+        "end_ts": "2026-05-31T04:30:01.763582+00:00",
+        "elapsed_s": 6.4,
+        "input_tokens": 2,
+        "output_tokens": 276,
+        "cost_usd": 0.049859850000000004,
+        "num_turns": 1,
+        "tool_calls": [],
+        "diagnosis": {
+          "root_cause_file": "bug2/OrderService.java",
+          "root_cause_line": 33,
+          "root_cause_explanation": "The ternary expression in processOrder() has its branches swapped. When the order type IS 'INTERNATIONAL' (condition is true), it assigns DOMESTIC_TAX_RATE (0.08) instead of INTERNATIONAL_TAX_RATE (0.15), and vice versa for DOMESTIC orders.",
+          "patch_code": "double taxRate = \"INTERNATIONAL\".equals(order.type())\n        ? DOMESTIC_TAX_RATE\n        : INTERNATIONAL_TAX_RATE;\n\u2192\ndouble taxRate = \"INTERNATIONAL\".equals(order.type())\n        ? INTERNATIONAL_TAX_RATE\n        : DOMESTIC_TAX_RATE;",
+          "confidence": "high",
+          "wrong_hypotheses": [
+            "AuditInterceptor modifying the return value \u2014 the interceptor only logs and passes through the result unchanged",
+            "Order.type() returning incorrect values \u2014 the record stores and returns the type string as-is"
+          ]
+        },
+        "raw_output": "```json\n{\n  \"root_cause_file\": \"bug2/OrderService.java\",\n  \"root_cause_line\": 33,\n  \"root_cause_explanation\": \"The ternary expression in processOrder() has its branches swapped. When the order type IS 'INTERNATIONAL' (condition is true), it assigns DOMESTIC_TAX_RATE (0.08) instead of INTERNATIONAL_TAX_RATE (0.15), and vice versa for DOMESTIC orders.\",\n  \"patch_code\": \"double taxRate = \\\"INTERNATIONAL\\\".equals(order.type())\\n        ? DOMESTIC_TAX_RATE\\n        : INTERNATIONAL_TAX_RATE;\\n\u2192\\ndouble taxRate = \\\"INTERNATIONAL\\\".equals(order.type())\\n        ? INTERNATIONAL_TAX_RATE\\n        : DOMESTIC_TAX_RATE;\",\n  \"confidence\": \"high\",\n  \"wrong_hypotheses\": [\"AuditInterceptor modifying the return value \u2014 the interceptor only logs and passes through the result unchanged\", \"Order.type() returning incorrect values \u2014 the record stores and returns the type string as-is\"]\n}\n```",
+        "completed": true
+      },
+      "score": {
+        "file_score": 3,
+        "line_score": 1,
+        "patch_score": 5,
+        "explain_score": 5,
+        "total": 14,
+        "max_score": 16,
+        "pct": 87.5,
+        "total_turns": 0,
+        "files_read": 0,
+        "unique_files_read": 0,
+        "causality_calls": 0,
+        "wrong_hypotheses": 2,
+        "confidence": "high",
+        "submitted": true
+      }
+    },
+    "B": {
+      "trace": {
+        "agent": "B",
+        "bug": "bug2",
+        "model": "claude-sonnet-4-6",
+        "mode": "single_turn",
+        "start_ts": "2026-05-31T04:30:01.765607+00:00",
+        "end_ts": "2026-05-31T04:30:08.297183+00:00",
+        "elapsed_s": 6.5,
+        "input_tokens": 2,
+        "output_tokens": 280,
+        "cost_usd": 0.052474599999999996,
+        "num_turns": 1,
+        "tool_calls": [],
+        "diagnosis": {
+          "root_cause_file": "bug2/OrderService.java",
+          "root_cause_line": 30,
+          "root_cause_explanation": "The ternary operator in processOrder() has the branches inverted: when order.type() is 'INTERNATIONAL' (condition is true), it assigns DOMESTIC_TAX_RATE (0.08) instead of INTERNATIONAL_TAX_RATE (0.15), and vice versa. The AOP proxy and AuditInterceptor are functioning correctly and are red herrings \u2014 the bug is purely in the conditional assignment inside the real OrderService.",
+          "patch_code": "double taxRate = \"INTERNATIONAL\".equals(order.type()) ? DOMESTIC_TAX_RATE : INTERNATIONAL_TAX_RATE; \u2192 double taxRate = \"INTERNATIONAL\".equals(order.type()) ? INTERNATIONAL_TAX_RATE : DOMESTIC_TAX_RATE;",
+          "confidence": "high",
+          "wrong_hypotheses": [
+            "AuditInterceptor modifying the return value",
+            "CGLIB proxy intercepting and altering the result",
+            "Order record storing the wrong type value"
+          ]
+        },
+        "raw_output": "```json\n{\n  \"root_cause_file\": \"bug2/OrderService.java\",\n  \"root_cause_line\": 30,\n  \"root_cause_explanation\": \"The ternary operator in processOrder() has the branches inverted: when order.type() is 'INTERNATIONAL' (condition is true), it assigns DOMESTIC_TAX_RATE (0.08) instead of INTERNATIONAL_TAX_RATE (0.15), and vice versa. The AOP proxy and AuditInterceptor are functioning correctly and are red herrings \u2014 the bug is purely in the conditional assignment inside the real OrderService.\",\n  \"patch_code\": \"double taxRate = \\\"INTERNATIONAL\\\".equals(order.type()) ? DOMESTIC_TAX_RATE : INTERNATIONAL_TAX_RATE; \u2192 double taxRate = \\\"INTERNATIONAL\\\".equals(order.type()) ? INTERNATIONAL_TAX_RATE : DOMESTIC_TAX_RATE;\",\n  \"confidence\": \"high\",\n  \"wrong_hypotheses\": [\"AuditInterceptor modifying the return value\", \"CGLIB proxy intercepting and altering the result\", \"Order record storing the wrong type value\"]\n}\n```",
+        "completed": true
+      },
+      "score": {
+        "file_score": 3,
+        "line_score": 1,
+        "patch_score": 5,
+        "explain_score": 5,
+        "total": 14,
+        "max_score": 16,
+        "pct": 87.5,
+        "total_turns": 0,
+        "files_read": 0,
+        "unique_files_read": 0,
+        "causality_calls": 0,
+        "wrong_hypotheses": 3,
+        "confidence": "high",
+        "submitted": true
+      }
+    },
+    "comparison": {
+      "winner": "TIE",
+      "score_delta": 0,
+      "turns_saved": 0,
+      "files_saved": 0,
+      "causality_calls_b": 0,
+      "explanation": "Tied score (14/16). Turn difference: 0 (positive = B was faster)."
+    }
+  },
+  "bug3": {
+    "A": {
+      "trace": {
+        "agent": "A",
+        "bug": "bug3",
+        "model": "claude-sonnet-4-6",
+        "mode": "single_turn",
+        "start_ts": "2026-05-31T04:30:08.302827+00:00",
+        "end_ts": "2026-05-31T04:30:13.602450+00:00",
+        "elapsed_s": 5.3,
+        "input_tokens": 2,
+        "output_tokens": 216,
+        "cost_usd": 0.04971559999999999,
+        "num_turns": 1,
+        "tool_calls": [],
+        "diagnosis": {
+          "root_cause_file": "bug3/GuestHandler.java",
+          "root_cause_line": 22,
+          "root_cause_explanation": "GuestHandler.handle was copy-pasted from AdminHandler without updating the permissions list. The role field was changed to 'guest' but the permissions array still contains [read,write,delete,manage] instead of [read:public], granting GUEST users full admin-level access.",
+          "patch_code": "BEFORE: return \"GUEST_PROFILE:{userId=\" + request.userId() + \",role=guest,permissions=[read,write,delete,manage]}\";\nAFTER:  return \"GUEST_PROFILE:{userId=\" + request.userId() + \",role=guest,permissions=[read:public]}\";",
+          "confidence": "high",
+          "wrong_hypotheses": []
+        },
+        "raw_output": "```json\n{\n  \"root_cause_file\": \"bug3/GuestHandler.java\",\n  \"root_cause_line\": 22,\n  \"root_cause_explanation\": \"GuestHandler.handle was copy-pasted from AdminHandler without updating the permissions list. The role field was changed to 'guest' but the permissions array still contains [read,write,delete,manage] instead of [read:public], granting GUEST users full admin-level access.\",\n  \"patch_code\": \"BEFORE: return \\\"GUEST_PROFILE:{userId=\\\" + request.userId() + \\\",role=guest,permissions=[read,write,delete,manage]}\\\";\\nAFTER:  return \\\"GUEST_PROFILE:{userId=\\\" + request.userId() + \\\",role=guest,permissions=[read:public]}\\\";\",\n  \"confidence\": \"high\",\n  \"wrong_hypotheses\": []\n}\n```",
+        "completed": true
+      },
+      "score": {
+        "file_score": 3,
+        "line_score": 2,
+        "patch_score": 5,
+        "explain_score": 5,
+        "total": 15,
+        "max_score": 16,
+        "pct": 93.8,
+        "total_turns": 0,
+        "files_read": 0,
+        "unique_files_read": 0,
+        "causality_calls": 0,
+        "wrong_hypotheses": 0,
+        "confidence": "high",
+        "submitted": true
+      }
+    },
+    "B": {
+      "trace": {
+        "agent": "B",
+        "bug": "bug3",
+        "model": "claude-sonnet-4-6",
+        "mode": "single_turn",
+        "start_ts": "2026-05-31T04:30:13.604028+00:00",
+        "end_ts": "2026-05-31T04:30:19.610105+00:00",
+        "elapsed_s": 6.0,
+        "input_tokens": 2,
+        "output_tokens": 228,
+        "cost_usd": 0.051946099999999995,
+        "num_turns": 1,
+        "tool_calls": [],
+        "diagnosis": {
+          "root_cause_file": "bug3/GuestHandler.java",
+          "root_cause_line": 19,
+          "root_cause_explanation": "GuestHandler.handle was copy-pasted from AdminHandler without updating the permissions list. The method returns the string literal '[read,write,delete,manage]' instead of '[read:public]', granting guest sessions full administrator permissions. The runtime causality data confirms GuestHandler is the concrete dispatch target for GUEST requests at the invokeinterface call site in RequestRouter.route.",
+          "patch_code": "return \"GUEST_PROFILE:{userId=\" + request.userId() + \",role=guest,permissions=[read,write,delete,manage]}\"; \u2192 return \"GUEST_PROFILE:{userId=\" + request.userId() + \",role=guest,permissions=[read:public]}\";",
+          "confidence": "high",
+          "wrong_hypotheses": []
+        },
+        "raw_output": "```json\n{\n  \"root_cause_file\": \"bug3/GuestHandler.java\",\n  \"root_cause_line\": 19,\n  \"root_cause_explanation\": \"GuestHandler.handle was copy-pasted from AdminHandler without updating the permissions list. The method returns the string literal '[read,write,delete,manage]' instead of '[read:public]', granting guest sessions full administrator permissions. The runtime causality data confirms GuestHandler is the concrete dispatch target for GUEST requests at the invokeinterface call site in RequestRouter.route.\",\n  \"patch_code\": \"return \\\"GUEST_PROFILE:{userId=\\\" + request.userId() + \\\",role=guest,permissions=[read,write,delete,manage]}\\\"; \u2192 return \\\"GUEST_PROFILE:{userId=\\\" + request.userId() + \\\",role=guest,permissions=[read:public]}\\\";\",\n  \"confidence\": \"high\",\n  \"wrong_hypotheses\": []\n}\n```",
+        "completed": true
+      },
+      "score": {
+        "file_score": 3,
+        "line_score": 3,
+        "patch_score": 5,
+        "explain_score": 5,
+        "total": 16,
+        "max_score": 16,
+        "pct": 100.0,
+        "total_turns": 0,
+        "files_read": 0,
+        "unique_files_read": 0,
+        "causality_calls": 0,
+        "wrong_hypotheses": 0,
+        "confidence": "high",
+        "submitted": true
+      }
+    },
+    "comparison": {
+      "winner": "TIE",
+      "score_delta": 1,
+      "turns_saved": 0,
+      "files_saved": 0,
+      "causality_calls_b": 0,
+      "explanation": "Tied score (15/16). Turn difference: 0 (positive = B was faster)."
+    }
+  }
+}

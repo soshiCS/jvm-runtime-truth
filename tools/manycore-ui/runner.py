@@ -9,7 +9,7 @@ import threading
 import uuid
 from pathlib import Path
 
-RUN_BASE = Path("/tmp/manycore_ui_runs")
+RUN_BASE = Path("/tmp/rt_ui_runs")
 
 DEFAULT_JDK = (
     "/Users/soroushaghajani/custom-jvm/jdk21u-export"
@@ -70,6 +70,22 @@ class RunManager:
     def list_runs(self) -> list:
         with self._lock:
             return [dict(v) for v in self._runs.values()]
+
+    def ingest_run(self, label: str, run_dir: str) -> str:
+        """Register a pre-captured run_dir (with runtime_targets.jsonl) as a completed run."""
+        run_id = str(uuid.uuid4())[:8]
+        state = {
+            "run_id":    run_id,
+            "run_dir":   run_dir,
+            "status":    "done",
+            "exit_code": 0,
+            "timed_out": False,
+            "error":     None,
+            "config":    {"label": label, "user_prefixes": "com/example/demo"},
+        }
+        with self._lock:
+            self._runs[run_id] = state
+        return run_id
 
     # ------------------------------------------------------------------
     def _execute(self, run_id: str, config: dict, run_dir: Path, jar_path: Path):
