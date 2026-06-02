@@ -9,11 +9,17 @@ Records every dynamic dispatch that executes at runtime — `invokedynamic`, `in
 ```bash
 bash configure --with-debug-level=fastdebug --with-jvm-variants=server
 make hotspot
-cp build/macosx-aarch64-server-fastdebug/support/modules_libs/java.base/server/libjvm.dylib \
-   build/macosx-aarch64-server-fastdebug/jdk/lib/server/libjvm.dylib
+
+# Copy the updated JVM library into the JDK image.
+# The build directory name reflects your OS and arch (e.g. linux-x86_64-server-fastdebug
+# or macosx-aarch64-server-fastdebug). The library is libjvm.so on Linux, libjvm.dylib on macOS.
+BUILD=build/$(ls build | head -1)
+LIB=libjvm.$([ "$(uname)" = Darwin ] && echo dylib || echo so)
+cp $BUILD/support/modules_libs/java.base/server/$LIB \
+   $BUILD/jdk/lib/server/$LIB
 ```
 
-Custom `java` binary: `build/macosx-aarch64-server-fastdebug/jdk/bin/java`
+Custom `java` binary: `$BUILD/jdk/bin/java`
 
 ---
 
