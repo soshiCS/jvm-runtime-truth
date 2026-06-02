@@ -251,3 +251,235 @@ def test_invokedynamic_callsite_no_target_class_does_not_create_phantom():
     assert names == {"com/example/App"}
     src = _cls(idx, "com/example/App")
     assert src["has_user_callsites_src"] is True
+
+
+# ---------------------------------------------------------------------------
+# Derived fields: lmf_impl_* from sidecar trace_id cross-reference
+# ---------------------------------------------------------------------------
+
+def _idx_with_sidecars(records, sidecar_map, user_prefixes=None):
+    return _build_index(records, user_prefixes=user_prefixes or [], sidecar_map=sidecar_map)
+
+
+def test_lmf_impl_derived_on_hidden_instance():
+    """When a sidecar_map maps a CRC to a trace_id, and a callsite_target record
+    carries lmf_impl_* for that trace_id, the +0x class entry should expose those
+    fields directly so a staticizer does not need to cross-reference the JSONL."""
+    records = [
+        {
+            "record": "callsite_target",
+            "category": "invokedynamic",
+            "trace_id": 7,
+            "source_class": "com/example/App",
+            "source_method": "run",
+            "source_bci": 10,
+            "evidence": "LINKAGE_GUARANTEED",
+            "indy_name": "run",
+            "indy_descriptor": "()Ljava/lang/Runnable;",
+            "lmf_impl_class": "com/example/App",
+            "lmf_impl_method": "lambda$run$0",
+            "lmf_impl_descriptor": "()V",
+            "staticizable": True,
+            "reconstructable": False,
+        },
+        {
+            "record": "bytecode_artifact",
+            "class": "com/example/App$$Lambda",
+            "loader_id": "0xaabb",
+            "crc": "cafe1234",
+            "kind": "original",
+            "hidden": True,
+        },
+        {
+            "record": "hidden_class_identity",
+            "runtime_name": "com/example/App$$Lambda+0x00001111",
+            "artifact_crc": "cafe1234",
+            "loader_id": "0xaabb",
+        },
+    ]
+    sidecar_map = {"cafe1234": {"trace_id": 7, "generated_by": "LambdaMetafactory", "class_name": "com/example/App$$Lambda"}}
+    idx = _idx_with_sidecars(records, sidecar_map)
+
+    entry = idx["classes_by_name"].get("com/example/App$$Lambda+0x00001111")
+    assert entry is not None
+    assert entry.get("artifact_trace_id") == 7
+    assert entry.get("lmf_impl_method") == "lambda$run$0"
+    assert entry.get("lmf_impl_class") == "com/example/App"
+    assert entry.get("lmf_impl_descriptor") == "()V"
+
+
+def test_lmf_impl_absent_when_no_sidecar():
+    """Without sidecar_map, lmf_impl_* fields must not appear on the +0x entry."""
+    records = [
+        {
+            "record": "bytecode_artifact",
+            "class": "com/example/App$$Lambda",
+            "loader_id": "0xaabb",
+            "crc": "cafe1234",
+            "kind": "original",
+            "hidden": True,
+        },
+        {
+            "record": "hidden_class_identity",
+            "runtime_name": "com/example/App$$Lambda+0x00001111",
+            "artifact_crc": "cafe1234",
+            "loader_id": "0xaabb",
+        },
+    ]
+    idx = _idx(records)
+    entry = idx["classes_by_name"].get("com/example/App$$Lambda+0x00001111")
+    assert entry is not None
+    assert "lmf_impl_method" not in entry
+    assert "artifact_trace_id" not in entry
+
+
+def test_lambda_family_aggregates_lmf_impls():
+    """A lambda family entry should expose lambda_impls listing distinct impl methods
+    from all member +0x instances."""
+    crcs  = ["aaa11111", "bbb22222"]
+    addrs = ["0x0001", "0x0002"]
+    trace_ids = [10, 11]
+    records = []
+    for crc, addr in zip(crcs, addrs):
+        records.append({
+            "record": "bytecode_artifact",
+            "class": "com/example/App$$Lambda",
+            "loader_id": "0xaabb",
+            "crc": crc,
+            "kind": "original",
+            "hidden": True,
+        })
+        records.append({
+            "record": "hidden_class_identity",
+            "runtime_name": f"com/example/App$$Lambda+{addr}",
+            "artifact_crc": crc,
+            "loader_id": "0xaabb",
+        })
+    for trace_id, crc, method in zip(trace_ids, crcs, ["lambda$0", "lambda$1"]):
+        records.append({
+            "record": "callsite_target",
+            "category": "invokedynamic",
+            "trace_id": trace_id,
+            "source_class": "com/example/App",
+            "source_method": "run",
+            "source_bci": 10 * trace_id,
+            "evidence": "LINKAGE_GUARANTEED",
+            "indy_name": "run",
+            "indy_descriptor": "()Ljava/lang/Runnable;",
+            "lmf_impl_class": "com/example/App",
+            "lmf_impl_method": method,
+            "lmf_impl_descriptor": "()V",
+            "staticizable": True,
+            "reconstructable": False,
+        })
+    sidecar_map = {
+        "aaa11111": {"trace_id": 10, "generated_by": "LambdaMetafactory", "class_name": "com/example/App$$Lambda"},
+        "bbb22222": {"trace_id": 11, "generated_by": "LambdaMetafactory", "class_name": "com/example/App$$Lambda"},
+    }
+    idx = _idx_with_sidecars(records, sidecar_map)
+
+    fam = idx["classes_by_name"].get("com/example/App$$Lambda")
+    assert fam is not None
+    assert fam.get("is_lambda_family") is True
+    impls = {i["lmf_impl_method"] for i in fam.get("lambda_impls", [])}
+    assert impls == {"lambda$0", "lambda$1"}
+
+
+# ---------------------------------------------------------------------------
+# Proxy detection and handler linkage
+# ---------------------------------------------------------------------------
+
+def test_proxy_class_is_detected():
+    """A class whose simple name starts with $Proxy and is created via runtime_target
+    should be marked is_proxy_class=True."""
+    records = [
+        {
+            "record": "runtime_target",
+            "dispatch_kind": "reflection",
+            "evidence": "LINKAGE_GUARANTEED",
+            "source_class": "com/example/App",
+            "source_method": "run",
+            "source_bci": 50,
+            "target_class": "jdk/proxy1/$Proxy0",
+            "target_method": "<init>",
+            "target_descriptor": "()V",
+            "target_hidden": False,
+        },
+    ]
+    idx = _idx(records)
+    proxy = idx["classes_by_name"].get("jdk/proxy1/$Proxy0")
+    assert proxy is not None
+    assert proxy.get("is_proxy_class") is True
+
+
+def test_proxy_handler_linked_to_preceding_lambda():
+    """When a lambda-class <init> is observed just before a proxy <init> in the same
+    source method, the proxy entry should expose proxy_handler pointing to that lambda."""
+    records = [
+        # BCI=10: handler lambda created
+        {
+            "record": "runtime_target",
+            "dispatch_kind": "methodhandle_linkage",
+            "evidence": "LINKAGE_GUARANTEED",
+            "source_class": "com/example/App",
+            "source_method": "run",
+            "source_bci": 10,
+            "target_class": "com/example/App$$Lambda+0x00001234",
+            "target_method": "<init>",
+            "target_descriptor": "()V",
+            "target_hidden": False,
+        },
+        # BCI=30: proxy created with that handler
+        {
+            "record": "runtime_target",
+            "dispatch_kind": "reflection",
+            "evidence": "LINKAGE_GUARANTEED",
+            "source_class": "com/example/App",
+            "source_method": "run",
+            "source_bci": 30,
+            "target_class": "jdk/proxy1/$Proxy0",
+            "target_method": "<init>",
+            "target_descriptor": "()V",
+            "target_hidden": False,
+        },
+        # identity record for the handler lambda
+        {
+            "record": "hidden_class_identity",
+            "runtime_name": "com/example/App$$Lambda+0x00001234",
+            "artifact_crc": "deadbeef",
+            "loader_id": "0xaabb",
+        },
+    ]
+    idx = _idx(records)
+    proxy = idx["classes_by_name"].get("jdk/proxy1/$Proxy0")
+    assert proxy is not None
+    assert proxy.get("is_proxy_class") is True
+    assert proxy.get("proxy_handler") == "com/example/App$$Lambda+0x00001234"
+
+    handler = idx["classes_by_name"].get("com/example/App$$Lambda+0x00001234")
+    assert handler is not None
+    assert "jdk/proxy1/$Proxy0" in handler.get("proxy_for", [])
+
+
+def test_non_proxy_builder_lambda_not_marked_as_proxy():
+    """Proxy$ProxyBuilder$$Lambda classes contain '$Proxy' but their simple name
+    does NOT start with '$Proxy', so they must NOT be flagged is_proxy_class."""
+    records = [
+        {
+            "record": "runtime_target",
+            "dispatch_kind": "methodhandle_linkage",
+            "evidence": "LINKAGE_GUARANTEED",
+            "source_class": "java/lang/reflect/Proxy",
+            "source_method": "newProxyInstance",
+            "source_bci": 5,
+            "target_class": "java/lang/reflect/Proxy$ProxyBuilder$$Lambda+0x0000aabb",
+            "target_method": "<init>",
+            "target_descriptor": "()V",
+            "target_hidden": False,
+        },
+    ]
+    idx = _idx(records)
+    cls = idx["classes_by_name"].get("java/lang/reflect/Proxy$ProxyBuilder$$Lambda+0x0000aabb")
+    # If entry exists (via hidden_class_identity it might not), it must NOT be is_proxy_class
+    if cls:
+        assert not cls.get("is_proxy_class", False)

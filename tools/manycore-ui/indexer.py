@@ -9,6 +9,55 @@ from collections import defaultdict
 from pathlib import Path
 
 
+# ---------------------------------------------------------------------------
+# Evidence levels for staticization readiness.
+# Lower number = stronger/more direct proof.
+# ---------------------------------------------------------------------------
+EVIDENCE_LEVELS = {
+    "LINKAGE_GUARANTEED":       1,   # JVM confirmed at linkage time
+    "ADAPTER_GRAPH_EXACT":      2,   # full MH adapter chain present, all_exact=True
+    "OBSERVED_RUNTIME_TARGET":  3,   # target observed at runtime (OBSERVED_ONLY)
+    "BYTECODE_DERIVED":         4,   # derived by reading captured bytecode
+    "PROXY_BYTECODE_DERIVED":   5,   # proxy dispatch chain from proxy class bytecode
+    "UNKNOWN":                  99,  # no evidence captured
+}
+
+
+def _scan_sidecars(artifacts_dir: Path) -> dict:
+    """Read *.metadata.txt sidecar files from the artifacts directory.
+
+    Returns a dict mapping crc32 → {trace_id, generated_by, class_name}.
+    These sidecar files are emitted alongside per-trace recover class files
+    and carry the trace_id that links a hidden lambda class CRC to its
+    source invokedynamic callsite.
+    """
+    result: dict = {}
+    if not artifacts_dir.is_dir():
+        return result
+    for f in artifacts_dir.glob("*.metadata.txt"):
+        data: dict = {}
+        try:
+            for line in f.read_text().splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    data[k.strip()] = v.strip()
+        except OSError:
+            continue
+        crc = data.get("crc32")
+        trace_id_raw = data.get("trace_id")
+        if crc and trace_id_raw is not None:
+            try:
+                trace_id = int(trace_id_raw)
+            except ValueError:
+                continue
+            result[crc] = {
+                "trace_id":     trace_id,
+                "generated_by": data.get("generated_by", ""),
+                "class_name":   data.get("class_name", ""),
+            }
+    return result
+
+
 def load_and_index(jsonl_path: str, user_prefixes: list | None = None) -> dict:
     records = []
     bad = 0
@@ -21,7 +70,13 @@ def load_and_index(jsonl_path: str, user_prefixes: list | None = None) -> dict:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 bad += 1
-    idx = _build_index(records, user_prefixes=user_prefixes or [])
+    # Scan for per-trace artifact sidecar files in the sibling artifacts/ directory.
+    # These carry the trace_id → CRC link needed to map lambda class instances back
+    # to their source invokedynamic callsites.
+    artifacts_dir = Path(jsonl_path).parent / "artifacts"
+    sidecar_map = _scan_sidecars(artifacts_dir)
+
+    idx = _build_index(records, user_prefixes=user_prefixes or [], sidecar_map=sidecar_map)
     idx["parse_errors"] = bad
     return idx
 
@@ -42,8 +97,10 @@ def _src(r: dict) -> tuple[str, str]:
     return cls, meth
 
 
-def _build_index(records: list, user_prefixes: list | None = None) -> dict:
+def _build_index(records: list, user_prefixes: list | None = None,
+                 sidecar_map: dict | None = None) -> dict:
     pfx = user_prefixes or []
+    sidecar_map = sidecar_map or {}   # crc32 → {trace_id, generated_by, class_name}
 
     def _is_user_src(cls: str) -> bool:
         return bool(pfx) and bool(cls) and any(cls.startswith(p) for p in pfx)
@@ -86,6 +143,13 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
     # artifact_path -> CRC of the last bytecode_artifact record that named this path.
     # Hidden lambda instances share a filename; the last-written CRC is what's on disk.
     path_to_last_crc: dict[str, str] = {}
+
+    # trace_id (int) -> LambdaMetafactory impl fields, from invokedynamic callsite_target.
+    # Used to back-populate lmf_impl_* on +0x hidden class entries.
+    trace_to_lmf: dict[int, dict] = {}
+
+    # All runtime_target raw records, stored for post-loop proxy/handler derivation.
+    runtime_targets_raw: list[dict] = []
 
     # method_identity: class -> {method -> [entry]}
     methods: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
@@ -192,6 +256,16 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
                 "raw":               r,
             }
             push_callsite(cs)
+            # For invokedynamic LambdaMetafactory callsites: record the impl method so we can
+            # back-populate it on the +0x hidden class entry via sidecar trace_id resolution.
+            if (r.get("category") == "invokedynamic"
+                    and r.get("lmf_impl_method")
+                    and r.get("trace_id") is not None):
+                trace_to_lmf[int(r["trace_id"])] = {
+                    "lmf_impl_class":      _norm(r.get("lmf_impl_class", "")),
+                    "lmf_impl_method":     r.get("lmf_impl_method", ""),
+                    "lmf_impl_descriptor": r.get("lmf_impl_descriptor", ""),
+                }
             continue
 
         # ------------------------------------------------------------------ callsite_target_set
@@ -281,6 +355,7 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
                 e["record_types"].add("runtime_target")
             if tgt_cls:
                 cls_entry(tgt_cls)["record_types"].add("runtime_target_ref")
+            runtime_targets_raw.append(r)
             continue
 
         # ------------------------------------------------------------------ diagnostic
@@ -336,6 +411,8 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
     # bytecode_artifact records for hidden classes use the base class name (no +0x),
     # so cls_entry() was skipped for them.  Now that hidden_id_map is fully populated,
     # walk each +0x class entry and check whether its CRC-indexed artifact was stored.
+    # Also derive lmf_impl_* (LambdaMetafactory impl method) via the sidecar trace_id
+    # link so a staticizer can find the final target without cross-referencing JSONL.
     for rname, hid_info in hidden_id_map.items():
         crc    = hid_info.get("artifact_crc", "")
         loader = hid_info.get("loader_id", "")
@@ -344,10 +421,20 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
         # base name is the part before +0x
         base   = rname.split("+0x")[0]
         crc_cls = f"{base}_crc{crc}"
+        e = classes[rname]
         if (crc_cls, loader) in artifacts:
-            e = classes[rname]
             e["has_artifacts"] = True
             e["record_types"].add("bytecode_artifact")
+        # Derive trace_id from sidecar, then look up LMF impl method.
+        sidecar = sidecar_map.get(crc, {})
+        trace_id = sidecar.get("trace_id")
+        if trace_id is not None:
+            e["artifact_trace_id"] = trace_id
+            lmf = trace_to_lmf.get(trace_id)
+            if lmf:
+                e["lmf_impl_class"]      = lmf["lmf_impl_class"]
+                e["lmf_impl_method"]     = lmf["lmf_impl_method"]
+                e["lmf_impl_descriptor"] = lmf["lmf_impl_descriptor"]
 
     # -- Build lambda family grouping entries ---------------------------------
     # For each set of 2+ hidden class instances sharing the same base name,
@@ -360,9 +447,28 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
             lambda_by_base.setdefault(base, []).append(rname)
 
     for base, instances in lambda_by_base.items():
-        if len(instances) < 2 or base in classes:
-            continue  # single instance needs no grouping; real entry already exists
+        if len(instances) < 2:
+            continue
+        existing = classes.get(base)
+        # Only skip if there's a real class entry (more than just generated_class records)
+        if existing and (existing.get("record_types", set()) - {"generated_class"}):
+            continue
         instances_sorted = sorted(instances)
+        # Aggregate lmf_impl_* from member instances (all members share the same base name
+        # so they all have the same functional interface, but may have different impls).
+        # Collect the distinct set for the family summary.
+        family_impls = []
+        seen_impls: set = set()
+        for inst in instances_sorted:
+            ic = classes[inst]
+            impl_key = (ic.get("lmf_impl_class",""), ic.get("lmf_impl_method",""), ic.get("lmf_impl_descriptor",""))
+            if impl_key[1] and impl_key not in seen_impls:
+                seen_impls.add(impl_key)
+                family_impls.append({
+                    "lmf_impl_class":      impl_key[0],
+                    "lmf_impl_method":     impl_key[1],
+                    "lmf_impl_descriptor": impl_key[2],
+                })
         classes[base] = {
             "name":                    base,
             "record_types":            {"lambda_family"},
@@ -376,7 +482,62 @@ def _build_index(records: list, user_prefixes: list | None = None) -> dict:
             "is_lambda_family":        True,
             "lambda_instances":        instances_sorted,
             "lambda_count":            len(instances),
+            "lambda_impls":            family_impls,  # distinct impl methods across all members
         }
+
+    # -- Proxy class detection and handler linkage --------------------------
+    # JDK dynamic proxy classes ($Proxy*) are generated at runtime; the InvocationHandler
+    # that was installed on each proxy can be identified from the runtime_target records:
+    # the handler lambda's <init> BCI precedes the proxy's <init> BCI in the same source
+    # method.  We derive this link here so the UI/staticizer can consume it directly
+    # without reading $Proxy*.class bytecode.
+    #
+    # handler_events: (src_class, src_method, bci) -> hidden class name (the handler lambda)
+    handler_events: dict[tuple, str] = {}
+    for rt in runtime_targets_raw:
+        tc = _norm(rt.get("target_class", ""))
+        tm = rt.get("target_method", "")
+        if tm == "<init>" and "+0x" in tc:
+            src = _norm(rt.get("source_class", ""))
+            sm  = rt.get("source_method", "")
+            bci = rt.get("source_bci", -1)
+            if bci >= 0:
+                handler_events[(src, sm, bci)] = tc
+
+    for rt in runtime_targets_raw:
+        tc = _norm(rt.get("target_class", ""))
+        tm = rt.get("target_method", "")
+        # Proxy classes created via reflection have target names like jdk/proxy1/$Proxy0.
+        # Match only on the final path segment starting with "$Proxy" (not builder classes).
+        if tm != "<init>" or not tc:
+            continue
+        simple = tc.split("/")[-1]
+        is_proxy = simple.startswith("$Proxy")
+        if not is_proxy:
+            continue
+        src = _norm(rt.get("source_class", ""))
+        sm  = rt.get("source_method", "")
+        bci = rt.get("source_bci", -1)
+        if tc in classes:
+            classes[tc]["is_proxy_class"] = True
+        else:
+            # Proxy class may not have been seen in callsite_target records yet
+            e = cls_entry(tc)
+            e["is_proxy_class"] = True
+        # Find the closest preceding handler-lambda creation in the same source method
+        best_handler: str | None = None
+        best_bci: int = -1
+        for (h_src, h_sm, h_bci), handler_cls in handler_events.items():
+            if h_src == src and h_sm == sm and 0 <= h_bci < bci and h_bci > best_bci:
+                best_handler = handler_cls
+                best_bci = h_bci
+        if best_handler:
+            classes[tc]["proxy_handler"] = best_handler
+            # Back-annotate the handler class with which proxy it serves
+            if best_handler in classes:
+                classes[best_handler].setdefault("proxy_for", [])
+                if tc not in classes[best_handler]["proxy_for"]:
+                    classes[best_handler]["proxy_for"].append(tc)
 
     # -- Finalise classes ---------------------------------------------------
     for c in classes.values():
