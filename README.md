@@ -7,19 +7,10 @@ Records every dynamic dispatch that executes at runtime — `invokedynamic`, `in
 ## Build
 
 ```bash
-bash configure --with-debug-level=fastdebug --with-jvm-variants=server
-make hotspot
-
-# Copy the updated JVM library into the JDK image.
-# The build directory name reflects your OS and arch (e.g. linux-x86_64-server-fastdebug
-# or macosx-aarch64-server-fastdebug). The library is libjvm.so on Linux, libjvm.dylib on macOS.
-BUILD=build/$(ls build | head -1)
-LIB=libjvm.$([ "$(uname)" = Darwin ] && echo dylib || echo so)
-cp $BUILD/support/modules_libs/java.base/server/$LIB \
-   $BUILD/jdk/lib/server/$LIB
+bash tools/build.sh
 ```
 
-Custom `java` binary: `$BUILD/jdk/bin/java`
+That runs `configure` (first time only), `make hotspot`, and copies the updated JVM library into the JDK image. Works on Linux and macOS. The custom `java` binary path is printed at the end.
 
 ---
 
