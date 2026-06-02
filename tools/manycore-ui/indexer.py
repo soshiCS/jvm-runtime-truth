@@ -129,6 +129,10 @@ def _build_index(records: list, user_prefixes: list | None = None,
     # (class, loader) -> {"final": record|None, "original": record|None}
     artifacts: dict[tuple, dict] = defaultdict(lambda: {"final": None, "original": None})
 
+    # crc → generated_class record for hidden lambdas.
+    # Populated instead of cls_entry() so _crc pseudo-names never appear as classes.
+    crc_to_gen_cls: dict[str, dict] = {}
+
     # (class, method) -> [callsite entry]
     callsites_by: dict[str, list] = defaultdict(list)
 
@@ -195,15 +199,14 @@ def _build_index(records: list, user_prefixes: list | None = None,
             crc    = r.get("crc", "")
             if cls:
                 if r.get("hidden"):
-                    # Hidden-class artifacts use a base class name (no +0x) that is shared by
-                    # all runtime instances of that hidden class family.  Do NOT create a class
-                    # entry for the base name — it is not a stable unique identity.  The real
-                    # per-instance entries come from hidden_class_identity records (+0x names).
-                    # Store only the CRC-indexed artifact so find_best_artifact() can resolve it.
-                    artifacts[(cls, loader)][kind] = r   # kept for fallback non-+0x lookup
-                    if crc:
-                        crc_cls = f"{cls}_crc{crc}"
-                        artifacts[(crc_cls, loader)][kind] = r
+                    # The lookup key used by find_best_artifact() and the back-fill loop is
+                    # always f"{base}_crc{crc}" (base = name without +0x or _crc suffix).
+                    # Normalize here: real JSONL already carries the _crc suffix in cls;
+                    # test fixtures may not.  Either way produce the canonical key.
+                    canonical = cls if (crc and cls.endswith(f"_crc{crc}")) else (
+                        f"{cls}_crc{crc}" if crc else cls
+                    )
+                    artifacts[(canonical, loader)][kind] = r
                     # Track which CRC was written last to each export file.
                     # Hidden lambda instances share a filename; later writes overwrite earlier ones.
                     if crc and r.get("artifact_path"):
@@ -218,11 +221,21 @@ def _build_index(records: list, user_prefixes: list | None = None,
         # ------------------------------------------------------------------ generated_class
         if rtype == "generated_class":
             cls = _norm(r.get("class", ""))
+            crc = r.get("crc", "")
             if cls:
-                e = cls_entry(cls)
-                e["record_types"].add("generated_class")
-                e["generated"] = True
-                generated_cls.append(r)
+                if r.get("hidden"):
+                    # Hidden lambda: the _crc-suffixed name is NOT a stable runtime identity.
+                    # The real per-instance +0x name comes from hidden_class_identity records.
+                    # Stash metadata for later attachment to the +0x entry; do NOT create a
+                    # class entry here so _crc pseudo-names never appear in the sidebar.
+                    if crc:
+                        crc_to_gen_cls[crc] = r
+                    generated_cls.append(r)
+                else:
+                    e = cls_entry(cls)
+                    e["record_types"].add("generated_class")
+                    e["generated"] = True
+                    generated_cls.append(r)
             continue
 
         # ------------------------------------------------------------------ callsite_target
@@ -425,6 +438,13 @@ def _build_index(records: list, user_prefixes: list | None = None,
         if (crc_cls, loader) in artifacts:
             e["has_artifacts"] = True
             e["record_types"].add("bytecode_artifact")
+        # Attach generated_class metadata (generated_by, source_trigger) from stash.
+        gen = crc_to_gen_cls.get(crc)
+        if gen:
+            e["generated"]      = True
+            e["generated_by"]   = gen.get("generated_by", "")
+            e["source_trigger"] = gen.get("source_trigger", "")
+            e["record_types"].add("generated_class")
         # Derive trace_id from sidecar, then look up LMF impl method.
         sidecar = sidecar_map.get(crc, {})
         trace_id = sidecar.get("trace_id")
