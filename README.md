@@ -47,13 +47,15 @@ Open `http://localhost:5000`.
 
 ## Load your run
 
+Register your output directory with the UI (the UI is a local server and doesn't scan the filesystem automatically):
+
 ```bash
 curl -X POST http://localhost:5000/api/runs/ingest \
   -H "Content-Type: application/json" \
   -d '{"label": "my-run", "run_dir": "/tmp/myrun"}'
 ```
 
-Then select the run in the UI sidebar.
+The run will appear in the sidebar at `http://localhost:5000`.
 
 ---
 
