@@ -21,8 +21,10 @@ if [ ! -f "$JAR" ]; then
   exit 1
 fi
 
-# Custom JVM
-JAVA="/Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/java"
+# Custom JVM — auto-detect from repo root (works on any machine after build.sh)
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BUILD_DIR="$(ls -d "$REPO_ROOT/build"/*/jdk 2>/dev/null | head -1)"
+JAVA="${BUILD_DIR}/bin/java"
 
 # Run directory
 RUN_DIR="${1:-/tmp/demo_runtime_truth_live}"

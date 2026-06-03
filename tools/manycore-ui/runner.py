@@ -11,10 +11,15 @@ from pathlib import Path
 
 RUN_BASE = Path("/tmp/rt_ui_runs")
 
-DEFAULT_JDK = (
-    "/Users/soroushaghajani/custom-jvm/jdk21u-export"
-    "/build/macosx-aarch64-server-fastdebug/jdk"
-)
+def _auto_detect_jdk() -> str:
+    """Find the first built JDK under the repo's build/ directory."""
+    import glob
+    script_dir = Path(__file__).parent
+    repo_root = script_dir.parent.parent
+    candidates = sorted(glob.glob(str(repo_root / "build" / "*" / "jdk")))
+    return candidates[0] if candidates else ""
+
+DEFAULT_JDK = _auto_detect_jdk()
 
 # Always-on SOROUSH export flags (same set as run_showcase.sh)
 REQUIRED_ENV = {

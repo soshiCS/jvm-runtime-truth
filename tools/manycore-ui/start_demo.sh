@@ -90,7 +90,7 @@ echo "║    kill $FLASK_PID $CF_PID"
 echo "║  Or just close this terminal."
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
-echo "Share with Nico:"
+echo "Remote access credentials:"
 if [[ -n "$PUBLIC_URL" ]]; then
     echo "  URL      : $PUBLIC_URL"
 fi

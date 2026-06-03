@@ -23,7 +23,8 @@ if [ ! -f "$JAR" ]; then
   exit 1
 fi
 
-JAVA="/Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/java"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+JAVA="$(ls -d "$REPO_ROOT/build"/*/jdk 2>/dev/null | head -1)/bin/java"
 
 if [ ! -x "$JAVA" ]; then
   echo "ERROR: custom JVM not found at $JAVA" >&2

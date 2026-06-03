@@ -8,7 +8,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 JAR="$SCRIPT_DIR/target/demo-spring-proxy-bypass-1.0.0.jar"
-JAVA="/Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/java"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+JAVA="$(ls -d "$REPO_ROOT/build"/*/jdk 2>/dev/null | head -1)/bin/java"
 RUN_DIR="${1:-/tmp/demo_proxy_bypass}"
 
 [ -f "$JAR" ]  || { echo "ERROR: JAR missing — run mvn package -DskipTests" >&2; exit 1; }

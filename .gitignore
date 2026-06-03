@@ -7,3 +7,5 @@ hs_err_pid*
 __pycache__/
 *.pyc
 tools/*/target/
+.DS_Store
+*.class

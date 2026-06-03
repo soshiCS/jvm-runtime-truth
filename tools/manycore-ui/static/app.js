@@ -1184,7 +1184,7 @@ function artifactMissingView(className, artifact) {
         <p style="font-size:11px;color:#64748b">
           No <code>hidden_class_identity</code> record was emitted for <code>${esc(className)}</code>.<br>
           The JVM did not record the CRC mapping for this hidden class instance.<br>
-          Check that the provenance export ran after class load and that <code>soroush_graph_hidden_class_id()</code> was called.
+          Check that the capture export ran after class load (hidden class identity hook must fire at load time).
         </p>
       </div>`;
     }
