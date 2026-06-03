@@ -29,7 +29,7 @@ Verify: `build/macosx-aarch64-server-fastdebug/jdk/bin/java -version` must show 
 ## Starting the server
 
 ```bash
-cd tools/manycore-ui
+cd tools/rt-ui
 python3 app.py              # port 5000
 python3 app.py 5001         # custom port
 ```
@@ -51,7 +51,7 @@ jar cf /tmp/showcase_ui_build/showcase.jar \
     -C /tmp/showcase_ui_build 'RuntimeTargetShowcaseDemo$Greeter.class'
 
 # 2. Start UI
-cd tools/manycore-ui && python3 app.py 5001
+cd tools/rt-ui && python3 app.py 5001
 
 # 3. Open http://localhost:5001 → click "▶ New Run"
 #    - Upload showcase.jar

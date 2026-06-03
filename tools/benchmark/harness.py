@@ -37,7 +37,7 @@ from scorer import score_run, compare
 
 REPO_ROOT    = Path(__file__).resolve().parents[2]
 APP_SRC      = REPO_ROOT / "tools/demo-buggy-app/src/main/java/com/example/demo"
-MANYCORE_UI  = REPO_ROOT / "tools/manycore-ui"
+RT_UI        = REPO_ROOT / "tools/rt-ui"
 RESULTS_DIR  = Path(__file__).parent / "results"
 DEFAULT_JSONL = "/tmp/demo-buggy-app-export2/runtime_targets.jsonl"
 
@@ -400,12 +400,12 @@ def _fmt_input(inp: dict) -> str:
     items = [f"{k}={repr(v)[:40]}" for k, v in inp.items() if k != "wrong_hypotheses"]
     return ", ".join(items)
 
-# ─── manycore-ui lifecycle ──────────────────────────────────────────────────────
+# ─── rt-ui lifecycle ──────────────────────────────────────────────────────
 
 _ui_proc = None
 
 def start_ui(jsonl_path: str) -> str | None:
-    """Start a fresh manycore-ui on UI_PORT and ingest the demo run. Returns run_id."""
+    """Start a fresh rt-ui on UI_PORT and ingest the demo run. Returns run_id."""
     global _ui_proc
 
     # Kill any existing process on this port
@@ -419,12 +419,12 @@ def start_ui(jsonl_path: str) -> str | None:
                 pass
         time.sleep(1)
 
-    print(f"  Starting manycore-ui on port {UI_PORT}...")
+    print(f"  Starting rt-ui on port {UI_PORT}...")
     env = os.environ.copy()
     env.pop("RT_DEMO_TOKEN", None)   # ensure no auth required
     _ui_proc = subprocess.Popen(
         ["python3", "app.py", str(UI_PORT)],
-        cwd=MANYCORE_UI,
+        cwd=RT_UI,
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -440,7 +440,7 @@ def start_ui(jsonl_path: str) -> str | None:
             pass
         time.sleep(0.5)
     else:
-        print("  ERROR: manycore-ui did not start in time")
+        print("  ERROR: rt-ui did not start in time")
         return None
 
     # Ingest the demo JSONL
@@ -476,7 +476,7 @@ def main():
     ap.add_argument("--jsonl", default=DEFAULT_JSONL,
                     help="Path to runtime_targets.jsonl")
     ap.add_argument("--run-id",
-                    help="Use existing manycore-ui run_id instead of starting a new server")
+                    help="Use existing rt-ui run_id instead of starting a new server")
     args = ap.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -484,7 +484,7 @@ def main():
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Start manycore-ui if needed
+    # Start rt-ui if needed
     causality_run_id = args.run_id
     if not causality_run_id:
         if not Path(args.jsonl).exists():
@@ -492,7 +492,7 @@ def main():
                      f"Run the demo app first: tools/demo-buggy-app/run_demo.sh --non-interactive")
         causality_run_id = start_ui(args.jsonl)
         if not causality_run_id:
-            sys.exit("Failed to start manycore-ui")
+            sys.exit("Failed to start rt-ui")
 
     agents   = (["A", "B"] if args.agent == "both" else [args.agent])
     all_results = {}

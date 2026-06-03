@@ -59,7 +59,7 @@ Investigate the root cause. Application source is in:
 """
 
 # Pre-captured causality API output for the /api/process endpoint.
-# This is what the ManyCore JVM produces when the request runs under instrumentation.
+# This is what the Runtime Truth JVM produces when the request runs under instrumentation.
 #
 # Sections present:
 #   /causality/reflection       — identifies Processor037 via reflection constructor

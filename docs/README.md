@@ -11,7 +11,7 @@ See the top-level [README](../README.md) for build and usage instructions.
 | [00-agent-handoff.md](00-agent-handoff.md) | Architecture overview and project status |
 | [03-source-ownership-map.md](03-source-ownership-map.md) | C++ source files → capabilities map |
 | [04-runtime-capture-architecture.md](04-runtime-capture-architecture.md) | Cold path, warm path, MH walk, export pipeline |
-| [05-validation-guide.md](05-validation-guide.md) | ManyCore cases + Spring Boot reproduction steps |
+| [05-validation-guide.md](05-validation-guide.md) | 15-case test suite + Spring Boot reproduction steps |
 | [06-known-limitations.md](06-known-limitations.md) | Known gaps with impact and workarounds |
 | [07-build-workflow-guide.md](07-build-workflow-guide.md) | Build, libjvm copy, env vars, troubleshooting |
 | [09-running-tests-and-demos.md](09-running-tests-and-demos.md) | How to run the test suite and capture demos |
@@ -22,7 +22,7 @@ See the top-level [README](../README.md) for build and usage instructions.
 
 **Phase 1: COMPLETE.**
 
-- 15/15 ManyCore synthetic cases pass
+- 15/15 synthetic test cases pass
 - Spring Boot validation (docs/56): 17,738 records, 9/9 validation checks pass
 - 41/41 indexer + graph builder unit tests pass
 - All attribution gaps resolved: reflection_method_invoke, invokeinterface, invokevirtual
@@ -43,7 +43,7 @@ SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/val.jsonl \
   -cp /tmp/manycore-cases-build/classes manycorecases.ManyCoreCasesMain
 ```
 
-Expected: `ManyCore cases demo complete — 15/15 passed`
+Expected: `15-case test suite demo complete — 15/15 passed`
 
 ---
 

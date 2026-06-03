@@ -2,8 +2,8 @@
 tests/test_graph_builder.py — Unit tests for graph_builder.py
 
 Synthetic JSONL fixtures prove each causality chain rule deterministically.
-Run with:  python3 -m pytest tools/manycore-ui/tests/ -v
-       or: python3 tools/manycore-ui/tests/test_graph_builder.py
+Run with:  python3 -m pytest tools/rt-ui/tests/ -v
+       or: python3 tools/rt-ui/tests/test_graph_builder.py
 """
 
 import json

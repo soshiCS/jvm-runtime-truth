@@ -71,7 +71,7 @@ Investigate the root cause. Application source is in:
 """
 
 # Pre-captured causality API output for POST /api/fee with accountId=ACC-PREM-8821.
-# This is what the ManyCore JVM produces when the request runs under instrumentation.
+# This is what the Runtime Truth JVM produces when the request runs under instrumentation.
 #
 # Sections present:
 #   /causality/reflection    — identifies FeeCalculatorBase$Profile009$t3yK6fHm via

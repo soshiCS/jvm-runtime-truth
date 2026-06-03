@@ -2,7 +2,7 @@
 Bug scenario definitions for the v5 (flagship runtime truth) benchmark.
 
 This is the V5 "Runtime Truth Decryption Challenge" — designed as the flagship
-public demo for the ManyCore platform.
+public demo for the Runtime Truth platform.
 
 The scenario exercises every major runtime visibility capability in a single
 request:
@@ -92,7 +92,7 @@ Investigate the root cause. Application source is in:
 """
 
 # Pre-captured causality API output for POST /api/decrypt?sessionKey=550e8400-e29b-41d4-a716-446655440000.
-# This is what the ManyCore JVM produces when the request runs under instrumentation.
+# This is what the Runtime Truth JVM produces when the request runs under instrumentation.
 #
 # The pipeline chain:
 #   DecryptPipeline.execute()          — Method.invoke on PipelineExecutor proxy

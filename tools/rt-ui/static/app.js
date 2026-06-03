@@ -224,7 +224,7 @@ const CAT_META = [
 
 // Fix: check jdk/framework BEFORE generated so that JDK-internal generated classes
 // (e.g. java/lang/invoke/LambdaForm$$Lambda$...) are classified as 'jdk', not 'generated'.
-// User-code-generated lambdas (e.g. manycorecases/Case01$$Lambda$...) don't start with
+// User-code-generated lambdas (e.g. com/example/Case01$$Lambda$...) don't start with
 // a JDK prefix so they still classify as 'generated'.
 function classifyClass(c) {
   const name = c.name;

@@ -87,7 +87,7 @@ Investigate the root cause. The application source is in:
 """
 
 # Pre-captured causality API data for Bug 1v2
-# This is what the ManyCore JVM would produce for /bug/reflection-v2
+# This is what the Runtime Truth JVM would produce for /bug/reflection-v2
 CAUSALITY_BUG1V2 = """\
 === /causality/reflection (filtered to com/example/demo) ===
 {

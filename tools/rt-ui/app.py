@@ -483,7 +483,7 @@ def download_full(run_id):
     return Response(
         buf.read(),
         mimetype="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=manycore_run_{run_id}.zip"},
+        headers={"Content-Disposition": f"attachment; filename=rt_run_{run_id}.zip"},
     )
 
 

@@ -149,7 +149,7 @@ fi
 echo "=== Server is running (pid $APP_PID) ==="
 echo ""
 echo "Try the causality API (requires Runtime Truth UI running on port 5001):"
-echo "  Run Runtime Truth UI: cd tools/manycore-ui && python app.py"
+echo "  Run Runtime Truth UI: cd tools/rt-ui && python app.py"
 echo "  Then ingest the export:"
 echo "    curl -X POST http://localhost:5001/runs/ingest \\"
 echo "         -H 'Content-Type: application/json' \\"

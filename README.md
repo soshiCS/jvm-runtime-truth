@@ -17,7 +17,7 @@ That runs `configure` (first time only), `make hotspot`, and copies the updated 
 ## Start the UI
 
 ```bash
-cd tools/manycore-ui
+cd tools/rt-ui
 pip install flask
 python3 app.py 5000
 ```
@@ -65,7 +65,7 @@ curl -X POST http://localhost:5000/api/runs/ingest \
 ## Run tests
 
 ```bash
-cd tools/manycore-ui && python3 -m pytest tests/ -v
+cd tools/rt-ui && python3 -m pytest tests/ -v
 ```
 
 ---
