@@ -175,7 +175,7 @@ No unknown targets. The missing piece is the explicit BCI→target link record, 
 
 **Root cause:** The current SOROUSH configuration does not emit callsite_target records for plain `invokeinterface`/`invokevirtual` bytecodes. These opcodes only produce callsite records when they go through the MethodHandle dispatch path (`invokehandle` after JVM rewriting of signature-polymorphic methods). Standard interface/virtual dispatch on user-defined types does not trigger `resolve_handle_call`.
 
-**Confirmed by cross-check:** Running ManyCore demo cases with identical env vars also produces zero invokevirtual/invokeinterface callsite_target records. Earlier ManyCore runs with these categories used a different JVM configuration.
+**Confirmed by cross-check:** Running Runtime Truth demo cases with identical env vars also produces zero invokevirtual/invokeinterface callsite_target records. Earlier Runtime Truth runs with these categories used a different JVM configuration.
 
 **Impact on staticization:** For this app:
 - `compiled.applyTransform(data)`: receiver type is `TransformHandler` (interface), actual class is one of the ByteBuddy-generated Transform* subclasses. All three Transfer* classes inherit `applyTransform()` from `TransformBase` without overriding it. The dispatch is deterministic: always calls `TransformBase.applyTransform()`, whose bytecode is in the artifact.
@@ -234,7 +234,7 @@ PipelineProxy.dispatch(ctx)
 
 ## 8. UI / Indexer Behavior
 
-The indexer (`tools/manycore-ui/indexer.py`) is expected to:
+The indexer (`tools/rt-ui/indexer.py`) is expected to:
 
 1. Derive `lmf_impl_*` fields on lambda hidden class entries via sidecar + trace_id cross-reference (from docs/51)
 2. Identify `$Proxy0` as proxy class; derive `proxy_handler` link via BCI-order heuristic (from docs/51)

@@ -134,7 +134,7 @@ PASS Case09 — Guard / catch / finally
 PASS Case10 — Reflection
 PASS Case11 — Dynamic proxy
 PASS Case12 — Hidden class
-ManyCore cases demo complete — 12/12 passed
+test cases demo complete — 12/12 passed
 ```
 
 ---

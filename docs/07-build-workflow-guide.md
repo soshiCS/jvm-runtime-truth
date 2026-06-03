@@ -23,7 +23,7 @@ Every source edit, every build, every validation, every `libjvm.dylib` deploymen
 | `/Users/soroushaghajani/custom-jvm/jdk21u/` | Historical copy — do not modify |
 | `/Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/` | Build output |
 | `/Users/soroushaghajani/gs-spring-boot/complete/` | Spring Boot validation app |
-| `/tmp/manycore-cases-build/` | ManyCore test case build dir |
+| `/tmp/cases-build/` | Runtime Truth test case build dir |
 
 ---
 
@@ -114,26 +114,26 @@ SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/out.jsonl \
 
 ---
 
-## ManyCore Cases
+## Runtime Truth Cases
 
 ### Build
 
 ```bash
 JAVAC=/Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/javac
-mkdir -p /tmp/manycore-cases-build/classes
-$JAVAC -d /tmp/manycore-cases-build/classes \
-  /tmp/manycore-cases-build/src/manycorecases/*.java
+mkdir -p /tmp/cases-build/classes
+$JAVAC -d /tmp/cases-build/classes \
+  /tmp/cases-build/src/testcases/*.java
 ```
 
-Source location: `/tmp/manycore-cases-build/src/manycorecases/`
+Source location: `/tmp/cases-build/src/testcases/`
 
 ### Run
 
 ```bash
 SOROUSH_PROVENANCE_GRAPH=1 \
-SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/manycore_out.jsonl \
+SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/rt_out.jsonl \
   /Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/java \
-  -cp /tmp/manycore-cases-build/classes manycorecases.ManyCoreCasesMain
+  -cp /tmp/cases-build/classes testcases.TestCasesMain
 ```
 
 ---
@@ -161,12 +161,12 @@ The `--spring.main.web-application-type=none` flag disables Tomcat. Without it, 
 
 ---
 
-## ManyCore UI
+## Runtime Truth UI
 
 ### Start
 
 ```bash
-cd /Users/soroushaghajani/custom-jvm/jdk21u-export/tools/manycore-ui
+cd /Users/soroushaghajani/custom-jvm/jdk21u-export/tools/rt-ui
 python3 app.py 5001
 # Open http://localhost:5001
 ```

@@ -1,6 +1,6 @@
-# ManyCore Causality — Demo Bug Suite
+# Runtime Truth Causality — Demo Bug Suite
 
-**Purpose**: Prove the value of the ManyCore Runtime Causality platform relative to conventional debugging.
+**Purpose**: Prove the value of the Runtime Truth Runtime Causality platform relative to conventional debugging.
 Each bug is a self-contained Spring Boot HTTP endpoint. Agent A (no causality) and Agent B (with causality API) are given the same symptom description and asked to identify the root cause.
 
 **Location**: `tools/demo-buggy-app/`  
@@ -155,13 +155,13 @@ Returns the `invokedynamic` site with the resolved hidden class, linking it back
 
 ## Running under the causality API
 
-After exercising the endpoints, ingest the export into a running manycore-ui:
+After exercising the endpoints, ingest the export into a running rt-ui:
 
 ```bash
-# Start manycore-ui (if not already running)
-cd tools/manycore-ui && python app.py 5001
+# Start rt-ui (if not already running)
+cd tools/rt-ui && python app.py 5001
 
-# Ingest the demo run (requires manycore-ui restart to pick up /api/runs/ingest)
+# Ingest the demo run (requires rt-ui restart to pick up /api/runs/ingest)
 curl -X POST http://localhost:5001/api/runs/ingest \
      -H 'Content-Type: application/json' \
      -d '{"label":"demo-buggy-app","run_dir":"/tmp/demo-buggy-app-export"}'
@@ -174,7 +174,7 @@ curl http://localhost:5001/api/runs/$RUN_ID/causality/polymorphic
 curl http://localhost:5001/api/runs/$RUN_ID/causality/hidden
 ```
 
-**Note**: The `/api/runs/ingest` endpoint was added in this session to `app.py` and `runner.py`. A manycore-ui restart is required to activate it.
+**Note**: The `/api/runs/ingest` endpoint was added in this session to `app.py` and `runner.py`. A rt-ui restart is required to activate it.
 
 ---
 

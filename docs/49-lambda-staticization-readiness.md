@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-01  
 **Status:** Validated  
-**Run used:** `/tmp/rt_ui_runs/05160976` (ManyCore Cases, Case01_LambdaIndy)
+**Run used:** `/tmp/rt_ui_runs/05160976` (Runtime Truth Cases, Case01_LambdaIndy)
 
 ---
 
@@ -46,7 +46,7 @@ All analysis in this report uses the binary as source of truth. The assertion `s
 | 27 | `1fe9e6e7` | `…$$Lambda+0x000000c8000888e8` |
 | 28 | `9d6569dc` | `…$$Lambda+0x000000c800088b28` |
 
-(Prefix: `manycorecases/Case01_LambdaIndy`. trace 26 = `makeConcatWithConstants` string concat, no lambda class.)
+(Prefix: `testcases/Case01_LambdaIndy`. trace 26 = `makeConcatWithConstants` string concat, no lambda class.)
 
 ---
 
@@ -67,7 +67,7 @@ All analysis in this report uses the binary as source of truth. The assertion `s
 | **Captures** | none (no fields, no-arg constructor) |
 | **Runtime dispatch** | BCI=13 `invokeinterface` → `…+0x…88230.run()` (OBSERVED_ONLY) |
 | **RT linkage evidence** | BCI=6 `runtime_target` → `Case01_LambdaIndy.lambda$run$0()V` (LINKAGE_GUARANTEED) |
-| **Artifact path** | `manycorecases_Case01_LambdaIndy$$Lambda_trace23_recover53.class` |
+| **Artifact path** | `testcases_Case01_LambdaIndy$$Lambda_trace23_recover53.class` |
 | **staticizable** | `true` |
 | **reconstructable** | `false` |
 | **Missing info** | none |
@@ -92,7 +92,7 @@ All analysis in this report uses the binary as source of truth. The assertion `s
 | **Captures** | none (no fields, no-arg constructor) |
 | **Runtime dispatch** | BCI=30 `invokeinterface` → `…+0x…88460.apply()` (OBSERVED_ONLY) |
 | **RT linkage evidence** | BCI=18 `runtime_target` → `String.valueOf(Object)String` (LINKAGE_GUARANTEED) |
-| **Artifact path** | `manycorecases_Case01_LambdaIndy$$Lambda_trace24_recover54.class` |
+| **Artifact path** | `testcases_Case01_LambdaIndy$$Lambda_trace24_recover54.class` |
 | **staticizable** | `true` |
 | **reconstructable** | `false` |
 | **Missing info** | none |
@@ -117,7 +117,7 @@ All analysis in this report uses the binary as source of truth. The assertion `s
 | **Captures** | `arg$1: java.lang.String` (the value of `greeting` at the indy site) |
 | **Runtime dispatch** | BCI=52 `invokeinterface` → `…+0x…886b0.get()` (OBSERVED_ONLY) |
 | **RT linkage evidence** | BCI=43 `runtime_target` → `Case01_LambdaIndy.lambda$run$1(String)String` (LINKAGE_GUARANTEED) |
-| **Artifact path** | `manycorecases_Case01_LambdaIndy$$Lambda_trace25_recover55.class` |
+| **Artifact path** | `testcases_Case01_LambdaIndy$$Lambda_trace25_recover55.class` |
 | **staticizable** | `true` |
 | **reconstructable** | `false` |
 | **Missing info** | Captured value not in JSONL (only captured type is recoverable from class bytecode) |
@@ -142,7 +142,7 @@ All analysis in this report uses the binary as source of truth. The assertion `s
 | **Captures** | none (no fields, no-arg constructor) |
 | **Runtime dispatch** | BCI=79 `invokeinterface` → `…+0x…888e8.apply()` (OBSERVED_ONLY) |
 | **RT linkage evidence** | BCI=62 `runtime_target` → `Case01_LambdaIndy.lambda$run$2(Integer,Integer)Integer` (LINKAGE_GUARANTEED) |
-| **Artifact path** | `manycorecases_Case01_LambdaIndy$$Lambda_trace27_recover63.class` |
+| **Artifact path** | `testcases_Case01_LambdaIndy$$Lambda_trace27_recover63.class` |
 | **staticizable** | `true` |
 | **reconstructable** | `false` |
 | **Missing info** | none |
@@ -167,7 +167,7 @@ All analysis in this report uses the binary as source of truth. The assertion `s
 | **Captures** | `arg$1: java.lang.String` (the receiver object — value of `base` at the indy site) |
 | **Runtime dispatch** | BCI=112 `invokeinterface` → `…+0x…88b28.get()` (OBSERVED_ONLY) |
 | **RT linkage evidence** | BCI=103 `runtime_target` → `String.toLowerCase()String` (LINKAGE_GUARANTEED) |
-| **Artifact path** | `manycorecases_Case01_LambdaIndy$$Lambda_trace28_recover64.class` |
+| **Artifact path** | `testcases_Case01_LambdaIndy$$Lambda_trace28_recover64.class` |
 | **staticizable** | `true` |
 | **reconstructable** | `false` |
 | **Source/binary mismatch** | **Yes** — binary has `toLowerCase`, source has `toUpperCase`. RT correctly reports binary. |

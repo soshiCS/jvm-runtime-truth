@@ -1,6 +1,6 @@
 # Agent Capability Audit — V4 Benchmark Planning
 
-**Purpose**: Determine how much of the ManyCore JVM platform's captured information
+**Purpose**: Determine how much of the Runtime Truth JVM platform's captured information
 is actually reachable by Agent B in the current benchmark setup, identify the gaps,
 and determine whether V4 should expose bytecode artifacts before adding more scenarios.
 
@@ -8,16 +8,16 @@ and determine whether V4 should expose bytecode artifacts before adding more sce
 - `src/hotspot/share/classfile/soroushProvenanceGraph.cpp` — JVM capture + export
 - `src/hotspot/share/classfile/klassFactory.cpp` — bytecode dump logic
 - `src/hotspot/share/classfile/soroushClassfileRewriter.cpp` — rewriter phases
-- `tools/manycore-ui/app.py` — full API surface (8 causality endpoints + others)
-- `tools/manycore-ui/indexer.py` — what the indexer parses and exposes
-- `tools/manycore-ui/runner.py` — which SOROUSH_* env vars are always set
+- `tools/rt-ui/app.py` — full API surface (8 causality endpoints + others)
+- `tools/rt-ui/indexer.py` — what the indexer parses and exposes
+- `tools/rt-ui/runner.py` — which SOROUSH_* env vars are always set
 - `tools/benchmark/harness_v2.py` — exactly which tools Agent B receives
 
 ---
 
 ## Main audit table
 
-| Feature | Captured by JVM | Exported to JSONL | In graph builder | Available in manycore-ui | Available through API | Usable by benchmark harness | Usable by Agent B today | Notes |
+| Feature | Captured by JVM | Exported to JSONL | In graph builder | Available in rt-ui | Available through API | Usable by benchmark harness | Usable by Agent B today | Notes |
 |---------|:-:|:-:|:-:|:-:|:-:|:-:|:-:|-------|
 | **callsite_target records** | ✓ | ✓ | ✓ (NT_CALLSITE, ET_CALLSITE_TARGET) | ✓ (class/method/callsite views) | ✓ (reflection, polymorphic, proxies, search) | ✓ (pre-captured in CAUSALITY string) | ✓ | Core record type; 4 filtered views available |
 | **runtime_target records** | ✓ (Phase 2B) | ✓ | ✓ (NT_RUNTIME_TARGET, ET_CALLSITE_RT_ATTRIBUTED) | ✓ (indexed in `runtime_target_ref`) | ✗ (no dedicated endpoint) | ✗ | ✗ | MH linkage events with source attribution. Graph uses them but no causality API endpoint exposes them directly |
@@ -100,7 +100,7 @@ Adding `causality_hidden` to Agent B's tool set requires one line in `harness_v2
 **3. causality_chain in benchmark harness — for proxy chain bugs**
 
 `/causality/chain?class=&method=&bci=` returns the full dispatch chain from a callsite through any
-proxy layers to the final concrete target. Currently available in manycore-ui but omitted from the
+proxy layers to the final concrete target. Currently available in rt-ui but omitted from the
 benchmark tool set. A proxy-chain bug is insoluble in 2 turns without `causality_chain`;
 with it, Agent B can traverse proxy → interceptor → real implementation in one call.
 
@@ -171,7 +171,7 @@ Current benchmark (V1, V2, V3) exercises:
 | Capability exercised | Fraction of platform |
 |---------------------|---------------------|
 | `callsite_target` records via 4 filtered views (reflection, polymorphic, proxies, summary) | 4 of 8 causality API endpoints |
-| Static source code search (search_files, read_file, grep) | Not unique to ManyCore |
+| Static source code search (search_files, read_file, grep) | Not unique to Runtime Truth |
 | `hidden_class_identity` API | Implemented, **not exposed to benchmark agent** |
 | `callsite_adapter_graph` data | Captured, indexed, **not exposed** |
 | `callsite_target_set` data | Captured, indexed, **not exposed** |
@@ -220,7 +220,7 @@ not expose it.
 javap output in one call). This unlocks an entire class of benchmark scenarios that are currently
 unsolvable for Agent B.
 
-**Validates**: The claim that ManyCore helps with generated/lambda bugs — currently unproven.
+**Validates**: The claim that Runtime Truth helps with generated/lambda bugs — currently unproven.
 
 ---
 

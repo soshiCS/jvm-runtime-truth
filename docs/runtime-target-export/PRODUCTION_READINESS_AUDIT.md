@@ -1,7 +1,7 @@
 # Production-Readiness Audit
 
 **Date:** 2026-05-25
-**Scope:** Runtime target export / Manycore staticization branch
+**Scope:** Runtime target export / rt staticization branch
 **Standard:** Every executed dynamic callsite must produce either an exact record
 or an explicit diagnostic. Zero silent omissions.
 

@@ -14,7 +14,7 @@ static analysis time: the actual runtime targets of `invokedynamic`, `MethodHand
 invoke, and reflection dispatch — plus the bytecode of every runtime-generated or
 runtime-transformed class.
 
-The output is a self-describing JSONL file consumed by Manycore's staticization
+The output is a self-describing JSONL file consumed by rt's staticization
 pipeline. Every record is either **exact** (a real runtime target with verified
 identity) or an **explicit diagnostic** (explaining why a site could not be
 represented exactly). There is no fake precision, no guessed target, no silent

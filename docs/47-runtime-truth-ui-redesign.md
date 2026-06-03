@@ -210,7 +210,7 @@ Per the requirement to keep all existing capabilities without a major rewrite:
 
 | File | Change |
 |---|---|
-| `tools/manycore-ui/static/style.css` | Verdict banner CSS + callsite row dot column |
-| `tools/manycore-ui/static/app.js` | `computeVerdict()`, `renderVerdictBanner()`, modified `renderTargetsView()` and `renderCallsiteRow()` |
+| `tools/rt-ui/static/style.css` | Verdict banner CSS + callsite row dot column |
+| `tools/rt-ui/static/app.js` | `computeVerdict()`, `renderVerdictBanner()`, modified `renderTargetsView()` and `renderCallsiteRow()` |
 
 No HTML changes required — all modifications are in JS and CSS.

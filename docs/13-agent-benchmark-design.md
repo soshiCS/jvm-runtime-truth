@@ -1,4 +1,4 @@
-# ManyCore Agent Benchmark Design
+# Runtime Truth Agent Benchmark Design
 
 **Purpose**: Measure whether runtime causality API access materially improves LLM debugging performance.
 
@@ -8,7 +8,7 @@ This is a product-value test, not a JVM-capture test.
 
 ## Question
 
-> Does an LLM identify the root cause of a runtime dispatch bug faster and more accurately when it has access to the ManyCore causality API?
+> Does an LLM identify the root cause of a runtime dispatch bug faster and more accurately when it has access to the Runtime Truth causality API?
 
 ---
 
@@ -197,7 +197,7 @@ python harness.py bug1 --agent A     # run only Agent A
 ```
 
 The harness:
-1. Starts a fresh manycore-ui instance on port 5002 (no auth)
+1. Starts a fresh rt-ui instance on port 5002 (no auth)
 2. Ingests the captured JSONL via `POST /api/runs/ingest`
 3. Runs Agent A then Agent B against the specified bug(s)
 4. Scores each agent using the rubric above

@@ -1,4 +1,4 @@
-# ManyCore Flagship Demo — V5: Runtime Truth Decryption
+# Runtime Truth Flagship Demo — V5: Runtime Truth Decryption
 
 **Scenario**: `tools/benchmark/bugs_v5.py` → `bug1v5`  
 **Harness**: `tools/benchmark/harness_v2.py`  
@@ -539,7 +539,7 @@ average of 3 tool calls. The benchmark gap is visually striking.
 
 The one thing that would materially improve the demo for a technical audience is
 switching from pre-captured causality data to a live instrumented deployment.
-With the actual Spring Boot app running under ManyCore, every demo hit would
+With the actual Spring Boot app running under Runtime Truth, every demo hit would
 show real class names, real addresses, and real nanoTime values — removing any
 suspicion that the output is staged.
 
@@ -548,7 +548,7 @@ undeniable.
 
 ### What would be required to make the live deployment work?
 
-1. **Deploy the Spring Boot app** (`tools/demo-runtime-truth/`) under ManyCore
+1. **Deploy the Spring Boot app** (`tools/demo-runtime-truth/`) under Runtime Truth
    instrumentation at `localhost:8080`.
 2. **Wire the causality tools** to the live `/api/causality` endpoint instead of
    the pre-captured `CAUSALITY_BUG1V5` string in `bugs_v5.py`.

@@ -1,4 +1,4 @@
-# ManyCore Agent Benchmark — V3: Strong Discovery Design
+# Runtime Truth Agent Benchmark — V3: Strong Discovery Design
 
 **Scenario**: `tools/benchmark/bugs_v3.py` → `bug1v3`  
 **Harness**: `tools/benchmark/harness_v2.py` (accepts v2 and v3 scenario IDs)  

@@ -1,7 +1,7 @@
 # doc 29 — Phase V8: Spring Proxy Bypass Results
 
 **Date:** 2026-05-31  
-**Run ID:** c921c24c (ManyCore UI port 5002)  
+**Run ID:** c921c24c (Runtime Truth UI port 5002)  
 **JSONL:** `/tmp/demo_proxy_bypass/runtime_targets.jsonl`
 
 ---

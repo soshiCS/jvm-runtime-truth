@@ -8,7 +8,7 @@
 
 ## 1. Gaps Identified in docs/54
 
-`docs/54` validated ManyCore attribution on a real Spring Boot program (`demo-runtime-truth`) and found two BLOCKER attribution gaps:
+`docs/54` validated Runtime Truth attribution on a real Spring Boot program (`demo-runtime-truth`) and found two BLOCKER attribution gaps:
 
 > **Gap 1 — Reflection `Method.invoke` missing source BCI**  
 > `DecryptPipeline.execute()` calls `executeMethod.invoke(executor, ctx)`. No `callsite_target(reflection_method_invoke)` was emitted despite this being the primary dispatch point of the pipeline. Expected: `source_class=com/example/truth/DecryptPipeline, source_method=execute, source_bci=22, category=reflection_method_invoke, target_class=com/example/truth/proxy/PipelineExecutor, target_method=execute`
@@ -222,7 +222,7 @@ soroush_trace_runtime_dispatch("invokeinterface",
 | invokedynamic | PipelineProxy | 21 | PipelineProxy::lambda$createExecutor$0 |
 | invokedynamic | PipelineProxy | 31 | (bootstrap) |
 
-### ManyCore 15-Case Run (`/tmp/mc55/`, `SOROUSH_USER_PREFIXES=manycorecases`)
+### Runtime Truth 15-Case Run (`/tmp/mc55/`, `SOROUSH_USER_PREFIXES=testcases`)
 
 ```
 PASS Case01 — Lambda / invokedynamic
@@ -241,7 +241,7 @@ PASS Case13 — invokevirtual mono
 PASS Case14 — invokevirtual poly
 PASS Case15 — invokeinterface poly
 
-ManyCore cases demo complete — 15/15 passed
+test cases demo complete — 15/15 passed
 ```
 
 **JSONL record breakdown (mc55):**

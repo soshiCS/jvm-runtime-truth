@@ -259,13 +259,13 @@ same scenario.
 
 ---
 
-## Causality API Validation via ManyCore UI
+## Causality API Validation via Runtime Truth UI
 
 To validate the live JSONL against the causality API (as the benchmark does):
 
 ```bash
-# Start ManyCore UI
-cd tools/manycore-ui
+# Start Runtime Truth UI
+cd tools/rt-ui
 pip install -r requirements.txt
 python3 app.py
 
@@ -293,11 +293,11 @@ as one of the constructor reflection targets from `TransformCompiler.doCompile`.
 
 ## Graph and JSONL Validation
 
-The indexer (`tools/manycore-ui/indexer.py`) can validate the run directly:
+The indexer (`tools/rt-ui/indexer.py`) can validate the run directly:
 
 ```bash
 python3 - << 'EOF'
-import sys; sys.path.insert(0, "tools/manycore-ui")
+import sys; sys.path.insert(0, "tools/rt-ui")
 from indexer import load_and_index, validate_run, find_best_artifact
 
 idx = load_and_index(

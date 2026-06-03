@@ -668,7 +668,7 @@ and `MethodHandleAccessorFactory`. These are MH invocations where the receiver i
 a method-return value inside JDK initialization code. They are not user code, not
 business logic, and have zero impact on staticization coverage.
 
-### What "done" means for Manycore / staticization scope
+### What "done" means for rt / staticization scope
 
 The branch is complete for its stated goal when:
 - Every user-code MH callsite in a `-Xint` slice run produces an exact record

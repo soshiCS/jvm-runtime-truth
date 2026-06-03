@@ -1,4 +1,4 @@
-# ManyCore Agent Benchmark — V4: Runtime Artifact Inspection
+# Runtime Truth Agent Benchmark — V4: Runtime Artifact Inspection
 
 **Scenario**: `tools/benchmark/bugs_v4.py` → `bug1v4`  
 **Harness**: `tools/benchmark/harness_v2.py` (accepts v2, v3, v4 scenario IDs)  

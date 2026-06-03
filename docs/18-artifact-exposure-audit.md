@@ -15,12 +15,12 @@ and whether Agent B can reach them today.
 | Field | Value |
 |-------|-------|
 | **URL** | `GET /api/runs/<run_id>/bytecode?artifact_path=<path>` |
-| **Source** | `tools/manycore-ui/app.py:207–234` |
+| **Source** | `tools/rt-ui/app.py:207–234` |
 | **Returns** | `javap -c -p -verbose` output for the `.class` file at `artifact_path` |
 | **Required params** | `artifact_path` — absolute path to a `.class` file on disk |
 | **Agent B today** | ✗ — not in benchmark tool list |
 | **harness_v2 exposes** | ✗ |
-| **manycore-ui exposes** | ✓ — UI calls it when user clicks "View Bytecode" on an artifact |
+| **rt-ui exposes** | ✓ — UI calls it when user clicks "View Bytecode" on an artifact |
 
 **Response schema**:
 ```json
@@ -53,12 +53,12 @@ For generated/lambda classes with no source file, this is the only way to read t
 | Field | Value |
 |-------|-------|
 | **URL** | `GET /api/runs/<run_id>/artifact?class=<cls>&loader_id=<id>` |
-| **Source** | `tools/manycore-ui/app.py:192–199` |
+| **Source** | `tools/rt-ui/app.py:192–199` |
 | **Returns** | Artifact record for the named class (CRC, size, kind, path, existence flag) |
 | **Required params** | `class` — internal class name (`com/example/Foo`); `loader_id` optional |
 | **Agent B today** | ✗ — not in benchmark tool list |
 | **harness_v2 exposes** | ✗ |
-| **manycore-ui exposes** | ✓ |
+| **rt-ui exposes** | ✓ |
 
 **Response schema** (from `find_best_artifact()` in `indexer.py:384–423`):
 ```json
@@ -84,11 +84,11 @@ For generated/lambda classes with no source file, this is the only way to read t
 | Field | Value |
 |-------|-------|
 | **URL** | `GET /api/runs/<run_id>/causality/hidden` |
-| **Source** | `tools/manycore-ui/app.py:843–873` |
+| **Source** | `tools/rt-ui/app.py:843–873` |
 | **Returns** | All hidden classes: runtime_name (+0x…), stable CRC, loader_id, has_artifact flag |
 | **Agent B today** | ✗ — not in benchmark tool list (endpoint exists, just not exposed) |
 | **harness_v2 exposes** | ✗ |
-| **manycore-ui exposes** | ✓ |
+| **rt-ui exposes** | ✓ |
 
 **Response schema**:
 ```json
@@ -118,12 +118,12 @@ problem that makes Bug 3 (lambda comparator) currently unsolvable for Agent B.
 | Field | Value |
 |-------|-------|
 | **URL** | `GET /api/runs/<run_id>/causality/chain?class=<cls>&method=<m>&bci=<n>` |
-| **Source** | `tools/manycore-ui/app.py:876–907` |
+| **Source** | `tools/rt-ui/app.py:876–907` |
 | **Returns** | Full causality chain from one BCI: callsite node + all target edges + adapter chain |
 | **Required params** | `class`, `method`; `bci` and `desc` optional |
 | **Agent B today** | ✗ — `causality_chain` is in the harness tool dispatch (`app.py:450`) but NOT in `TOOLS_B_EXTRA` in `harness_v2.py` |
 | **harness_v2 exposes** | Partial — tool name recognized in dispatch but missing from tool description string and gate message |
-| **manycore-ui exposes** | ✓ |
+| **rt-ui exposes** | ✓ |
 
 **Response schema**:
 ```json
@@ -162,11 +162,11 @@ problem that makes Bug 3 (lambda comparator) currently unsolvable for Agent B.
 | Field | Value |
 |-------|-------|
 | **URL** | `GET /api/runs/<run_id>/download/artifacts` |
-| **Source** | `tools/manycore-ui/app.py:419–438` |
+| **Source** | `tools/rt-ui/app.py:419–438` |
 | **Returns** | ZIP archive of all `.class` files captured during the run |
 | **Agent B today** | ✗ |
 | **harness_v2 exposes** | ✗ |
-| **manycore-ui exposes** | ✓ (download button in UI) |
+| **rt-ui exposes** | ✓ (download button in UI) |
 
 Not useful for agent benchmark — bulk download, not targeted query.
 
@@ -177,11 +177,11 @@ Not useful for agent benchmark — bulk download, not targeted query.
 | Field | Value |
 |-------|-------|
 | **URL** | `GET /api/runs/<run_id>/classes/<class_name>/callsites` |
-| **Source** | `tools/manycore-ui/app.py:163–177` |
+| **Source** | `tools/rt-ui/app.py:163–177` |
 | **Returns** | All callsite_summary records where `source_class == class_name` |
 | **Agent B today** | ✗ |
 | **harness_v2 exposes** | ✗ |
-| **manycore-ui exposes** | ✓ |
+| **rt-ui exposes** | ✓ |
 
 Useful for "what did this class dispatch to?" but redundant with `causality_search`.
 
@@ -192,11 +192,11 @@ Useful for "what did this class dispatch to?" but redundant with `causality_sear
 | Field | Value |
 |-------|-------|
 | **URL** | `GET /api/runs/<run_id>/causality/search?q=<fragment>` |
-| **Source** | `tools/manycore-ui/app.py:693–734` |
+| **Source** | `tools/rt-ui/app.py:693–734` |
 | **Returns** | All callsites where source or target class/method contains the fragment |
 | **Agent B today** | ✗ — not in benchmark tool list |
 | **harness_v2 exposes** | ✗ |
-| **manycore-ui exposes** | ✓ |
+| **rt-ui exposes** | ✓ |
 
 **Response schema**: same as the spec in `docs/11-demo-platform-design.md` (search response).
 Useful for "find all callsites involving class X" without knowing exact BCI.
@@ -208,11 +208,11 @@ Useful for "find all callsites involving class X" without knowing exact BCI.
 | Field | Value |
 |-------|-------|
 | **URL** | `GET /api/runs/<run_id>/causality/explain?class=&method=&bci=` |
-| **Source** | `tools/manycore-ui/app.py:910–977` |
+| **Source** | `tools/rt-ui/app.py:910–977` |
 | **Returns** | dispatch mechanism, polymorphism, targets, static_label, natural language explanation, full chain |
 | **Agent B today** | ✗ — not in benchmark tool list |
 | **harness_v2 exposes** | ✗ |
-| **manycore-ui exposes** | ✓ |
+| **rt-ui exposes** | ✓ |
 
 The highest-value single endpoint for a debugging agent — synthesizes everything. Not exposed.
 

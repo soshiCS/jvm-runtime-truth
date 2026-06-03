@@ -86,9 +86,9 @@ this was only visible in the Diagnostics modal.
 
 | File | Change |
 |---|---|
-| `tools/manycore-ui/static/index.html` | Replace checkbox `panel-subheader` with empty `#class-category-bar` div |
-| `tools/manycore-ui/static/style.css` | Replace `.sidebar-toggle` with chip styles; two-line `.class-item` layout |
-| `tools/manycore-ui/static/app.js` | Add `classifyClass()`, `renderCategoryBar()`; rewrite `renderClassList()`; remove `showAllClasses` state |
+| `tools/rt-ui/static/index.html` | Replace checkbox `panel-subheader` with empty `#class-category-bar` div |
+| `tools/rt-ui/static/style.css` | Replace `.sidebar-toggle` with chip styles; two-line `.class-item` layout |
+| `tools/rt-ui/static/app.js` | Add `classifyClass()`, `renderCategoryBar()`; rewrite `renderClassList()`; remove `showAllClasses` state |
 
 ---
 
@@ -104,6 +104,6 @@ this was only visible in the Diagnostics modal.
 ## Validation
 
 ```
-node --check tools/manycore-ui/static/app.js  → OK
-python3 -m pytest tools/manycore-ui/tests/ -q → 26 passed
+node --check tools/rt-ui/static/app.js  → OK
+python3 -m pytest tools/rt-ui/tests/ -q → 26 passed
 ```

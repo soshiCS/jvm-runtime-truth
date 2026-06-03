@@ -1,4 +1,4 @@
-# ManyCore Agent Benchmark — Results
+# Runtime Truth Agent Benchmark — Results
 
 **Date**: 2026-05-31  
 **Design ref**: [docs/13-agent-benchmark-design.md](13-agent-benchmark-design.md)
@@ -42,7 +42,7 @@ The primary explanation: the bug descriptions were specific enough (named log li
 | Source sanitization | Bug indicator comments stripped from all Java files before agent sees them |
 | Agent A input | Bug description + sanitized source code |
 | Agent B input | Bug description + sanitized source code + pre-captured causality API output |
-| Causality data | Real output from `/causality/reflection`, `/causality/proxies`, `/causality/polymorphic` captured from a live run under the ManyCore JVM |
+| Causality data | Real output from `/causality/reflection`, `/causality/proxies`, `/causality/polymorphic` captured from a live run under the Runtime Truth JVM |
 | Scoring | Automated, 16-point rubric (file 0–3, line 0–3, patch 0–5, explain 0–5) |
 
 Commands used:

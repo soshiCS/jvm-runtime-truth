@@ -11,8 +11,8 @@
 
 | File | Issue |
 |---|---|
-| `tools/manycore-ui/__pycache__/indexer.cpython-314.pyc` | Compiled .pyc tracked in git |
-| `tools/manycore-ui/__pycache__/runner.cpython-314.pyc` | Compiled .pyc tracked in git |
+| `tools/rt-ui/__pycache__/indexer.cpython-314.pyc` | Compiled .pyc tracked in git |
+| `tools/rt-ui/__pycache__/runner.cpython-314.pyc` | Compiled .pyc tracked in git |
 | `src/utils/LogCompilation/target/classes/*.class` | Compiled Java .class files tracked in git |
 
 **Fix:** Remove from git index, add to `.gitignore`.
@@ -27,8 +27,8 @@
 | `tools/demo-agent-dispatch/capture.sh` | Line 9 | Same pattern |
 | `tools/demo-runtime-truth/capture_live.sh` | Line 25 | Same pattern |
 | `tools/demo-spring-proxy-bypass/capture.sh` | Line 11 | Same pattern |
-| `tools/manycore-ui/runner.py` | Line 15 | `DEFAULT_JDK = "/Users/soroushaghajani/..."` |
-| `tools/manycore-ui/static/index.html` | Line 169 | Placeholder with full personal path |
+| `tools/rt-ui/runner.py` | Line 15 | `DEFAULT_JDK = "/Users/soroushaghajani/..."` |
+| `tools/rt-ui/static/index.html` | Line 169 | Placeholder with full personal path |
 | `docs/README.md` | Multiple | Build command with hardcoded personal path |
 
 **Fix:** Replace hardcoded paths with `$(dirname "$0")/../../build/...` or `AUTO_DETECT` logic.
@@ -39,9 +39,9 @@
 
 | File | Issue |
 |---|---|
-| `tools/manycore-ui/static/app.js:1187` | C++ function `soroush_graph_hidden_class_id()` in user-facing error message |
-| `tools/manycore-ui/static/app.js:1205` | `SOROUSH_CAPTURE_FINAL_BYTECODE=1` in user-facing error (acceptable as env var) |
-| `tools/manycore-ui/start_demo.sh` | Comment "Share with Nico" — personal name |
+| `tools/rt-ui/static/app.js:1187` | C++ function `soroush_graph_hidden_class_id()` in user-facing error message |
+| `tools/rt-ui/static/app.js:1205` | `SOROUSH_CAPTURE_FINAL_BYTECODE=1` in user-facing error (acceptable as env var) |
+| `tools/rt-ui/start_demo.sh` | Comment "Share with Nico" — personal name |
 
 **Fix:** Replace C++ function name with a user-readable description. Remove personal name comment.
 
@@ -110,7 +110,7 @@
 
 | # | Change | Why risky |
 |---|---|---|
-| R1 | Rename `tools/manycore-ui/` → `tools/ui/` | Breaks all imports, test references, scripts |
+| R1 | Rename `tools/rt-ui/` → `tools/ui/` | Breaks all imports, test references, scripts |
 | R2 | Rename `SOROUSH_*` env vars | Requires C++ + Python + docs + test changes in sync |
 | R3 | Delete/archive old docs (docs/01–54) | Destroys project history; unknown what downstream tools reference |
 | R4 | Rename Java packages in demo apps | Not needed; packages are not user-facing |

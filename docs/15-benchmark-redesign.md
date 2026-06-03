@@ -1,4 +1,4 @@
-# ManyCore Agent Benchmark — Redesign
+# Runtime Truth Agent Benchmark — Redesign
 
 **Replaces**: [docs/14-benchmark-results.md](14-benchmark-results.md) single-turn experiment  
 **Harness**: `tools/benchmark/harness_v2.py`  
@@ -93,7 +93,7 @@ The causal claim: an agent with causality can jump directly to the offending con
 
 **Initial information**: same as Agent A  
 **Tools**: same as Agent A **plus** `causality_reflection`, `causality_polymorphic`, `causality_proxies`, `causality_summary`  
-**Causality data**: pre-captured real API output from running under the ManyCore JVM
+**Causality data**: pre-captured real API output from running under the Runtime Truth JVM
 
 ---
 

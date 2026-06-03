@@ -150,7 +150,7 @@ if (cl_info.is_hidden() && soroush_graph_enabled() && hidden_artifact_crc != 0) 
 
 The rewriter transforms bytecode of user-specified classes (controlled by `SOROUSH_REWRITER_PREFIX`) before class loading. It instruments method entries and exit points to support tracing and provenance tracking beyond what the interpreter hooks capture.
 
-The rewriter is complementary to the interpreter hooks, not a replacement. Phase 1 validation was performed with the interpreter hooks alone (the Spring Boot and ManyCore runs use the interpreter hooks exclusively; the rewriter prefix is optional).
+The rewriter is complementary to the interpreter hooks, not a replacement. Phase 1 validation was performed with the interpreter hooks alone (the Spring Boot and Runtime Truth runs use the interpreter hooks exclusively; the rewriter prefix is optional).
 
 ---
 
@@ -194,13 +194,13 @@ The output file is set via `SOROUSH_EXPORT_RUNTIME_TARGETS` env var.
 
 ---
 
-## ManyCore UI
+## Runtime Truth UI
 
 ### Primary files
-`tools/manycore-ui/app.py` — Flask server, run management, REST API  
-`tools/manycore-ui/indexer.py` — JSONL → in-memory index  
-`tools/manycore-ui/static/index.html` — SPA frontend  
-`tools/manycore-ui/static/style.css` — UI styles
+`tools/rt-ui/app.py` — Flask server, run management, REST API  
+`tools/rt-ui/indexer.py` — JSONL → in-memory index  
+`tools/rt-ui/static/index.html` — SPA frontend  
+`tools/rt-ui/static/style.css` — UI styles
 
 ### Key functions in `indexer.py`
 
@@ -220,8 +220,8 @@ The output file is set via `SOROUSH_EXPORT_RUNTIME_TARGETS` env var.
 ## Offline Causality Graph Builder (Phase 2a)
 
 ### Primary files
-`tools/manycore-ui/graph_builder.py` — offline graph construction from JSONL  
-`tools/manycore-ui/tests/test_graph_builder.py` — synthetic fixture tests (22 tests)
+`tools/rt-ui/graph_builder.py` — offline graph construction from JSONL  
+`tools/rt-ui/tests/test_graph_builder.py` — synthetic fixture tests (22 tests)
 
 ### Purpose
 Reads a `runtime_targets.jsonl` file and builds a deterministic directed graph of runtime causality. No heuristic edges are ever created — missing connections produce orphan nodes and gap report entries instead.
@@ -304,7 +304,7 @@ diagnostic  diagnostic::{src_class}::{src_method}::{src_desc}::{src_bci}
 
 ### Phase 2B: runtime_target source attribution (COMPLETE)
 
-**ManyCore**: 915 orphans → 0 orphans (100% reduction). **Spring Boot**: 2,905 orphans → 0 orphans (100% reduction).
+**Runtime Truth**: 915 orphans → 0 orphans (100% reduction). **Spring Boot**: 2,905 orphans → 0 orphans (100% reduction).
 
 Phase 2B added a vframeStream walk in `soroush_trace_membername_resolution()` (`methodHandles.cpp`). When a user or framework frame is found, `source_capture=exact` plus source fields are emitted in the `runtime_target` record. When no frame is found (JVM init, daemon threads), `source_capture=missing` with `source_missing_reason` is emitted and the record remains an orphan.
 
@@ -323,9 +323,9 @@ In the current workloads, every MH linkage event has a recoverable frame (even J
 ## Test Cases
 
 ### Location
-Source: `/tmp/manycore-cases-build/src/manycorecases/`  
-Classes: `/tmp/manycore-cases-build/classes/`  
-Main: `manycorecases.ManyCoreCasesMain`
+Source: `/tmp/cases-build/src/testcases/`  
+Classes: `/tmp/cases-build/classes/`  
+Main: `testcases.TestCasesMain`
 
 ### Files by capability
 
@@ -347,4 +347,4 @@ Main: `manycorecases.ManyCoreCasesMain`
 | `Case14_InvokevirtualPoly.java` | **Phase 2C**: polymorphic `invokevirtual` — `Animal` with Dog/Cat/Bird subclasses. Single BCI 54 dispatches to three concrete targets via loop. Warm-path hook captures all three; graph shows `static_label=blocked_multi_target` (= SR_MULTI_TARGET). |
 | `Case15_InvokeinterfacePoly.java` | **Phase 2D**: polymorphic `invokeinterface` — `Speaker` interface with Dog/Cat/Bird implementations. Single BCI 54 dispatches to three concrete targets via loop. Warm-path hook captures all three; graph shows `static_label=blocked_multi_target`. |
 | `HiddenClassTemplate.java` | Template class loaded as hidden in Case12 |
-| `ManyCoreCasesMain.java` | Test runner, asserts PASS/FAIL for each of 15 cases |
+| `Runtime TruthCasesMain.java` | Test runner, asserts PASS/FAIL for each of 15 cases |

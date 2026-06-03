@@ -6,7 +6,7 @@
 
 ## Phase 2B Implementation Summary (2026-05-30)
 
-**Result**: ManyCore 915 → 0 orphans (100%). Spring Boot 2,905 → 0 orphans (100%).
+**Result**: Runtime Truth 915 → 0 orphans (100%). Spring Boot 2,905 → 0 orphans (100%).
 
 **Approach chosen**: Extended `runtime_target` records (Option A) — source attribution added to the `runtime_target` JSONL schema, keeping the record type for backward compatibility. The `soroush_graph_linkage()` function signature was extended with source frame parameters; the vframeStream walk was added to `soroush_trace_membername_resolution()` in `methodHandles.cpp`.
 
@@ -19,10 +19,10 @@
 - `src/hotspot/share/prims/methodHandles.cpp` — vframeStream walk in `soroush_trace_membername_resolution()`; added `#include "runtime/vframe.inline.hpp"`
 - `src/hotspot/share/classfile/soroushProvenanceGraph.hpp` — extended `soroush_graph_linkage()` signature
 - `src/hotspot/share/classfile/soroushProvenanceGraph.cpp` — extended `soroush_graph_linkage()` label encoding; extended Phase 4 export to emit source fields
-- `tools/manycore-ui/graph_builder.py` — new `ET_CALLSITE_RT_ATTRIBUTED` edge type; `runtime_target` handler now creates callsite nodes for attributed records; `connected_runtime_targets` computed from actual data
-- `tools/manycore-ui/tests/test_graph_builder.py` — 5 new Phase 2B tests (tests 15–19)
+- `tools/rt-ui/graph_builder.py` — new `ET_CALLSITE_RT_ATTRIBUTED` edge type; `runtime_target` handler now creates callsite nodes for attributed records; `connected_runtime_targets` computed from actual data
+- `tools/rt-ui/tests/test_graph_builder.py` — 5 new Phase 2B tests (tests 15–19)
 
-**Validation**: 11/11 checks pass on ManyCore and Spring Boot. 19/19 unit tests pass. `heuristic_edges_created = 0` preserved.
+**Validation**: 11/11 checks pass on Runtime Truth and Spring Boot. 19/19 unit tests pass. `heuristic_edges_created = 0` preserved.
 
 ---
 
@@ -32,7 +32,7 @@ Phase 2A produced a causality graph with two categories of unconnected nodes:
 
 | Export | `runtime_target` orphans | `connected_runtime_targets` |
 |---|---|---|
-| ManyCore (12-case suite) | **915** | 0 |
+| Runtime Truth (12-case suite) | **915** | 0 |
 | Spring Boot | **2,905** | 0 |
 
 Every `runtime_target` record in both exports contains target identity (`target_class`, `target_method`, `target_descriptor`, `target_loader_id`) but no source identity (`source_class`, `source_method`, `source_bci`). Without a source, the graph builder cannot create a `CALLSITE_TARGET` edge. The records become orphan nodes.
@@ -92,14 +92,14 @@ All four call `soroush_graph_linkage(node_type, source, holder, mname, sig, load
 **Containing function**: `MethodHandles::init_MemberName(Handle mname, Handle target, TRAPS)`  
 **Call path**: User code → `MethodHandles.lookup().unreflect(method)` → JNI →  `MethodHandles::init_MemberName()` → emission  
 **What is resolved**: A `java.lang.reflect.Method` is being wrapped into a `MemberName` for use as a MethodHandle target. The target `Method*` is fully known.  
-**Records produced**: 5 (ManyCore), 3 (Spring Boot) — rare; happens only when user code explicitly calls `unreflect()` on a reflect Method.
+**Records produced**: 5 (Runtime Truth), 3 (Spring Boot) — rare; happens only when user code explicitly calls `unreflect()` on a reflect Method.
 
 ### 3.3 Line 271 — `reflect.Constructor → MemberName`
 
 **Containing function**: `MethodHandles::init_MemberName(Handle mname, Handle target, TRAPS)`  
 **Call path**: User code → `MethodHandles.lookup().unreflectConstructor(ctor)` → JNI → `MethodHandles::init_MemberName()` → emission  
 **What is resolved**: A `java.lang.reflect.Constructor` is being wrapped into a `MemberName`. The target `Method*` is fully known.  
-**Records produced**: 7 (ManyCore), 249 (Spring Boot) — moderately common in Spring Boot (DI constructor resolution).
+**Records produced**: 7 (Runtime Truth), 249 (Spring Boot) — moderately common in Spring Boot (DI constructor resolution).
 
 ### 3.4 Lines 849, 873 — `MemberName.resolve`
 
@@ -109,7 +109,7 @@ All four call `soroush_graph_linkage(node_type, source, holder, mname, sig, load
 - Line 873 (`IS_CONSTRUCTOR` case): Same path → IS_CONSTRUCTOR branch → emission
 
 **What is resolved**: A `MemberName` object (encoding a class + method name + descriptor) is being resolved to a concrete JVM `Method*`. This is the core MH construction linkage operation triggered by `MethodHandles.lookup().findVirtual()`, `findStatic()`, `findConstructor()`, etc.  
-**Records produced**: 903 (ManyCore), 2,653 (Spring Boot) — the dominant category.
+**Records produced**: 903 (Runtime Truth), 2,653 (Spring Boot) — the dominant category.
 
 ### 3.5 Why linkResolver.cpp is NOT the correct file
 
@@ -348,7 +348,7 @@ This is correct: MH linkage events observed at one execution may have different 
 The `SG_NODE_METHODHANDLE_LINKAGE` and `SG_NODE_REFLECTION_INVOKE` nodes for these four sites will no longer be created (since `soroush_graph_linkage()` is no longer called). The LINKS_TO edges for these sites will no longer be created. As a result:
 - `runtime_target` records with `dispatch_kind=methodhandle_linkage` or `dispatch_kind=reflection` will no longer be emitted for these sites
 - `rt_count` in the export summary drops to 0 for LINKS_TO-derived records
-- `callsite_target_count` increases by ~915 (ManyCore) / ~2,905 (Spring Boot)
+- `callsite_target_count` increases by ~915 (Runtime Truth) / ~2,905 (Spring Boot)
 
 The `direct_methodhandle` path from `RESOLVES_TO` edges is unaffected (it has zero records in practice).
 
@@ -380,12 +380,12 @@ These cases produce `diagnostic` records (via the `!src_ok` path in `soroush_gra
 
 Based on Phase 1 data:
 
-**ManyCore (915 orphans):**
+**Runtime Truth (915 orphans):**
 
 | Category | Count | Attributable? | Reason |
 |---|---|---|---|
 | `methodhandle_linkage` (MemberName.resolve) | 903 | ~880 (~97%) | Most MH resolutions are user-triggered |
-| `reflection` (reflect.Constructor) | 7 | ~7 (100%) | Direct user code in ManyCore cases |
+| `reflection` (reflect.Constructor) | 7 | ~7 (100%) | Direct user code in test cases |
 | `reflection` (reflect.Method) | 5 | ~5 (100%) | Direct user code |
 | **Estimated remaining orphans** | **~23** | — | JVM init-time resolutions |
 
@@ -406,7 +406,7 @@ Some `runtime_target` records cannot be attributed regardless of implementation 
 
 1. **Static initializer MH linkage**: A `<clinit>` method that calls `MethodHandles.lookup().findVirtual()` at class load time. The stack shows only JVM-internal class initialization frames. No user callsite exists.
 
-2. **Bootstrap linkage during `main()` setup**: Some MH linkage happens during JDK internal bootstrap before the user's `main()` frame is on the stack. This is a small count (< 10 in ManyCore).
+2. **Bootstrap linkage during `main()` setup**: Some MH linkage happens during JDK internal bootstrap before the user's `main()` frame is on the stack. This is a small count (< 10 in Runtime Truth).
 
 3. **Finalizer thread**: Any MH usage in a finalizer runs on the finalizer background thread with no user callsite.
 
@@ -468,7 +468,7 @@ Implement Option B as described in Section 7. Modify `soroush_trace_membername_r
 **Estimated lines of JVM code changed**: ~25 lines modified (the function body), zero new files, zero new headers.
 
 **Estimated impact**:
-- ManyCore: 915 orphans → ~23 orphans (~97% reduction)
+- Runtime Truth: 915 orphans → ~23 orphans (~97% reduction)
 - Spring Boot: 2,905 orphans → ~265 orphans (~91% reduction)
 
 **Validation steps after implementation:**
@@ -478,16 +478,16 @@ Implement Option B as described in Section 7. Modify `soroush_trace_membername_r
    make hotspot CONF=macosx-aarch64-server-fastdebug
    ```
 
-2. Run ManyCore suite and regenerate JSONL:
+2. Run Runtime Truth suite and regenerate JSONL:
    ```bash
    SOROUSH_EXPORT_RUNTIME_TARGETS=1 SOROUSH_PROVENANCE_GRAPH=1 \
-     java -cp /tmp/manycore-cases-build/classes manycorecases.ManyCoreCasesMain \
-     > /tmp/manycore_phase2b.jsonl 2>/dev/null
+     java -cp /tmp/cases-build/classes testcases.TestCasesMain \
+     > /tmp/rt_phase2b.jsonl 2>/dev/null
    ```
 
 3. Run graph builder and check orphan count:
    ```bash
-   python3 tools/manycore-ui/graph_builder.py /tmp/manycore_phase2b.jsonl --report --validate
+   python3 tools/rt-ui/graph_builder.py /tmp/rt_phase2b.jsonl --report --validate
    # Expected: runtime_target orphans < 30 (was 915)
    # Expected: CALLSITE_TARGET edges increase by ~880
    ```
@@ -497,7 +497,7 @@ Implement Option B as described in Section 7. Modify `soroush_trace_membername_r
    python3 -c "
    import json
    cats = {}
-   for line in open('/tmp/manycore_phase2b.jsonl'):
+   for line in open('/tmp/rt_phase2b.jsonl'):
        r = json.loads(line.strip())
        if r.get('record') == 'callsite_target':
            c = r.get('category','')
@@ -511,7 +511,7 @@ Implement Option B as described in Section 7. Modify `soroush_trace_membername_r
 
 6. Run all 14 unit tests (no changes expected):
    ```bash
-   python3 tools/manycore-ui/tests/test_graph_builder.py
+   python3 tools/rt-ui/tests/test_graph_builder.py
    ```
 
 **Blocked Phase 2B items** (require investigation before implementation):
@@ -540,6 +540,6 @@ These are corrected in the respective documents. See update notes in each file.
 - [src/hotspot/share/prims/methodHandles.cpp](../src/hotspot/share/prims/methodHandles.cpp) — emission sites (lines 260, 271, 849, 873)
 - [src/hotspot/share/classfile/soroushProvenanceGraph.cpp](../src/hotspot/share/classfile/soroushProvenanceGraph.cpp) — `soroush_graph_linkage()` implementation; runtime_target export (Phase 4, line 2323)
 - [src/hotspot/share/interpreter/linkResolver.cpp](../src/hotspot/share/interpreter/linkResolver.cpp) — existing vframeStream usage patterns (lines 3970, 4014)
-- [tools/manycore-ui/graph_builder.py](../tools/manycore-ui/graph_builder.py) — no changes required
+- [tools/rt-ui/graph_builder.py](../tools/rt-ui/graph_builder.py) — no changes required
 - [docs/06-known-limitations.md](06-known-limitations.md) — Limitation #13 (updated)
 - [docs/08-phase2-causality-graph-design-review.md](08-phase2-causality-graph-design-review.md) — Phase 2b section (updated)

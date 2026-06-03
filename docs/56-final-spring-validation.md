@@ -171,9 +171,9 @@ All three requests cover the full dispatch path: Spring controller → pipeline 
 
 ---
 
-## ManyCore 15-Case Regression Check
+## Runtime Truth 15-Case Regression Check
 
-All 15 ManyCore cases still pass with the same binary and indexer:
+All 15 test cases still pass with the same binary and indexer:
 
 ```
 PASS Case01 — Lambda / invokedynamic
@@ -192,7 +192,7 @@ PASS Case13 — invokevirtual mono
 PASS Case14 — invokevirtual poly
 PASS Case15 — invokeinterface poly
 
-ManyCore cases demo complete — 15/15 passed
+test cases demo complete — 15/15 passed
 ```
 
 ---

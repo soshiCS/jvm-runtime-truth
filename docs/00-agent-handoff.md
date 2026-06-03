@@ -10,7 +10,7 @@ This is a custom fork of OpenJDK 21 (`jdk21u`) that instruments the HotSpot JVM 
 
 The long-term goal is **staticization**: converting a dynamic Java workload into a representation that can be analyzed, optimized, or ahead-of-time compiled without requiring dynamic dispatch. The provenance graph is Phase 1: prove that every dispatch site can be attributed to an exact, verifiable runtime target before attempting to eliminate the dynamism.
 
-The project is sometimes referred to as **"ManyCore JVM"** because the original motivation was to model how Java programs behave on massively parallel hardware where dynamic dispatch overhead at scale becomes a bottleneck.
+The project is sometimes referred to as **"Runtime Truth JVM"** because the original motivation was to model how Java programs behave on massively parallel hardware where dynamic dispatch overhead at scale becomes a bottleneck.
 
 ---
 
@@ -18,10 +18,10 @@ The project is sometimes referred to as **"ManyCore JVM"** because the original 
 
 **Phase 1 is complete. Phase 2A is complete. Phase 2B is complete.**
 
-- All 12 synthetic ManyCore test cases pass with zero user-code diagnostic records.
+- All 12 synthetic Runtime Truth test cases pass with zero user-code diagnostic records.
 - Spring Boot validation passes: exit 0, `=== validation complete ===`, 0 user-code diagnostics.
-- Phase 2A (`graph_builder.py`): Runtime Causality Graph MVP — 19/19 unit tests pass; ManyCore 11/11 checks; Spring Boot 11/11 checks.
-- Phase 2B (`runtime_target` source attribution): 0 orphans in both workloads after vframeStream walk in `methodHandles.cpp`. ManyCore 915→0 orphans; Spring Boot 2,905→0 orphans. All `runtime_target` records now carry `source_capture=exact` + source attribution fields.
+- Phase 2A (`graph_builder.py`): Runtime Causality Graph MVP — 19/19 unit tests pass; Runtime Truth 11/11 checks; Spring Boot 11/11 checks.
+- Phase 2B (`runtime_target` source attribution): 0 orphans in both workloads after vframeStream walk in `methodHandles.cpp`. Runtime Truth 915→0 orphans; Spring Boot 2,905→0 orphans. All `runtime_target` records now carry `source_capture=exact` + source attribution fields.
 - The instrumentation is stable: no JVM crashes, no `BootstrapMethodError`, no silent corruption.
 
 ---
@@ -39,7 +39,7 @@ jdk21u-export/                         ← THE ONLY AUTHORITATIVE REPOSITORY
     interpreterRuntime.cpp/.hpp        ← JRT_ENTRY trampoline for warm-path hook
   src/hotspot/cpu/aarch64/
     templateTable_aarch64.cpp          ← Warm-path invokehandle hook (fires on every dispatch)
-  tools/manycore-ui/                   ← Local Flask web UI for visualizing export
+  tools/rt-ui/                   ← Local Flask web UI for visualizing export
     app.py                             ← Flask server + run management
     indexer.py                         ← JSONL → in-memory index
     static/                            ← HTML/CSS/JS frontend
@@ -77,23 +77,23 @@ cp build/macosx-aarch64-server-fastdebug/support/modules_libs/java.base/server/l
 
 ## How to Run a Complete Validation
 
-### ManyCore 12-case test suite
+### 12-case test suite
 
 ```bash
 # Build cases (if not already built)
 JAVAC=/Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/javac
-mkdir -p /tmp/manycore-cases-build/classes
-$JAVAC -d /tmp/manycore-cases-build/classes \
-  /tmp/manycore-cases-build/src/manycorecases/*.java
+mkdir -p /tmp/cases-build/classes
+$JAVAC -d /tmp/cases-build/classes \
+  /tmp/cases-build/src/testcases/*.java
 
 # Run
 SOROUSH_PROVENANCE_GRAPH=1 \
-SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/manycore_val.jsonl \
+SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/rt_val.jsonl \
   /Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/java \
-  -cp /tmp/manycore-cases-build/classes manycorecases.ManyCoreCasesMain
+  -cp /tmp/cases-build/classes testcases.TestCasesMain
 ```
 
-**Expected:** `ManyCore cases demo complete — 12/12 passed`
+**Expected:** `test cases demo complete — 12/12 passed`
 
 ### Spring Boot validation
 
@@ -177,7 +177,7 @@ Both must be set. Setting only `SOROUSH_EXPORT_RUNTIME_TARGETS` produces a singl
 
 1. **`DirectMethodHandle$StaticAccessor` adapter shape**: Currently produces `adapter_unknown_shape` diagnostics for `Enhancer.wrapCachedClass` and `MethodHandleObjectFieldAccessorImpl.set`. Adding StaticAccessor modeling would eliminate these.
 
-2. **`runtime_target` source attribution — COMPLETE (Phase 2B)**: All `runtime_target` records now carry `source_capture=exact` + `source_class`/`source_method`/`source_bci`/`source_loader_id` fields recovered from a vframeStream walk in `soroush_trace_membername_resolution()` (`methodHandles.cpp`). Result: ManyCore 915 → 0 orphans, Spring Boot 2,905 → 0 orphans. `graph_builder.py` connects attributed records via `ET_CALLSITE_RT_ATTRIBUTED` edges. See [10-phase2b-runtime-target-attribution-design.md](10-phase2b-runtime-target-attribution-design.md) and `06-known-limitations.md` Limitation #13.
+2. **`runtime_target` source attribution — COMPLETE (Phase 2B)**: All `runtime_target` records now carry `source_capture=exact` + `source_class`/`source_method`/`source_bci`/`source_loader_id` fields recovered from a vframeStream walk in `soroush_trace_membername_resolution()` (`methodHandles.cpp`). Result: Runtime Truth 915 → 0 orphans, Spring Boot 2,905 → 0 orphans. `graph_builder.py` connects attributed records via `ET_CALLSITE_RT_ATTRIBUTED` edges. See [10-phase2b-runtime-target-attribution-design.md](10-phase2b-runtime-target-attribution-design.md) and `06-known-limitations.md` Limitation #13.
 
 3. **Web request path validation**: Run Spring Boot in web mode (`web-application-type=servlet`) for a fixed number of HTTP requests, then trigger a graceful shutdown. This exercises `@RequestMapping` dispatch chains not exercised in Phase 1.
 

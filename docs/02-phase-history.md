@@ -64,7 +64,7 @@ The naive fix — calling `soroush_graph_hidden_identity()` inside `soroush_grap
 - `src/hotspot/share/classfile/klassFactory.cpp` — CRC capture before parse, `soroush_graph_hidden_identity` call after `create_instance_klass`
 - `src/hotspot/share/classfile/soroushProvenanceGraph.cpp` — `SgHiddenId` struct, `soroush_graph_hidden_identity()`, export emission
 - `src/hotspot/share/classfile/soroushProvenanceGraph.hpp` — `soroush_graph_hidden_identity()` declaration
-- `tools/manycore-ui/indexer.py` — base-CRC alias insertion
+- `tools/rt-ui/indexer.py` — base-CRC alias insertion
 
 ### Validation
 Case 12 (`Case12_HiddenClass.java`) passes. Spring Boot run produces 1,381 `hidden_class_identity` records, including 5 `Application$$Lambda+0x...` entries with unique CRCs.
@@ -294,7 +294,7 @@ BCI 67 → `Math.min` is the critical proof: sibling inference from CP index #57
 Validate the instrumentation against a real (non-synthetic) Spring Boot 4.0 application, exercising CGLIB, JDK proxy, reflection, lambda streams, and MethodHandle paths in a realistic container startup context.
 
 ### Problem
-Spring Boot starts embedded Tomcat and blocks indefinitely, making automated validation impossible. The existing test harness only covers synthetic `ManyCoreCasesMain` cases.
+Spring Boot starts embedded Tomcat and blocks indefinitely, making automated validation impossible. The existing test harness only covers synthetic `Runtime TruthCasesMain` cases.
 
 ### Solution
 
@@ -351,12 +351,12 @@ Extend `soroush_trace_iv_dispatch` to detect `Method.invoke` dispatches and deco
 - `src/hotspot/share/interpreter/interpreterRuntime.cpp` — Phase 2E block in `soroush_trace_iv_dispatch`
 - `src/hotspot/share/interpreter/interpreterRuntime.hpp` — `recv_oop` parameter added
 - `src/hotspot/cpu/aarch64/templateTable_aarch64.cpp` — `recv` as arg2 in `call_VM`
-- `tools/manycore-ui/tests/test_graph_builder.py` — 3 Phase 2E tests added (tests 24–26)
+- `tools/rt-ui/tests/test_graph_builder.py` — 3 Phase 2E tests added (tests 24–26)
 - `docs/04-runtime-capture-architecture.md` — Phase 2E section added
 - `docs/06-known-limitations.md` — Gap #15 marked RESOLVED
 
 ### Validation
 - Spring Boot (mixed+HTTP): `doInvoke bci=55 → HelloController.index` present (1 record). Startup-only: 0. -Xint+HTTP: 1. Consistent.
-- ManyCore: 15/15 PASS. Case10 reflection records correct.
+- Runtime Truth: 15/15 PASS. Case10 reflection records correct.
 - Graph tests: 26/26 PASS (3 new Phase 2E tests).
 - No debug output in production builds.

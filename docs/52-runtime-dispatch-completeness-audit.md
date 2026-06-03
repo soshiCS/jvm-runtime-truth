@@ -38,8 +38,8 @@ A structural gap (dispatch type not exercised in the demo suite) is noted separa
 | Static method reference | ✅ Case01 BCI=18 (`String::valueOf`) | ✅ `String.valueOf` LINKAGE_GUARANTEED | ✅ | **PASS** |
 | Instance method reference (bound) | ✅ Case01 BCI=103 (`base::toLowerCase`) | ✅ `String.toLowerCase` LINKAGE_GUARANTEED | ✅ | **PASS** |
 | Two-arg lambda | ✅ Case01 BCI=62 (`(a,b)->a+b`) | ✅ `lambda$run$2` LINKAGE_GUARANTEED | ✅ | **PASS** |
-| Multiple lambdas same FI | ✅ ManyCoreCasesMain (12×ThrowingRunnable) | ✅ 12 distinct +0x instances, each with CRC | ✅ 12 invokedynamic callsite_target records | **PASS** |
-| Same lambda class ≥2 instances | ✅ ManyCoreCasesMain (same BCI run once) | ✅ 1 instance per BCI (non-loop) | N/A | **PASS** |
+| Multiple lambdas same FI | ✅ Runtime TruthCasesMain (12×ThrowingRunnable) | ✅ 12 distinct +0x instances, each with CRC | ✅ 12 invokedynamic callsite_target records | **PASS** |
+| Same lambda class ≥2 instances | ✅ Runtime TruthCasesMain (same BCI run once) | ✅ 1 instance per BCI (non-loop) | N/A | **PASS** |
 | String concat vs lambda (distinct) | ✅ Both present in Case01/02 | ✅ Bootstrap method field distinguishes them | ✅ `indy_name=makeConcatWithConstants` vs `run`/`apply`/`get` | **PASS** |
 | Constructor reference (`Foo::new`) | ❌ Not in demo suite | — | — | **NOT TESTED** |
 | Lambdas in loops (same BCI N times) | ❌ Not in demo suite | — | — | **NOT TESTED** |

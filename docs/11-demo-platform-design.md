@@ -7,7 +7,7 @@
 
 ## Background
 
-The ManyCore JVM instrumentation is interpreter-complete for runtime causality reconstruction as of Phase 2E. Every dynamic dispatch in user code — invokevirtual, invokeinterface, invokedynamic, Method.invoke, Constructor.newInstance, proxy chains, lambda bodies, hidden classes — is captured with exact source attribution.
+The Runtime Truth JVM instrumentation is interpreter-complete for runtime causality reconstruction as of Phase 2E. Every dynamic dispatch in user code — invokevirtual, invokeinterface, invokedynamic, Method.invoke, Constructor.newInstance, proxy chains, lambda bodies, hidden classes — is captured with exact source attribution.
 
 This document designs the demo layer that turns that capability into a demonstrable, measurable claim.
 
@@ -94,7 +94,7 @@ For Agent B, `files_inspected` should be lower (fewer red herrings from proxy cl
 1. Every endpoint returns structured JSON — no free-text explanation required to use it
 2. All class names in slash-form (`com/example/Foo`) consistent with JSONL
 3. Every response includes an `explanation` field: a one-paragraph human-readable description of what the data means — for direct consumption by the LLM agent without requiring it to understand the full graph schema
-4. Endpoints are scoped to a `run_id` — the ID of a completed provenance export run in the ManyCore UI
+4. Endpoints are scoped to a `run_id` — the ID of a completed provenance export run in the Runtime Truth UI
 5. All endpoints are read-only GET requests
 
 ### Endpoint specifications
@@ -470,10 +470,10 @@ Reasoning:
 4. The benchmark harness is just a wrapper around two API-equipped conversations — it's the last layer to build.
 
 **Correct order:**
-1. **API** (this session) — expose graph_builder.py as REST endpoints in manycore-ui
+1. **API** (this session) — expose graph_builder.py as REST endpoints in rt-ui
 2. **Demo app** (next session) — Spring Boot app with 4 injected bugs, test suite, run script
 3. **Benchmark harness** (after demo app) — orchestrator that runs both agents, collects metrics
-4. **UI integration** (optional/last) — surface causality API results in the existing manycore-ui frontend
+4. **UI integration** (optional/last) — surface causality API results in the existing rt-ui frontend
 
 ---
 
@@ -481,7 +481,7 @@ Reasoning:
 
 **Status: IMPLEMENTED (2026-05-30)**
 
-The causality API is implemented as 8 new endpoints in `tools/manycore-ui/app.py`, all prefixed `/api/runs/<run_id>/causality/`.
+The causality API is implemented as 8 new endpoints in `tools/rt-ui/app.py`, all prefixed `/api/runs/<run_id>/causality/`.
 
 ### Endpoints implemented
 
@@ -536,7 +536,7 @@ curl "$BASE/api/runs/$RUN_ID/causality/explain?class=com/example/Router&method=r
 |---|---|
 | `docs/11-demo-platform-design.md` | Created (this file) |
 | `docs/AGENT_NAVIGATOR.md` | Updated — pointer to this doc added |
-| `tools/manycore-ui/app.py` | Updated — 8 causality endpoints added |
+| `tools/rt-ui/app.py` | Updated — 8 causality endpoints added |
 
 ---
 
@@ -554,7 +554,7 @@ Requirements:
 
 ### Task B — Run the demo app and verify the API reveals the bugs
 - Run `run_with_provenance.sh`
-- Load the JSONL into manycore-ui
+- Load the JSONL into rt-ui
 - Call each causality endpoint and verify it returns the expected data for each bug
 - Document the exact API query sequences Agent B should use
 

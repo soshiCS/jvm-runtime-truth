@@ -15,10 +15,10 @@ This project is a custom fork of OpenJDK 21 that instruments the HotSpot JVM int
 - The instrumentation is stable. No JVM crashes, no silent omissions for user code.
 
 **Phase 2a (complete):**
-- `tools/manycore-ui/graph_builder.py` — offline Runtime Causality Graph MVP. 22 tests pass (14 Phase 2a + 5 Phase 2b + 3 poly model). ManyCore + Spring Boot validation: 11/11 checks each.
+- `tools/rt-ui/graph_builder.py` — offline Runtime Causality Graph MVP. 22 tests pass (14 Phase 2a + 5 Phase 2b + 3 poly model). Runtime Truth + Spring Boot validation: 11/11 checks each.
 
 **Phase 2b (COMPLETE 2026-05-30):**
-- `runtime_target` source attribution: vframeStream walk in `soroush_trace_membername_resolution()` (`methodHandles.cpp`). ManyCore: 915→0 orphans. Spring Boot: 2905→0 orphans. `source_capture=exact/missing` fields now in `runtime_target` records. `graph_builder.py` connects attributed records via `ET_CALLSITE_RT_ATTRIBUTED`. 19/19 tests pass.
+- `runtime_target` source attribution: vframeStream walk in `soroush_trace_membername_resolution()` (`methodHandles.cpp`). Runtime Truth: 915→0 orphans. Spring Boot: 2905→0 orphans. `source_capture=exact/missing` fields now in `runtime_target` records. `graph_builder.py` connects attributed records via `ET_CALLSITE_RT_ATTRIBUTED`. 19/19 tests pass.
 
 **Polymorphic callsite model (COMPLETE 2026-05-30, prerequisite for Phase 2C):**
 - New `soroush_graph_poly_callsite()` in `soroushProvenanceGraph.cpp/.hpp`. Uses dedup key `(src_class, src_method, src_desc, src_bci, target_class, target_method, target_desc)` — one entry per unique (callsite, target) pair. Stored in `g_poly_buckets`; exported as Phase 3.1 in the JSONL pipeline.
@@ -28,7 +28,7 @@ This project is a custom fork of OpenJDK 21 that instruments the HotSpot JVM int
 - **Cold-path hook** in `runtime_resolve_virtual_method` in `linkResolver.cpp` (after line 1674). Records the first-resolved target per CP cache entry. Calls `soroush_graph_poly_callsite("invokevirtual", ...)`.
 - **Warm-path hook** in `TemplateTable::invokevirtual_helper` (`templateTable_aarch64.cpp`), non-final vtable path. Fires on **every interpreted non-final invokevirtual dispatch**. After `__ lookup_virtual_method(r0, index, method)`, saves `lr`, calls `InterpreterRuntime::soroush_trace_iv_dispatch(thread, rmethod)`, restores `lr`. `rmethod` is automatically preserved by `call_VM_leaf_base`. JRT_ENTRY in `interpreterRuntime.cpp`; walks vframeStream, guards `op == _invokevirtual` to skip invokeinterface forced-virtual cases.
 - **True polymorphic capture**: a single `invokevirtual` BCI now produces one record per distinct receiver type actually seen at runtime. Case14 BCI 54 → Dog.sound, Cat.sound, Bird.sound (all same `source_bci=54`).
-- 14/14 ManyCore cases pass. Case13: `Circle.describe()` mono (BCI 9). Case14: `Animal.sound()` poly (BCI 54 → 3 targets, `static_label=blocked_multi_target`). `heuristic_edges_created=0`.
+- 14/14 test cases pass. Case13: `Circle.describe()` mono (BCI 9). Case14: `Animal.sound()` poly (BCI 54 → 3 targets, `static_label=blocked_multi_target`). `heuristic_edges_created=0`.
 - Spring Boot: `com/example/springboot/Application.lambda$validationRunner$3 bci=21 → HelloController.index` captured via warm-path invokevirtual hook.
 
 **Phase 2D invokeinterface capture (COMPLETE 2026-05-30):**
@@ -36,7 +36,7 @@ This project is a custom fork of OpenJDK 21 that instruments the HotSpot JVM int
 - **Warm-path hook** in `TemplateTable::invokeinterface` normal itable path (`templateTable_aarch64.cpp`), after `profile_arguments_type`, before `jump_from_interpreted`. Fires on **every interpreted normal itable dispatch**. Saves `lr`, calls `InterpreterRuntime::soroush_trace_ii_dispatch(thread, rmethod)`, restores `lr`.
 - **`soroush_trace_ii_dispatch`** JRT_ENTRY in `interpreterRuntime.cpp`; declared in `interpreterRuntime.hpp`. Walks vframeStream, guards `op == _invokeinterface`. Emits via `soroush_graph_poly_callsite("invokeinterface", ...)`.
 - **True polymorphic capture**: a single `invokeinterface` BCI produces one record per distinct concrete type observed. Case15 BCI 54 → Dog.sound, Cat.sound, Bird.sound (all same `source_bci=54`, `source_opcode=invokeinterface`). Graph node: `static_label=blocked_multi_target` (SR_MULTI_TARGET). `heuristic_edges_created=0`.
-- 15/15 ManyCore cases pass. Spring Boot: 11,956 invokeinterface records captured, 0 crashes.
+- 15/15 test cases pass. Spring Boot: 11,956 invokeinterface records captured, 0 crashes.
 
 **Breadth Validation Pass (COMPLETE 2026-05-30):**
 7-area validation covering real-world JVM mechanisms. All 6 runnable areas pass with 0 orphans, 0 heuristic edges. Three new gaps discovered and documented in [06-known-limitations.md](06-known-limitations.md):
@@ -63,7 +63,7 @@ jdk21u         =  historical copy     →  never modify, never build from, never
 | Dimension | State |
 |---|---|
 | Phase | Phase 1 COMPLETE / Phase 2a–2E COMPLETE / Breadth Validation COMPLETE / All gaps (#15–#17) resolved or workaround confirmed |
-| ManyCore test suite | 15/15 PASS, 0 user-code diagnostics |
+| Runtime Truth test suite | 15/15 PASS, 0 user-code diagnostics |
 | Spring Boot validation | HTTP reflection edge captured (`doInvoke bci=55 → HelloController.index`) |
 | Breadth validation (8 areas) | Areas 1,2,3,4,5,6,7,8 ALL PROVEN_COVERED; Gap #16 workaround: `-javaagent:$BBA` |
 | Graph builder unit tests | 26/26 PASS (3 Phase 2E tests added) |
@@ -132,18 +132,18 @@ The most common violation: editing `jdk21u/src/hotspot/share/classfile/linkResol
 → Key file: `linkResolver.cpp` — `sg_walk_mh`, `sg_walk_generic_bmh`, `sg_compute_node_semantic`
 
 ### I need to debug UI or indexer issues
-→ [03-source-ownership-map.md](03-source-ownership-map.md) — "ManyCore UI" section  
-→ `tools/manycore-ui/README.md` — REST API, UI layout, validation checks  
-→ Key files: `tools/manycore-ui/app.py`, `tools/manycore-ui/indexer.py`
+→ [03-source-ownership-map.md](03-source-ownership-map.md) — "Runtime Truth UI" section  
+→ `tools/rt-ui/README.md` — REST API, UI layout, validation checks  
+→ Key files: `tools/rt-ui/app.py`, `tools/rt-ui/indexer.py`
 
 ### I need to work on the demo platform or LLM benchmark
 → [11-demo-platform-design.md](11-demo-platform-design.md) — full design: benchmark spec, API spec, 4 bug specs, next tasks  
 → [12-demo-bug-suite.md](12-demo-bug-suite.md) — implementation complete; JSONL validated; A/B TTID reduction table  
 → [13-agent-benchmark-design.md](13-agent-benchmark-design.md) — A vs B benchmark design: controlled variables, scoring rubric, harness, success criteria  
 → [14-benchmark-results.md](14-benchmark-results.md) — **Results**: single-turn run, all 3 bugs; TIE on 2, +1 on Bug 3 (line precision only); no material advantage found in single-turn mode  
-→ Causality API: `GET /api/runs/<run_id>/causality/{summary,search,polymorphic,reflection,proxies,hidden,chain,explain}` — already implemented in `tools/manycore-ui/app.py`  
+→ Causality API: `GET /api/runs/<run_id>/causality/{summary,search,polymorphic,reflection,proxies,hidden,chain,explain}` — already implemented in `tools/rt-ui/app.py`  
 → Demo app: `tools/demo-buggy-app/` — 4 bugs implemented, Maven build passes, JSONL export confirmed  
-→ To ingest a pre-captured run: `POST /api/runs/ingest {"label":"...","run_dir":"..."}` (requires manycore-ui restart to activate — added in runner.py + app.py)
+→ To ingest a pre-captured run: `POST /api/runs/ingest {"label":"...","run_dir":"..."}` (requires rt-ui restart to activate — added in runner.py + app.py)
 
 ### I need to add a new JSONL record type
 → [04-runtime-capture-architecture.md](04-runtime-capture-architecture.md) — "Export Pipeline" section  
@@ -157,8 +157,8 @@ The most common violation: editing `jdk21u/src/hotspot/share/classfile/linkResol
 → [09-running-tests-and-demos.md](09-running-tests-and-demos.md) — UI quickstart, CLI one-liners, remote demo via start_demo.sh
 
 ### I need to work on the causality graph builder
-→ `tools/manycore-ui/graph_builder.py` — offline graph builder (Phase 2a)  
-→ `tools/manycore-ui/tests/test_graph_builder.py` — 14 fixture tests  
+→ `tools/rt-ui/graph_builder.py` — offline graph builder (Phase 2a)  
+→ `tools/rt-ui/tests/test_graph_builder.py` — 14 fixture tests  
 → [03-source-ownership-map.md → Offline Causality Graph Builder](03-source-ownership-map.md) — node/edge types, identity rules, extension guidance  
 → [08-phase2-causality-graph-design-review.md](08-phase2-causality-graph-design-review.md) — Phase 2a status + Phase 2b–d roadmap
 
@@ -201,7 +201,7 @@ The most common violation: editing `jdk21u/src/hotspot/share/classfile/linkResol
 | [07-build-workflow-guide.md](07-build-workflow-guide.md) | Canonical repo/file paths, standard build sequence, env vars, common mistakes with diagnosis and fix |
 | [08-phase2-causality-graph-design-review.md](08-phase2-causality-graph-design-review.md) | Phase 2 architectural review: causality graph MVP feasibility, gap analysis, new record types, roadmap |
 | [10-phase2b-runtime-target-attribution-design.md](10-phase2b-runtime-target-attribution-design.md) | Phase 2b design review: `runtime_target` root-cause investigation, emission-site inventory (all in `methodHandles.cpp`), Option B implementation design |
-| [09-running-tests-and-demos.md](09-running-tests-and-demos.md) | Quick-start: run 12-case suite, Spring Boot demo, ManyCore UI, and start_demo.sh remote tunnel |
+| [09-running-tests-and-demos.md](09-running-tests-and-demos.md) | Quick-start: run 12-case suite, Spring Boot demo, Runtime Truth UI, and start_demo.sh remote tunnel |
 | [11-demo-platform-design.md](11-demo-platform-design.md) | LLM Debugging Benchmark design: A/B agent benchmark, causality API spec (8 endpoints, implemented), 4 demo bug specs (reflection/proxy/lambda/polymorphic), implementation order, next tasks |
 | [12-demo-bug-suite.md](12-demo-bug-suite.md) | Demo bug suite: 4 Spring Boot bugs (reflection/proxy/polymorphic/lambda), JSONL validation results, causality API calls for each, A/B TTID reduction table |
 | [13-agent-benchmark-design.md](13-agent-benchmark-design.md) | A vs B benchmark design: controlled variables, scoring rubric (16 pts), harness, success criteria (≥3pt delta required) |
@@ -235,9 +235,9 @@ The most common violation: editing `jdk21u/src/hotspot/share/classfile/linkResol
 | Hidden class CRC capture | `klassFactory.cpp` (pre-parse) | `soroushProvenanceGraph.cpp` |
 | Hidden class identity recording | `klassFactory.cpp` (post-`create_instance_klass`) | `soroushProvenanceGraph.cpp` |
 | Bytecode rewriting | `soroushClassfileRewriter.cpp` | — |
-| UI server + run management | `tools/manycore-ui/app.py` | — |
-| JSONL indexing | `tools/manycore-ui/indexer.py` | — |
-| UI frontend | `tools/manycore-ui/static/index.html` | `tools/manycore-ui/static/style.css` |
+| UI server + run management | `tools/rt-ui/app.py` | — |
+| JSONL indexing | `tools/rt-ui/indexer.py` | — |
+| UI frontend | `tools/rt-ui/static/index.html` | `tools/rt-ui/static/style.css` |
 
 ---
 
@@ -246,7 +246,7 @@ The most common violation: editing `jdk21u/src/hotspot/share/classfile/linkResol
 | Task | Validation command / document |
 |---|---|
 | JVM built and libjvm deployed correctly | `java -version` → must show `jdk21u-export` in VM line |
-| All 15 cases pass | `ManyCoreCasesMain` → `15/15 passed`; see [05-validation-guide.md Part 1](05-validation-guide.md) |
+| All 15 cases pass | `Runtime TruthCasesMain` → `15/15 passed`; see [05-validation-guide.md Part 1](05-validation-guide.md) |
 | Case04 warm-path hook works | BCI 67 → `Math.min` (not `Math.max`); see [05-validation-guide.md → Case 04](05-validation-guide.md) |
 | Reflection (Case B) works | Case10 all 5 targets exact; see [05-validation-guide.md → Case 10](05-validation-guide.md) |
 | Hidden class identity works | Case12 `HiddenClassTemplate+0x...` has non-zero CRC; see [05-validation-guide.md → Case 12](05-validation-guide.md) |
@@ -255,7 +255,7 @@ The most common violation: editing `jdk21u/src/hotspot/share/classfile/linkResol
 | CGLIB proxy captured | `Application$$SpringCGLIB$$0.setBeanFactory` in JSONL; [05-validation-guide.md](05-validation-guide.md) |
 | Case15 invokeinterface poly | BCI 54 → three `callsite_target` records (Dog/Cat/Bird), `static_label=blocked_multi_target`, `heuristic_edges_created=0` |
 | Breadth validation (Areas 2,4,5,6,7) | See [05-validation-guide.md Part 6](05-validation-guide.md); 0 orphans, 0 heuristic edges per area |
-| No regressions after a change | Run full suite: ManyCore 15 cases + Spring Boot validation |
+| No regressions after a change | Run full suite: Runtime Truth 15 cases + Spring Boot validation |
 
 ---
 

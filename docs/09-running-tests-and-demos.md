@@ -10,13 +10,13 @@ For in-depth per-case validation details and expected output, see [05-validation
 
 | Method | When to use |
 |---|---|
-| **ManyCore UI** (local) | Exploring output interactively, uploading a JAR, browsing callsite records |
+| **Runtime Truth UI** (local) | Exploring output interactively, uploading a JAR, browsing callsite records |
 | **CLI** | Scripted validation, CI, running without Flask |
 | **start_demo.sh** (remote) | Sharing a live demo with someone outside localhost via Cloudflare tunnel |
 
 ---
 
-## Method 1: ManyCore UI (Local)
+## Method 1: Runtime Truth UI (Local)
 
 ### Prerequisites
 
@@ -27,28 +27,28 @@ python3 -m pip install flask
 ### Start the server
 
 ```bash
-cd /Users/soroushaghajani/custom-jvm/jdk21u-export/tools/manycore-ui
+cd /Users/soroushaghajani/custom-jvm/jdk21u-export/tools/rt-ui
 python3 app.py 5001
 ```
 
 Open `http://localhost:5001` in a browser.
 
-### Run the 12-case ManyCore suite via UI
+### Run the 12-case suite via UI
 
 1. Click **New Run**
 2. Set **Run mode** to `main-class`
-3. Set **Main class** to `manycorecases.ManyCoreCasesMain`
-4. Set **Extra classpath** to `/tmp/manycore-cases-build/classes`
-5. Set **User prefixes** to `manycorecases`
+3. Set **Main class** to `testcases.TestCasesMain`
+4. Set **Extra classpath** to `/tmp/cases-build/classes`
+5. Set **User prefixes** to `testcases`
 6. Click **Run**
 7. Wait for status **Complete** (~10 seconds)
 
 Expected results:
-- Stdout tab: last line `ManyCore cases demo complete — 12/12 passed`
-- Diagnostics tab: 0 user-code diagnostics (entries starting with `manycorecases`)
+- Stdout tab: last line `test cases demo complete — 12/12 passed`
+- Diagnostics tab: 0 user-code diagnostics (entries starting with `testcases`)
 - Stats bar: callsite_target count > 0
 
-If `/tmp/manycore-cases-build/classes` does not exist yet, build it first — see [CLI: Build the test cases](#cli-build-the-test-cases) below.
+If `/tmp/cases-build/classes` does not exist yet, build it first — see [CLI: Build the test cases](#cli-build-the-test-cases) below.
 
 ### Run Spring Boot via UI
 
@@ -94,36 +94,36 @@ Only needed once (or after editing the Java source files):
 
 ```bash
 JAVAC=/Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/javac
-mkdir -p /tmp/manycore-cases-build/classes
-$JAVAC -d /tmp/manycore-cases-build/classes \
-  /tmp/manycore-cases-build/src/manycorecases/*.java
+mkdir -p /tmp/cases-build/classes
+$JAVAC -d /tmp/cases-build/classes \
+  /tmp/cases-build/src/testcases/*.java
 ```
 
-Source lives at `/tmp/manycore-cases-build/src/manycorecases/`.
+Source lives at `/tmp/cases-build/src/testcases/`.
 
-### CLI: Run the 12-case ManyCore suite
+### CLI: Run the 12-case suite
 
 ```bash
 SOROUSH_PROVENANCE_GRAPH=1 \
-SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/manycore_out.jsonl \
+SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/rt_out.jsonl \
   /Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/java \
-  -cp /tmp/manycore-cases-build/classes manycorecases.ManyCoreCasesMain
+  -cp /tmp/cases-build/classes testcases.TestCasesMain
 ```
 
 Expected last two lines of stdout:
 ```
 PASS Case12 — Hidden class
-ManyCore cases demo complete — 12/12 passed
+test cases demo complete — 12/12 passed
 ```
 
 Quick sanity check on the JSONL:
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_out.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_out.jsonl') if l.strip()]
 es = [r for r in records if r.get('record')=='export_summary'][0]
 ud = [r for r in records if r.get('record')=='diagnostic'
-      and r.get('src_class','').startswith('manycorecases')]
+      and r.get('src_class','').startswith('testcases')]
 print('export complete :', es.get('complete'))
 print('user diagnostics:', len(ud))
 print('callsite_target :', es.get('callsite_target_count'))
@@ -170,7 +170,7 @@ Expected: `User diagnostics: 0`
 
 ## Method 3: Remote Demo via start_demo.sh
 
-`start_demo.sh` starts the ManyCore UI and exposes it publicly through a Cloudflare Tunnel with single-use token auth. Use this when showing a live demo to someone outside localhost.
+`start_demo.sh` starts the Runtime Truth UI and exposes it publicly through a Cloudflare Tunnel with single-use token auth. Use this when showing a live demo to someone outside localhost.
 
 ### Prerequisites
 
@@ -182,7 +182,7 @@ python3 -m pip install flask
 ### Start
 
 ```bash
-cd /Users/soroushaghajani/custom-jvm/jdk21u-export/tools/manycore-ui
+cd /Users/soroushaghajani/custom-jvm/jdk21u-export/tools/rt-ui
 ./start_demo.sh
 ```
 
@@ -242,7 +242,7 @@ In the class list on the left:
 python3 -c "
 import json
 from collections import Counter
-records = [json.loads(l) for l in open('/tmp/manycore_out.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_out.jsonl') if l.strip()]
 print('Record type counts:')
 for t, c in sorted(Counter(r.get('record') for r in records).items(), key=lambda x: -x[1]):
     print(f'  {c:>6}  {t}')
@@ -278,4 +278,4 @@ Key record types:
 | Build the JVM from scratch | [07-build-workflow-guide.md](07-build-workflow-guide.md) |
 | Understanding the JSONL schema | [04-runtime-capture-architecture.md](04-runtime-capture-architecture.md) — "Export Pipeline" |
 | Why a diagnostic was emitted | [06-known-limitations.md](06-known-limitations.md) |
-| UI REST API reference | `tools/manycore-ui/README.md` |
+| UI REST API reference | `tools/rt-ui/README.md` |

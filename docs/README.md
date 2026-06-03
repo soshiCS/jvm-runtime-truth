@@ -35,15 +35,14 @@ See the top-level [README](../README.md) for build and usage instructions.
 bash tools/build.sh
 ```
 
-Validate:
+Validate: build the 15-case test JAR (see [09-running-tests-and-demos.md](09-running-tests-and-demos.md)), then:
 ```bash
 SOROUSH_PROVENANCE_GRAPH=1 \
 SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/val.jsonl \
-  <path-to-custom-java> \
-  -cp /tmp/manycore-cases-build/classes manycorecases.ManyCoreCasesMain
+  <path-to-custom-java> -jar /tmp/cases-build/cases.jar
 ```
 
-Expected: `15-case test suite demo complete — 15/15 passed`
+Expected output ends with: `15/15 passed`
 
 ---
 

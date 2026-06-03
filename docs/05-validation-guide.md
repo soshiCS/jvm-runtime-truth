@@ -25,32 +25,32 @@ The build string must contain `jdk21u-export`. If it says `jdk21u` (without `-ex
 
 ---
 
-## Part 1: ManyCore 14-Case Suite
+## Part 1: Runtime Truth 14-Case Suite
 
 ### Build the test cases
 
 ```bash
 JAVAC=/Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/javac
-mkdir -p /tmp/manycore-cases-build/out
+mkdir -p /tmp/cases-build/out
 
-$JAVAC -d /tmp/manycore-cases-build/out \
-  /tmp/manycore-cases-build/src/manycorecases/*.java
+$JAVAC -d /tmp/cases-build/out \
+  /tmp/cases-build/src/testcases/*.java
 ```
 
 ### Run all 14 cases
 
 ```bash
 SOROUSH_PROVENANCE_GRAPH=1 \
-SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/manycore_val.jsonl \
+SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/rt_val.jsonl \
   /Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/java \
-  -Xint -cp /tmp/manycore-cases-build/out manycorecases.ManyCoreCasesMain
+  -Xint -cp /tmp/cases-build/out testcases.TestCasesMain
 echo "Exit: $?"
 ```
 
 Expected stdout (last 3 lines):
 ```
 PASS Case14 — invokevirtual poly
-ManyCore cases demo complete — 14/14 passed
+test cases demo complete — 14/14 passed
 ```
 Expected exit code: 0.
 
@@ -59,7 +59,7 @@ Expected exit code: 0.
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_val.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_val.jsonl') if l.strip()]
 by_type = {}
 for r in records:
     t = r.get('record','?')
@@ -84,13 +84,13 @@ Key checks:
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_val.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_val.jsonl') if l.strip()]
 # export_summary complete = true
 es = [r for r in records if r.get('record')=='export_summary']
 print('export complete:', es[0].get('complete') if es else 'MISSING')
 # user-code diagnostics
 ud = [r for r in records if r.get('record')=='diagnostic'
-      and r.get('src_class','').startswith('manycorecases')]
+      and r.get('src_class','').startswith('testcases')]
 print('user diagnostics:', len(ud))
 for r in ud: print(' ', r.get('src_class'), r.get('src_method'), r.get('reason'))
 "
@@ -111,7 +111,7 @@ user diagnostics: 0
 ```bash
 SOROUSH_PROVENANCE_GRAPH=1 SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/c01.jsonl \
   /Users/soroushaghajani/custom-jvm/jdk21u-export/build/macosx-aarch64-server-fastdebug/jdk/bin/java \
-  -cp /tmp/manycore-cases-build/classes manycorecases.ManyCoreCasesMain 2>/dev/null \
+  -cp /tmp/cases-build/classes testcases.TestCasesMain 2>/dev/null \
   | grep -E "Case01|PASS|FAIL"
 ```
 
@@ -139,7 +139,7 @@ Expected: `PASS Case04 — MH receiver origins`
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_val.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_val.jsonl') if l.strip()]
 c04 = [r for r in records if r.get('record')=='callsite_target'
        and r.get('source_class','').endswith('Case04_MHReceiverOrigins')
        and r.get('source_method','') == 'run']
@@ -169,9 +169,9 @@ Expected: PASS for each. These validate `sg_walk_mh` and `callsite_adapter_graph
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_val.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_val.jsonl') if l.strip()]
 ag = [r for r in records if r.get('record')=='callsite_adapter_graph'
-      and r.get('source_class','').startswith('manycorecases/Case0')]
+      and r.get('source_class','').startswith('testcases/Case0')]
 print(f'Case 05-09 adapter graph records: {len(ag)}')
 "
 ```
@@ -185,7 +185,7 @@ What it validates: Case B path — `Method.invoke` and `Constructor.newInstance`
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_val.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_val.jsonl') if l.strip()]
 c10 = [r for r in records if r.get('record')=='callsite_target'
        and 'Case10' in r.get('source_class','')]
 print(f'Case10 callsite_target records: {len(c10)}')
@@ -203,7 +203,7 @@ What it validates: invokeinterface hook captures JDK proxy dispatch. `$Proxy0.ad
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_val.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_val.jsonl') if l.strip()]
 c11 = [r for r in records if r.get('record')=='callsite_target'
        and ('Case11' in r.get('source_class','') or 'Proxy' in r.get('source_class',''))]
 print(f'Case11-related callsite_target records: {len(c11)}')
@@ -221,7 +221,7 @@ What it validates: `Lookup.defineHiddenClass`, hidden class invocation, `hidden_
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_val.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_val.jsonl') if l.strip()]
 hci = [r for r in records if r.get('record')=='hidden_class_identity'
        and 'HiddenClassTemplate' in r.get('runtime_name','')]
 print(f'HiddenClassTemplate hidden_class_identity records: {len(hci)}')
@@ -240,7 +240,7 @@ What it validates: Plain `invokevirtual` on a concrete subclass (`Circle.describ
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_val.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_val.jsonl') if l.strip()]
 c13 = [r for r in records if r.get('record')=='callsite_target'
        and r.get('category')=='invokevirtual'
        and 'Case13' in r.get('source_class','')
@@ -254,7 +254,7 @@ for r in c13:
 Expected:
 ```
 Case13 invokevirtual describe records: 1
-  BCI 9: manycorecases/Case13_InvokevirtualMono$Circle.describe [exact]
+  BCI 9: testcases/Case13_InvokevirtualMono$Circle.describe [exact]
 ```
 
 ### Case 14 — invokevirtual two call sites
@@ -266,11 +266,11 @@ What it validates: Two separate `invokevirtual` call sites in one method, each r
 ```bash
 python3 -c "
 import json
-records = [json.loads(l) for l in open('/tmp/manycore_val.jsonl') if l.strip()]
+records = [json.loads(l) for l in open('/tmp/rt_val.jsonl') if l.strip()]
 c14 = [r for r in records if r.get('record')=='callsite_target'
        and r.get('category')=='invokevirtual'
        and 'Case14' in r.get('source_class','')
-       and r.get('target_class','').startswith('manycorecases')]
+       and r.get('target_class','').startswith('testcases')]
 print(f'Case14 invokevirtual user-target records: {len(c14)}')
 for r in sorted(c14, key=lambda x: x.get('source_bci',0)):
     print(f\"  BCI {r.get('source_bci')}: {r.get('target_class')}.{r.get('target_method')} [{r.get('source_capture')}]\")
@@ -280,8 +280,8 @@ for r in sorted(c14, key=lambda x: x.get('source_bci',0)):
 Expected:
 ```
 Case14 invokevirtual user-target records: 2
-  BCI 17: manycorecases/Case14_InvokevirtualPoly$Dog.sound [exact]
-  BCI 22: manycorecases/Case14_InvokevirtualPoly$Cat.name [exact]
+  BCI 17: testcases/Case14_InvokevirtualPoly$Dog.sound [exact]
+  BCI 22: testcases/Case14_InvokevirtualPoly$Cat.name [exact]
 ```
 
 ---
@@ -316,7 +316,7 @@ direct: Greetings from Spring Boot!
 reflection: Greetings from Spring Boot!
 mh: Greetings from Spring Boot!
 proxy: proxy:greet
-stream: SPRING, BOOT, MANYCORE
+stream: SPRING, BOOT, rt
 abs(-42): 42
 sorted[0]: apple
 app class: Application$$SpringCGLIB$$0
@@ -506,7 +506,7 @@ export complete: True
 ### Run the unit tests (19 synthetic fixture tests)
 
 ```bash
-python3 tools/manycore-ui/tests/test_graph_builder.py
+python3 tools/rt-ui/tests/test_graph_builder.py
 ```
 
 Expected output:
@@ -534,13 +534,13 @@ Expected output:
 19 passed, 0 failed
 ```
 
-### Run graph builder on ManyCore export
+### Run graph builder on Runtime Truth export
 
 First generate the JSONL if needed (see Part 1). Then:
 
 ```bash
 cd /Users/soroushaghajani/custom-jvm/jdk21u-export
-python3 tools/manycore-ui/graph_builder.py /tmp/manycore_val.jsonl --report --validate
+python3 tools/rt-ui/graph_builder.py /tmp/rt_val.jsonl --report --validate
 ```
 
 Expected validation result:
@@ -565,7 +565,7 @@ Expected report highlights:
 First generate the JSONL if needed (see Part 3). Then:
 
 ```bash
-python3 tools/manycore-ui/graph_builder.py /tmp/spring_out.jsonl --report --validate
+python3 tools/rt-ui/graph_builder.py /tmp/spring_out.jsonl --report --validate
 ```
 
 Expected validation result:
@@ -588,7 +588,7 @@ Expected report highlights:
 ### Query: show causality chain for a specific user callsite
 
 ```bash
-python3 tools/manycore-ui/graph_builder.py /tmp/spring_out.jsonl \
+python3 tools/rt-ui/graph_builder.py /tmp/spring_out.jsonl \
   --query chain \
   --src "com/example/springboot/Application" \
   --method "commandLineRunner" \
@@ -600,7 +600,7 @@ Expected: JSON array starting with a callsite node for `commandLineRunner@BCI1` 
 ### Query: list all runtime_target orphan nodes
 
 ```bash
-python3 tools/manycore-ui/graph_builder.py /tmp/spring_out.jsonl --query orphans
+python3 tools/rt-ui/graph_builder.py /tmp/spring_out.jsonl --query orphans
 ```
 
 Expected: JSON array of orphan `runtime_target` nodes (those with `source_capture=missing` or no source attribution). In Phase 2B workloads this is empty (0 orphans), but the query remains useful for future workloads or for inspecting any `source_missing_reason` values.
@@ -608,7 +608,7 @@ Expected: JSON array of orphan `runtime_target` nodes (those with `source_captur
 ### Query: list staticizable callsite candidates
 
 ```bash
-python3 tools/manycore-ui/graph_builder.py /tmp/spring_out.jsonl --query staticizable
+python3 tools/rt-ui/graph_builder.py /tmp/spring_out.jsonl --query staticizable
 ```
 
 Expected: callsite nodes labelled `staticizable_candidate_direct` or `staticizable_candidate_adapter_modeled`.
@@ -616,19 +616,19 @@ Expected: callsite nodes labelled `staticizable_candidate_direct` or `staticizab
 ### Query: list blocked callsites
 
 ```bash
-python3 tools/manycore-ui/graph_builder.py /tmp/spring_out.jsonl --query blocked
+python3 tools/rt-ui/graph_builder.py /tmp/spring_out.jsonl --query blocked
 ```
 
 Expected: callsite nodes labelled with reasons like `observed_only_not_proven`, `blocked_multi_target`.
 
 ---
 
-## Part 5: ManyCore UI
+## Part 5: Runtime Truth UI
 
 ### Start the UI
 
 ```bash
-cd /Users/soroushaghajani/custom-jvm/jdk21u-export/tools/manycore-ui
+cd /Users/soroushaghajani/custom-jvm/jdk21u-export/tools/rt-ui
 python3 app.py 5001
 # Open http://localhost:5001
 ```
@@ -636,9 +636,9 @@ python3 app.py 5001
 ### Run the 12-case suite via UI
 
 1. Click "New Run"
-2. Upload the ManyCore fat JAR (or use `main-class` run mode with `-cp /tmp/manycore-cases-build/classes`)
-3. Main class: `manycorecases.ManyCoreCasesMain`
-4. User prefixes: `manycorecases`
+2. Upload the Runtime Truth fat JAR (or use `main-class` run mode with `-cp /tmp/cases-build/classes`)
+3. Main class: `testcases.TestCasesMain`
+4. User prefixes: `testcases`
 5. Click Run
 6. Wait for status to show Complete
 7. Verify: 12/12 cases pass in stdout tab, no user-code diagnostics in Diagnostics tab
@@ -877,7 +877,7 @@ Verify graph: 1 callsite, 2 CALLSITE_TARGET edges, `static_label = blocked_multi
 ```python
 python3 -c "
 import sys, json
-sys.path.insert(0, 'tools/manycore-ui')
+sys.path.insert(0, 'tools/rt-ui')
 from graph_builder import build_graph, NT_CALLSITE, ET_CALLSITE_TARGET, SR_MULTI_TARGET
 G, meta = build_graph('/tmp/breadth-val/results/area8.jsonl')
 greet_methods = [n for n in G.nodes if 'PolyGreeter' in n and 'greet' in n]
@@ -898,7 +898,7 @@ print('PASS: 2 CALLSITE_TARGET edges, static_label=blocked_multi_target, heurist
 cd /Users/soroushaghajani/custom-jvm/jdk21u-export
 for AREA in 2 4 5 6 7 8; do
   echo "=== Area $AREA ==="
-  python3 tools/manycore-ui/graph_builder.py /tmp/breadth-val/results/area${AREA}.jsonl --report 2>&1 \
+  python3 tools/rt-ui/graph_builder.py /tmp/breadth-val/results/area${AREA}.jsonl --report 2>&1 \
     | grep -E "nodes|edges|orphan|heuristic|gap"
 done
 ```
@@ -970,7 +970,7 @@ Expected for each area: `runtime_target orphans: 0`, `Heuristic edges created: 0
 2. Gap #16 (Mockito/ByteBuddy safepoint starvation): **WORKAROUND CONFIRMED** (2026-05-30). Classification: validation environment issue, not a capture architecture bug. Pre-loading the agent with `-javaagent:byte-buddy-agent.jar` eliminates the deadlock. With preloaded agent: 0 heuristics, 0 orphans, all mock dispatch edges captured.
 3. Gap #17 (same-class-name loader dedup collision): **RESOLVED** (2026-05-30). `soroush_graph_poly_callsite` dedup key now includes `src_loader_id` + `target_loader_id`. Area8 breadth-val confirms per-loader dedup works correctly.
 
-**Current status**: All 8 breadth areas PROVEN_COVERED. 26/26 graph tests pass. 15/15 ManyCore cases pass. 0 open blocking gaps. JIT-compiled frames remain the only unresolved architectural capture boundary; the UI mitigates this with `-Xint`.
+**Current status**: All 8 breadth areas PROVEN_COVERED. 26/26 graph tests pass. 15/15 test cases pass. 0 open blocking gaps. JIT-compiled frames remain the only unresolved architectural capture boundary; the UI mitigates this with `-Xint`.
 
 ---
 

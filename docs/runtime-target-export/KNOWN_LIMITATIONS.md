@@ -22,7 +22,7 @@ captured. Classes touched by JIT before the first interpreted execution of a
 callsite are silently not captured.
 
 **Mitigation in use:** All validation and production runs use `-Xint`. For
-Manycore staticization use cases, the slice is run interpreter-only.
+rt staticization use cases, the slice is run interpreter-only.
 
 **Deferred:** Compiled-frame recovery would require JIT-specific frame inspection
 (deoptimization-based or via `vframeStream` with JVMTI). This is a separate large

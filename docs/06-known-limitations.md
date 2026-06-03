@@ -102,7 +102,7 @@ getSomeMethodHandle().invokeExact(arg);
 
 **What happens**: One diagnostic in the mixed-mode Spring Boot run: a call site where the caller frame is JIT-compiled. When it occurs, the frame has no interpreter-frame metadata, and the source class/method/BCI cannot be recovered.
 
-**Note**: The UI always passes `-Xint`. The standard manual validation commands in `docs/00-agent-handoff.md` and `docs/05-validation-guide.md` do NOT pass `-Xint`. Both the 12-case ManyCore test suite and the Spring Boot manual validation run in **mixed mode** (JIT active). For the current short-lived workloads, the fastdebug JIT rarely fires before exit, so only 1 compiled-frame diagnostic was observed in the Spring Boot run. Under a long-running or warmed-up workload, this count will grow.
+**Note**: The UI always passes `-Xint`. The standard manual validation commands in `docs/00-agent-handoff.md` and `docs/05-validation-guide.md` do NOT pass `-Xint`. Both the 12-case test suite and the Spring Boot manual validation run in **mixed mode** (JIT active). For the current short-lived workloads, the fastdebug JIT rarely fires before exit, so only 1 compiled-frame diagnostic was observed in the Spring Boot run. Under a long-running or warmed-up workload, this count will grow.
 
 **Impact on manual runs**: Add `-Xint` to any manual validation command to eliminate compiled-frame diagnostics and ensure fully interpreter-based capture. Without `-Xint`, captured coverage depends on whether the JIT compiled a method before the callsite was first resolved.
 
@@ -179,7 +179,7 @@ Two dedup models exist in the system:
 - `source_capture="missing"` + `source_missing_reason="no_user_frame_on_stack"` — when no frame is available (JVM init, daemon threads)
 
 **Validation results** (Phase 2B, 2026-05-30):
-- ManyCore: 915 orphans → **0 orphans** (100% reduction), 915 connected
+- Runtime Truth: 915 orphans → **0 orphans** (100% reduction), 915 connected
 - Spring Boot: 2,905 orphans → **0 orphans** (100% reduction), 2,912 connected
 
 **Remaining gap**: `source_capture=missing` records (zero in current workloads, but theoretically possible during JVM boot or daemon thread MH linkage) remain orphans. This is correct behavior — no fabricated attribution.
@@ -295,7 +295,7 @@ SOROUSH_PROVENANCE_GRAPH=1 SOROUSH_EXPORT_RUNTIME_TARGETS=out.jsonl \
   - loaderB: `0x0000000105629ee0`
 - Graph: 1 callsite node, 2 distinct method nodes (differing only by `loader_id`), 2 `CALLSITE_TARGET` edges.
 - `static_label = blocked_multi_target`, `heuristic_edges_created = 0`.
-- 26/26 graph builder unit tests pass. 15/15 ManyCore cases pass.
+- 26/26 graph builder unit tests pass. 15/15 test cases pass.
 
 ---
 

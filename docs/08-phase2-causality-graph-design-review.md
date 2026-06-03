@@ -8,13 +8,13 @@
 
 ## Phase 2a Implementation Status (2026-05-30)
 
-**COMPLETE.** `tools/manycore-ui/graph_builder.py` was implemented and validated.
+**COMPLETE.** `tools/rt-ui/graph_builder.py` was implemented and validated.
 
 | Item | Status |
 |---|---|
 | `graph_builder.py` offline builder | ✓ Implemented |
 | 14 synthetic fixture tests | ✓ All passing |
-| ManyCore 12-case validation | ✓ 10/10 validation checks pass |
+| 12-case validation | ✓ 10/10 validation checks pass |
 | Spring Boot validation | ✓ 10/10 validation checks pass |
 | Heuristic edges | ✓ 0 (hard rule enforced) |
 | Gap report | ✓ Produced on every run |
@@ -31,7 +31,7 @@
 - 6 `staticizable_candidate_adapter_modeled` callsites
 - 3,290 `observed_only_not_proven` callsites
 
-**ManyCore results (2026-05-30):**
+**Runtime Truth results (2026-05-30):**
 - 6,204 nodes, 4,974 edges, 916 gap records
 - 38 CALLSITE_TARGET edges + 54 LAMBDA_BODY edges
 - 96/96 adapter graphs connected
@@ -45,13 +45,13 @@
 **Run graph builder:**
 ```bash
 # Tests
-python3 tools/manycore-ui/tests/test_graph_builder.py
+python3 tools/rt-ui/tests/test_graph_builder.py
 
-# ManyCore
-python3 tools/manycore-ui/graph_builder.py /tmp/manycore_val.jsonl --report --validate
+# Runtime Truth
+python3 tools/rt-ui/graph_builder.py /tmp/rt_val.jsonl --report --validate
 
 # Spring Boot
-python3 tools/manycore-ui/graph_builder.py /tmp/spring_out.jsonl --report --validate
+python3 tools/rt-ui/graph_builder.py /tmp/spring_out.jsonl --report --validate
 ```
 
 See [05-validation-guide.md Part 4](05-validation-guide.md) for full validation commands and expected output.  
@@ -403,7 +403,7 @@ A batch of counter records emitted at JVM shutdown, one per observed callsite:
 
 **Goal**: Build and query the runtime causality graph from Phase 1 JSONL data.  
 **JVM changes**: None.  
-**Deliverable**: `tools/manycore-ui/graph_builder.py`
+**Deliverable**: `tools/rt-ui/graph_builder.py`
 
 Steps:
 1. Define node types: `Method`, `Callsite`, `HiddenClass`, `BytecodeArtifact`
@@ -411,7 +411,7 @@ Steps:
 3. Load all records from JSONL → populate nodes and edges
 4. Add `runtime_target` records as orphan target nodes (no incoming CALLS edge; flag as `source_unattributed=true`)
 5. Produce GraphML or JSON output
-6. Validate against 12-case ManyCore workload (expected graph shapes are well-defined per case)
+6. Validate against 12-case workload (expected graph shapes are well-defined per case)
 7. Validate against Spring Boot run (confirm 26 user-code CALLS edges, 0 unresolved user-code nodes)
 
 ---
@@ -429,7 +429,7 @@ Steps:
 - `graph_builder.py`: `source_capture=exact` records produce `NT_CALLSITE` + `ET_CALLSITE_RT_ATTRIBUTED` edge; `missing` records remain `NT_RUNTIME_TARGET` orphans
 
 **Validation results (2026-05-30)**:
-- ManyCore: 915 orphans → **0** (100% reduction), connected_runtime_targets = 915
+- Runtime Truth: 915 orphans → **0** (100% reduction), connected_runtime_targets = 915
 - Spring Boot: 2,905 orphans → **0** (100% reduction), connected_runtime_targets = 2,912
 - 11/11 validation checks pass on both workloads
 - 19/19 unit tests pass
@@ -485,7 +485,7 @@ This is the highest-leverage first move because:
 **Concrete entry point**:
 
 ```python
-# tools/manycore-ui/graph_builder.py
+# tools/rt-ui/graph_builder.py
 #
 # Usage:
 #   python3 graph_builder.py /tmp/spring_out.jsonl --output graph.graphml
@@ -494,7 +494,7 @@ This is the highest-leverage first move because:
 # Edge types: CALLS, LAMBDA_BODY, ADAPTS_VIA, RESOLVES_TO
 #
 # Validation:
-#   12-case ManyCore: all case graphs match expected shapes in 05-validation-guide.md
+#   12-case: all case graphs match expected shapes in 05-validation-guide.md
 #   Spring Boot: 26 user-code CALLS edges, 0 unresolved user-code nodes
 ```
 

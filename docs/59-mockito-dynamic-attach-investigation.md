@@ -185,7 +185,7 @@ methods, and spy-proxied real method calls.
 | Use case | Impact |
 |---|---|
 | Demo with capture_live.sh (demo-runtime-truth) | Not affected — no Mockito |
-| ManyCore 15-case regression | Not affected — no Mockito |
+| 15-case regression | Not affected — no Mockito |
 | Spring Boot capture | Not affected — Spring Boot doesn't use Mockito inline mock in production |
 | Test-suite validation with Mockito | Requires `-javaagent:byte-buddy-agent.jar` |
 | Staticization demo | Not affected |

@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-01  
 **Status:** Validated  
-**Run:** `/tmp/rt_ui_runs/05160976` (ManyCore Cases demo, 12 cases)  
+**Run:** `/tmp/rt_ui_runs/05160976` (Runtime Truth Cases demo, 12 cases)  
 **Total JSONL records:** ~4 522 across all cases
 
 ---
@@ -33,7 +33,7 @@ Demo is viable with caveats. All cases produce relevant runtime data. The PARTIA
 | Case12_HiddenClass | Lookup.defineHiddenClass | **READY** | — |
 | HiddenClassTemplate | Template type | **READY** | Artifact + identity captured |
 | HiddenOp | Interface | **READY** | Artifact captured |
-| ManyCoreCasesMain | Dispatch harness | **READY** | All 12 entry lambdas captured |
+| Runtime TruthCasesMain | Dispatch harness | **READY** | All 12 entry lambdas captured |
 
 ---
 
@@ -379,7 +379,7 @@ Supporting types. `HiddenClassTemplate.class` is captured both as a non-hidden a
 
 ---
 
-### ManyCoreCasesMain — READY
+### Runtime TruthCasesMain — READY
 
 **12 invokedynamic dispatch lambdas** in `main()` (one per case runner). All 12 are:
 - `staticizable=true, reconstructable=false` (LambdaMetafactory, ThrowingRunnable interface)
@@ -394,7 +394,7 @@ Supporting types. `HiddenClassTemplate.class` is captured both as a non-hidden a
 
 ### Scope / filter behavior
 
-With user prefix set to `manycorecases/Case01_LambdaIndy`:
+With user prefix set to `testcases/Case01_LambdaIndy`:
 - Class list shows `Case01_LambdaIndy`, `Case01_LambdaIndy$$Lambda` (family, λ×5 badge), and the 5 `+0x` instances
 - Other cases (Case02–Case12, Main) are hidden by default ✅
 - Selecting a `+0x` instance shows its bytecode ✅ (after indexer family-creation fix)
@@ -408,7 +408,7 @@ With user prefix set to `manycorecases/Case01_LambdaIndy`:
 | Lambda +0x instance | ✅ | ART/TGT/SRC | Yes — CRC-matched artifact |
 | `$Proxy0` / `$Proxy1` | ✅ | ART | Yes — proxy class bytecode |
 | `HiddenClassTemplate+0x…` | ✅ | ART | Yes — matches template class bytecode |
-| `ManyCoreCasesMain$$Lambda+0x…` | ✅ | ART | Yes |
+| `Runtime TruthCasesMain$$Lambda+0x…` | ✅ | ART | Yes |
 
 ### Callsite→target navigation
 
