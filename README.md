@@ -14,25 +14,6 @@ That runs `configure` (first time only), `make hotspot`, and copies the updated 
 
 ---
 
-## Capture a run
-
-```bash
-mkdir -p /tmp/myrun/artifacts
-
-export SOROUSH_PROVENANCE_GRAPH=1
-export SOROUSH_RUNTIME_GRAPH=1
-export SOROUSH_CAPTURE_FINAL_BYTECODE=1
-export SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/myrun/runtime_targets.jsonl
-export SOROUSH_BYTECODE_DUMP_DIR=/tmp/myrun/artifacts
-export SOROUSH_USER_PREFIXES="com/myapp"   # slash-separated package prefix
-
-<path-to-custom-java> -Xint -jar myapp.jar
-```
-
-`-Xint` is required (interpreter-only mode). Output: `runtime_targets.jsonl` + `.class` files in `artifacts/`.
-
----
-
 ## Start the UI
 
 ```bash
@@ -45,9 +26,30 @@ Open `http://localhost:5000`.
 
 ---
 
-## Load your run
+## Run a JAR
 
-Register your output directory with the UI (the UI is a local server and doesn't scan the filesystem automatically):
+Click **New Run**, upload your JAR, select the class prefix to observe, and click run. Results appear automatically in the sidebar when the run completes.
+
+---
+
+## Advanced: capture a long-running app (e.g. Spring Boot)
+
+For apps that need external traffic (HTTP requests, etc.), run them manually with capture enabled:
+
+```bash
+mkdir -p /tmp/myrun/artifacts
+
+export SOROUSH_PROVENANCE_GRAPH=1
+export SOROUSH_RUNTIME_GRAPH=1
+export SOROUSH_CAPTURE_FINAL_BYTECODE=1
+export SOROUSH_EXPORT_RUNTIME_TARGETS=/tmp/myrun/runtime_targets.jsonl
+export SOROUSH_BYTECODE_DUMP_DIR=/tmp/myrun/artifacts
+export SOROUSH_USER_PREFIXES="com/myapp"
+
+<path-to-custom-java> -Xint -jar myapp.jar
+```
+
+Then load the results into the UI:
 
 ```bash
 curl -X POST http://localhost:5000/api/runs/ingest \
@@ -55,7 +57,8 @@ curl -X POST http://localhost:5000/api/runs/ingest \
   -d '{"label": "my-run", "run_dir": "/tmp/myrun"}'
 ```
 
-The run will appear in the sidebar at `http://localhost:5000`.
+> `-Xint` is required (interpreter-only mode).  
+> `SOROUSH_USER_PREFIXES` is a slash-format package prefix (e.g. `com/myapp`).
 
 ---
 
